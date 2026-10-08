@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Unit tests (no site packages)
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -B -S -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: CLI help
+        env:
+          PYTHONPATH: src
+        run: python3 -B -S -m cao --help
+
+      - name: Plugin listing
+        env:
+          PYTHONPATH: src
+        run: python3 -B -S -m cao plugins list --json
+
+      - name: Example self-check
+        env:
+          PYTHONPATH: src
+        run: python3 -B -S examples/synthetic_runtime.py
+
+      - name: Whitespace check
+        run: git show --check --format= HEAD

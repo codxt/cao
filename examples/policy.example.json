@@ -1,0 +1,25 @@
+{
+  "grants": [
+    {
+      "kind": "capability.discovery",
+      "plugin_id": "synthetic",
+      "workspace_id": "demo-workspace"
+    },
+    {
+      "kind": "snapshot.capture",
+      "plugin_id": "synthetic",
+      "workspace_id": "demo-workspace"
+    },
+    {
+      "kind": "execution.start",
+      "plugin_id": "synthetic",
+      "workspace_id": "demo-workspace"
+    },
+    {
+      "kind": "session.prompt",
+      "plugin_id": "synthetic",
+      "workspace_id": "demo-workspace",
+      "session_id": "sess-1"
+    }
+  ]
+}

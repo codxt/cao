@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cao"
+version = "0.0.0"
+description = "Open-source AgentOps control plane for agentic runtimes"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["agentops", "control-plane", "agents", "runtime", "orchestration"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+cao = "cao.cli:main"
+
+# Runtime plugins register under the "cao.runtime_plugins" entry-point group
+# when installed. CAO ships none: Herdr integration lands later as its own
+# plugin, so no entry-point table is declared here.
+
+[tool.setuptools.packages.find]
+where = ["src"]
