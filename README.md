@@ -6,35 +6,26 @@ capabilities, capture state, inspect targets, observe output, start work,
 prompt sessions, and enforce authority — without coupling the core to any one
 runtime.
 
-CAO is **runtime neutral**. A runtime integrates through a plugin. Herdr is
-planned as the first first-class runtime plugin, but it is **not referenced or
-implemented** in this foundation release. Core identities are generic:
-runtime, workspace, execution, and session ids.
+CAO is **runtime neutral**. A runtime integrates through a plugin selected
+explicitly by id. Herdr is the first first-class runtime plugin; it is
+registered through an installed entry point and is **not** a built-in default.
+Core identities are generic: runtime, workspace, execution, and session ids.
 
-## Status: F0 foundation
+## Status
 
-This repository currently contains the **F0 shared foundation** only:
+This repository provides a usable, **read-only** control-plane CLI:
 
-- runtime-neutral contracts and capability discovery;
-- one-shot snapshot capture, target inspection, and output/event observation;
-- start, prompt, and optional close;
-- explicit plugin selection with no silent fallback;
-- evidence that preserves source, verdict, capture time, fingerprint,
-  coverage, and reason;
-- policy authorization against the exact requested action;
-- state I/O that fails loudly on corrupt or unreadable state.
+- runtime plugin discovery (`cao plugins list`);
+- read-only registry views over proposed work, active claims, and runs
+  (`cao work list`, `cao worker list`, `cao run list`);
+- explicit intended-vs-observed reconciliation status
+  (`cao coordinator status`);
+- relay deduplication-state inspection (`cao relay status`).
 
-Later lanes add the `work`, `worker`, `run`, `coordinator`, and `relay`
-command groups. Their CLI shape is scaffolded now, and every scaffolded command
-reports a structured `UNAVAILABLE` result with a nonzero exit status rather
-than pretending to succeed.
-
-### Non-goals for F0
-
-- No runtime implementation ships in the core, and no runtime is imported.
-- No Work Registry, reconciliation, lifecycle, launcher, relay, portfolio, or
-  Git modules (owned by later lanes).
-- No runtime dependencies; the core uses only the Python standard library.
+Every command reports structured JSON, delegates to the module that owns the
+state, and fails closed. The CLI never mutates state and never fabricates a
+result: when required state cannot be read it prints explicit `UNAVAILABLE`
+evidence and exits nonzero.
 
 ## Install
 
@@ -42,7 +33,13 @@ Requires Python 3.10+.
 
 ```sh
 python3 -m pip install -e .
+cao plugins list --json
 ```
+
+Installing the package registers the Herdr runtime plugin under the
+`cao.runtime_plugins` entry-point group, so `cao plugins list` reports it with
+its real id and advertised capabilities. There are no runtime dependencies
+(`dependencies = []`).
 
 To run straight from a checkout without installing:
 
@@ -53,20 +50,27 @@ PYTHONPATH=src python3 -m cao --help
 ## CLI
 
 ```sh
-cao --help
 cao plugins list --json
+cao work list --ledger /path/to/registry.sqlite3
+cao worker list --ledger /path/to/registry.sqlite3
+cao run list --ledger /path/to/registry.sqlite3
+cao coordinator status --ledger /path/to/registry.sqlite3
+cao relay status --state examples/synthetic_ledger.json
 ```
 
 `plugins list` reports registered runtime plugins by explicit id. With no
 plugins installed the result is an empty, honest list — not a fallback
 runtime.
 
-Scaffolded lane groups report structured `UNAVAILABLE`:
+The registry commands read a Work Registry SQLite ledger read-only. `--ledger`
+defaults to the registry module's own default state path; the CLI never scans
+the filesystem for state. `examples/synthetic_ledger.json` is a relay
+deduplication state file, not a registry ledger.
 
-```sh
-cao work list --json   # exit status 3, structured UNAVAILABLE
-cao run list --json
-```
+Exit codes are `0` (success), `2` (usage error), and `3` (explicit
+`UNAVAILABLE`/`UNKNOWN`). See [`docs/operators.md`](docs/operators.md) for the
+exact JSON schema of every command and the runtime capabilities that are
+supported versus explicitly unavailable.
 
 ## Design in one paragraph
 
@@ -75,10 +79,12 @@ policy/authority are four separate concerns. CAO's core keeps them separate:
 `runtime.py` talks to plugins, `policy.py` authorizes the exact requested
 action, `state.py` persists state and fails loudly on bad input, and
 `evidence.py` qualifies every observation. Required evidence that cannot be
-read stays `UNKNOWN` and fails closed.
+read stays `UNKNOWN` and fails closed. The CLI composes these modules rather
+than reimplementing any of their logic.
 
 See [`docs/architecture.md`](docs/architecture.md),
-[`docs/runtime-plugin.md`](docs/runtime-plugin.md), and
+[`docs/runtime-plugin.md`](docs/runtime-plugin.md),
+[`docs/operators.md`](docs/operators.md), and
 [`docs/extraction-provenance.md`](docs/extraction-provenance.md).
 
 ## Development and validation

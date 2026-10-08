@@ -1,0 +1,11 @@
+{
+  "schema": "cao.relay.v0",
+  "delivered": [
+    "synthetic-event-0001",
+    "synthetic-event-0002"
+  ],
+  "writers": {
+    "synthetic-writer-a": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "synthetic-writer-b": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}

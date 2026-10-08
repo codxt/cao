@@ -24,9 +24,11 @@ classifiers = [
 [project.scripts]
 cao = "cao.cli:main"
 
-# Runtime plugins register under the "cao.runtime_plugins" entry-point group
-# when installed. CAO ships none: Herdr integration lands later as its own
-# plugin, so no entry-point table is declared here.
+# Runtime plugins register under the "cao.runtime_plugins" entry-point group.
+# No plugin ships as a built-in default: an entry point registers a plugin, and
+# ``PluginRegistry.discover`` only sees plugins that are actually installed.
+[project.entry-points."cao.runtime_plugins"]
+herdr = "cao.plugins.herdr:HerdrRuntimePlugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]

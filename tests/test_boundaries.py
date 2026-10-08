@@ -2,12 +2,19 @@
 
 Concrete plugins are permitted only behind the runtime plugin boundary;
 core dependencies, private data, and concern separation remain guarded.
+
+The source traversal is RECURSIVE: the guards must apply to nested core
+modules (for example ``cao/observers/``), not just the top-level package. The
+one explicit exception is the ``cao/plugins/`` package, which is plugin-owned
+and legitimately contains runtime-specific code, including the concrete runtime
+name that core must never contain.
 """
 
 from __future__ import annotations
 
 import ast
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 CAO_ROOT = SRC_ROOT / "cao"
 DOCS_ROOT = REPO_ROOT / "docs"
+PLUGINS_ROOT_NAME = "plugins"
 
 # Concerns that must not leak into one another.
 SEPARATION_RULES = {
@@ -34,8 +42,38 @@ SEPARATION_RULES = {
 PRIVATE_TOKENS = ("albr", "sentinelx", "/home/", "resident")
 
 
-def _python_files() -> list[Path]:
-    return sorted(CAO_ROOT.glob("*.py"))
+def _python_files(root: Path = CAO_ROOT) -> list[Path]:
+    """Every Python source file below ``root``, recursively.
+
+    Recursive on purpose: a top-level-only glob would silently skip every
+    subpackage (``cao/observers/``, ``cao/plugins/``) and any future one.
+    """
+
+    return sorted(root.rglob("*.py"))
+
+
+def _module_name(path: Path) -> str:
+    """The importable dotted module name for ``path`` below ``src``."""
+
+    relative = path.relative_to(SRC_ROOT)
+    parts = list(relative.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _is_plugin_file(path: Path, root: Path = CAO_ROOT) -> bool:
+    """Whether ``path`` lives under ``root``'s plugins package.
+
+    Deliberately narrow: only files under ``<root>/plugins/`` are plugin-owned,
+    so a sibling such as ``<root>/plugins_extra.py`` is NOT exempt.
+    """
+
+    try:
+        path.relative_to(root / PLUGINS_ROOT_NAME)
+        return True
+    except ValueError:
+        return False
 
 
 def _imports(path: Path) -> set[str]:
@@ -48,23 +86,41 @@ def _imports(path: Path) -> set[str]:
     return names
 
 
+def _plugin_import_offenders(root: Path = CAO_ROOT) -> list[str]:
+    """Core sources that import the concrete plugin package."""
+
+    offenders: list[str] = []
+    for path in _python_files(root):
+        for module in _imports(path):
+            if module in {"plugins", "cao.plugins"} or module.startswith(
+                ("plugins.", "cao.plugins.")
+            ):
+                offenders.append(f"{path.relative_to(root)}: {module}")
+    return offenders
+
+
+def _herdr_offenders(root: Path = CAO_ROOT) -> list[str]:
+    """Non-plugin sources that mention the concrete runtime name.
+
+    Plugin-owned files are exempt: a runtime integration is expected to name
+    its own runtime.
+    """
+
+    offenders: list[str] = []
+    for path in _python_files(root):
+        if _is_plugin_file(path, root):
+            continue
+        if "herdr" in path.read_text(encoding="utf-8").lower():
+            offenders.append(str(path.relative_to(root)))
+    return offenders
+
+
 class ScopeTests(unittest.TestCase):
     def test_core_does_not_import_concrete_plugins(self) -> None:
-        offenders = []
-        for path in _python_files():
-            for module in _imports(path):
-                if module in {"plugins", "cao.plugins"} or module.startswith(
-                    ("plugins.", "cao.plugins.")
-                ):
-                    offenders.append(f"{path.name}: {module}")
-        self.assertEqual(offenders, [])
+        self.assertEqual(_plugin_import_offenders(), [])
 
     def test_no_herdr_in_source(self) -> None:
-        offenders = []
-        for path in _python_files():
-            if "herdr" in path.read_text(encoding="utf-8").lower():
-                offenders.append(path.name)
-        self.assertEqual(offenders, [])
+        self.assertEqual(_herdr_offenders(), [])
 
 
 class DependencyBoundaryTests(unittest.TestCase):
@@ -79,7 +135,7 @@ class DependencyBoundaryTests(unittest.TestCase):
                     # A sibling module in this package (relative import).
                     continue
                 if top not in sys.stdlib_module_names:
-                    extra.append(f"{path.name}: {module}")
+                    extra.append(f"{path.relative_to(CAO_ROOT)}: {module}")
         self.assertEqual(extra, [])
 
     def test_concern_separation(self) -> None:
@@ -113,7 +169,7 @@ class ImportabilityTests(unittest.TestCase):
         for path in _python_files():
             if path.name == "__main__.py":
                 continue
-            importlib.import_module(f"cao.{path.stem}")
+            importlib.import_module(_module_name(path))
 
 
 class ContractBoundaryTests(unittest.TestCase):
@@ -141,6 +197,64 @@ class ContractBoundaryTests(unittest.TestCase):
         # An environment with no installed plugins yields an empty registry;
         # CAO never ships a built-in runtime.
         self.assertEqual(PluginRegistry.discover(entry_points=[]).ids(), ())
+
+
+class RecursiveGuardTests(unittest.TestCase):
+    """Proof that the guards genuinely cover nested core modules.
+
+    Each case builds an ephemeral tree so a newly created nested module is
+    detected without leaving anything behind. The tests fail if the traversal
+    regresses to top-level-only, or if the plugin exception widens beyond the
+    plugins package.
+    """
+
+    def _tree(self, layout: dict[str, str]) -> Path:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / "cao"
+        for relative, text in layout.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        return root
+
+    def test_nested_core_module_is_detected(self) -> None:
+        root = self._tree(
+            {
+                "nested/__init__.py": "",
+                "nested/offender.py": "RUNTIME = 'herdr'\n",
+            }
+        )
+        self.assertIn("nested/offender.py", _herdr_offenders(root))
+        self.assertIn(
+            "nested/offender.py", [str(p.relative_to(root)) for p in _python_files(root)]
+        )
+
+    def test_nested_core_plugin_import_is_detected(self) -> None:
+        root = self._tree(
+            {
+                "nested/__init__.py": "",
+                "nested/offender.py": "import cao.plugins.herdr\n",
+            }
+        )
+        offenders = _plugin_import_offenders(root)
+        self.assertEqual(len(offenders), 1)
+        self.assertIn("nested/offender.py", offenders[0])
+
+    def test_plugins_package_is_exempt_but_only_plugins(self) -> None:
+        root = self._tree(
+            {
+                "plugins/__init__.py": "",
+                "plugins/runtime_x/__init__.py": "RUNTIME = 'herdr'\n",
+                "observers/__init__.py": "",
+                "observers/nested_offender.py": "RUNTIME = 'herdr'\n",
+                "plugins_extra.py": "RUNTIME = 'herdr'\n",
+            }
+        )
+        offenders = _herdr_offenders(root)
+        self.assertIn("observers/nested_offender.py", offenders)
+        self.assertIn("plugins_extra.py", offenders)
+        self.assertNotIn("plugins/runtime_x/__init__.py", offenders)
 
 
 if __name__ == "__main__":
