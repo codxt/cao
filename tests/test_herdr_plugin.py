@@ -6,18 +6,22 @@ responses. No live Herdr server is contacted and no runtime state is mutated.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest import mock
 
 from cao.contracts import (
     Capability,
     ExecutionRef,
     SessionRef,
+    Snapshot,
     StartRequest,
     TargetRef,
     UnsupportedCapability,
@@ -37,7 +41,17 @@ from cao.runtime import RuntimeClient
 FIXED_NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 FIXED_TIME = "2026-01-01T00:00:00Z"
 EXPECTED_CAPABILITIES = frozenset(
-    {Capability.DISCOVERY, Capability.SNAPSHOT, Capability.INSPECT}
+    {
+        Capability.DISCOVERY,
+        Capability.SNAPSHOT,
+        Capability.INSPECT,
+        Capability.PROMPT,
+    }
+)
+UNIMPLEMENTED_CAPABILITIES = (
+    Capability.OBSERVE,
+    Capability.START,
+    Capability.CLOSE,
 )
 
 
@@ -122,6 +136,35 @@ def pane_response(pane: dict) -> str:
     return _envelope("pane_info", "pane", pane)
 
 
+def agent_prompted_response(
+    *,
+    pane_id: str = "ws-1:p1",
+    workspace_id: str = "ws-1",
+    terminal_id: str = "term-1",
+    agent_status: str = "working",
+    session: tuple[str, str] | None = ("id", "sess-1"),
+) -> str:
+    """A protocol-22 ``agent_prompted`` result carrying an ``AgentInfo``."""
+
+    agent: dict = {
+        "pane_id": pane_id,
+        "workspace_id": workspace_id,
+        "tab_id": "ws-1:t1",
+        "terminal_id": terminal_id,
+        "agent_status": agent_status,
+        "focused": True,
+        "revision": 4,
+    }
+    if session is not None:
+        agent["agent_session"] = {
+            "source": "herdr:example",
+            "agent": "example",
+            "kind": session[0],
+            "value": session[1],
+        }
+    return _envelope("agent_prompted", "agent", agent)
+
+
 def _envelope(result_type: str, key: str, value: object) -> str:
     return json.dumps(
         {
@@ -151,6 +194,45 @@ def make_plugin(response: object) -> tuple[HerdrRuntimePlugin, FakeRunner]:
     return plugin, runner
 
 
+class ScriptedRunner:
+    """Returns one queued response per call and records the argv.
+
+    An unexpected extra call is a hard failure, so a test that owes exactly one
+    side-effecting call can rely on the queue length to notice a stray one.
+    """
+
+    def __init__(self, *responses: object) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, argv):
+        self.calls.append(tuple(argv))
+        if not self.responses:
+            raise AssertionError(f"unexpected extra Herdr call: {tuple(argv)}")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def make_scripted_plugin(
+    *responses: object,
+) -> tuple[HerdrRuntimePlugin, ScriptedRunner]:
+    runner = ScriptedRunner(*responses)
+    plugin = HerdrRuntimePlugin(runner=runner, clock=lambda: FIXED_NOW)
+    return plugin, runner
+
+
+def session_ref(
+    *,
+    workspace_id: str = "ws-1",
+    execution_id: str = "term-1",
+    session_id: str = "sess-1",
+    runtime_id: str = "herdr",
+) -> SessionRef:
+    return SessionRef(runtime_id, workspace_id, execution_id, session_id)
+
+
 # -- discovery / capabilities ----------------------------------------------
 
 
@@ -171,6 +253,15 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.evidence.source, EvidenceSource.PLUGIN)
         self.assertEqual(result.value.capabilities, EXPECTED_CAPABILITIES)
+
+    def test_advertised_capabilities_match_the_implemented_set(self) -> None:
+        # K5: the advertised set is exactly what is implemented. Adding a
+        # capability without implementing it (or dropping one) fails here.
+        advertised = HerdrRuntimePlugin().capabilities()
+        self.assertEqual(advertised, EXPECTED_CAPABILITIES)
+        self.assertIn(Capability.PROMPT, advertised)
+        for capability in UNIMPLEMENTED_CAPABILITIES:
+            self.assertNotIn(capability, advertised)
 
 
 # -- snapshot: supported path ----------------------------------------------
@@ -524,6 +615,280 @@ class InspectTests(unittest.TestCase):
             RuntimeClient(plugin).inspect(target)
 
 
+# -- prompt: supported path and identity binding ---------------------------
+
+
+class _WrongWorkspaceSnapshotPlugin(HerdrRuntimePlugin):
+    """A plugin whose snapshot is bound to a different workspace.
+
+    The real plugin always stamps the requested workspace; this deliberately
+    violates that invariant so the prompt workspace guard can be exercised.
+    """
+
+    def snapshot(self, workspace_id: str) -> Snapshot:
+        snapshot = super().snapshot(workspace_id)
+        return Snapshot(
+            runtime_id=snapshot.runtime_id,
+            workspace_id="ws-elsewhere",
+            captured_at=snapshot.captured_at,
+            fingerprint=snapshot.fingerprint,
+            coverage=snapshot.coverage,
+            entries=snapshot.entries,
+        )
+
+
+class PromptTests(unittest.TestCase):
+    PROMPT_TEXT = "SECRET-PROMPT-TEXT"
+
+    def test_prompt_resolves_session_to_pane_and_issues_one_prompt_call(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(), agent_prompted_response()
+        )
+        result = RuntimeClient(plugin).prompt(session_ref(), "hello")
+
+        self.assertTrue(result.ok, result.evidence.reason)
+        self.assertEqual(result.value.session_id, "sess-1")
+        self.assertTrue(result.value.accepted)
+        # K4: the snapshot read plus exactly one side-effecting agent prompt.
+        self.assertEqual(
+            runner.calls,
+            [("api", "snapshot"), ("agent", "prompt", "ws-1:p1", "hello")],
+        )
+
+    def test_prompt_rejects_returned_session_mismatch(self) -> None:
+        # The send already happened, so this cannot undo it, but the ack must
+        # not claim a success when the pane's agent session changed between the
+        # snapshot and the prompt. The returned value is never copied through.
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(),
+            agent_prompted_response(session=("id", "sess-returned-elsewhere")),
+        )
+        with self.assertRaises(HerdrProtocolError):
+            plugin.prompt(session_ref(session_id="sess-1"), "hello")
+        # Honest count: the send was issued exactly once.
+        self.assertEqual(
+            runner.calls,
+            [("api", "snapshot"), ("agent", "prompt", "ws-1:p1", "hello")],
+        )
+
+    def test_prompt_without_matching_session_fails_closed(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(), agent_prompted_response()
+        )
+        with self.assertRaises(HerdrNotFoundError):
+            plugin.prompt(session_ref(session_id="sess-absent"), "hello")
+        # No match resolves before the side-effecting call: zero prompt calls.
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_prompt_ambiguous_session_match_fails_closed(self) -> None:
+        # Two distinct panes record the same session id: refusing to guess.
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=2)],
+            panes=[make_pane("ws-1:p1"), make_pane("ws-1:p2")],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_prompted_response())
+        with self.assertRaises(HerdrProtocolError):
+            plugin.prompt(session_ref(), "hello")
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_prompt_snapshot_workspace_mismatch_fails_closed(self) -> None:
+        runner = ScriptedRunner(snapshot_response())
+        plugin = _WrongWorkspaceSnapshotPlugin(runner=runner, clock=lambda: FIXED_NOW)
+        with self.assertRaises(HerdrNotFoundError):
+            plugin.prompt(session_ref(workspace_id="ws-1"), "hello")
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_prompt_partial_snapshot_fails_closed_without_a_prompt_call(self) -> None:
+        # A workspace declaring two panes but listing one is a half-view: the
+        # session happens to match, but the plugin must refuse to write.
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=2)],
+            panes=[make_pane("ws-1:p1")],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_prompted_response())
+        with self.assertRaises(HerdrProtocolError):
+            plugin.prompt(session_ref(), "hello")
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_prompt_partial_snapshot_hiding_duplicate_session_fails_closed(
+        self,
+    ) -> None:
+        # The exact defect: the visible pane carries the requested session, but
+        # an unlisted pane could carry it too, so uniqueness cannot be proven.
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=2)],
+            panes=[make_pane("ws-1:p1", session=("id", "sess-1"))],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_prompted_response())
+        with self.assertRaises(HerdrProtocolError):
+            plugin.prompt(session_ref(), "hello")
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_prompt_complete_multi_pane_snapshot_succeeds(self) -> None:
+        # The fix must not refuse a complete view: two named panes, two declared,
+        # coverage 1.0, and only the matching session is prompted.
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=2)],
+            panes=[
+                make_pane("ws-1:p1", session=("id", "sess-1")),
+                make_pane("ws-1:p2", session=("id", "sess-2")),
+            ],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_prompted_response())
+        ack = plugin.prompt(session_ref(session_id="sess-1"), "hello")
+        self.assertTrue(ack.accepted)
+        self.assertEqual(ack.session_id, "sess-1")
+        self.assertEqual(
+            runner.calls,
+            [("api", "snapshot"), ("agent", "prompt", "ws-1:p1", "hello")],
+        )
+
+    def test_prompt_refuses_text_starting_with_hyphen(self) -> None:
+        # A leading hyphen may be read as an option by the bare-argument CLI, so
+        # it is refused before any call is made.
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(), agent_prompted_response()
+        )
+        with self.assertRaises(ValueError):
+            plugin.prompt(session_ref(), "--wait")
+        self.assertEqual(runner.calls, [])
+
+    def test_prompt_rejects_wrong_returned_pane_id(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(), agent_prompted_response(pane_id="ws-1:p2")
+        )
+        with self.assertRaises(HerdrProtocolError) as caught:
+            plugin.prompt(session_ref(), self.PROMPT_TEXT)
+        self.assertNotIn(self.PROMPT_TEXT, str(caught.exception))
+        self.assertEqual(
+            runner.calls,
+            [("api", "snapshot"), ("agent", "prompt", "ws-1:p1", self.PROMPT_TEXT)],
+        )
+
+    def test_prompt_rejects_returned_workspace_mismatch(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(), agent_prompted_response(workspace_id="ws-other")
+        )
+        with self.assertRaises(HerdrNotFoundError):
+            plugin.prompt(session_ref(workspace_id="ws-1"), "hello")
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_prompt_malformed_response_fails_closed(self) -> None:
+        # K6: an unreadable or unbound response never becomes an acceptance.
+        malformed = {
+            "non-json": "not json at all",
+            "wrong result type": _envelope("pane_info", "pane", make_pane()),
+            "missing agent object": _envelope("agent_prompted", "other", {}),
+            "non-object agent": _envelope("agent_prompted", "agent", []),
+            "agent without pane id": _envelope(
+                "agent_prompted", "agent", {"workspace_id": "ws-1"}
+            ),
+        }
+        for label, response in malformed.items():
+            with self.subTest(label=label):
+                plugin, runner = make_scripted_plugin(
+                    snapshot_response(), response
+                )
+                with self.assertRaises(HerdrProtocolError):
+                    plugin.prompt(session_ref(), "hello")
+                self.assertEqual(len(runner.calls), 2)
+
+    def test_prompt_error_envelope_is_sanitized(self) -> None:
+        secret = "/opt/example-host/secret"
+        recognized = json.dumps(
+            {"id": "cli:test", "error": {"code": "pane_not_found", "message": secret}}
+        )
+        plugin, runner = make_scripted_plugin(snapshot_response(), recognized)
+        with self.assertRaises(HerdrNotFoundError) as caught:
+            plugin.prompt(session_ref(), "hello")
+        self.assertEqual(str(caught.exception), "Herdr reports 'pane_not_found'")
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual(len(runner.calls), 2)
+
+        unrecognized = json.dumps(
+            {
+                "id": "cli:test",
+                "error": {"code": secret + "_not_found", "message": secret},
+            }
+        )
+        plugin, runner = make_scripted_plugin(snapshot_response(), unrecognized)
+        with self.assertRaises(HerdrProtocolError) as caught:
+            plugin.prompt(session_ref(), "hello")
+        self.assertEqual(
+            str(caught.exception), "Herdr returned an unrecognized error response"
+        )
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_prompt_missing_executable_is_sanitized_and_unchained(self) -> None:
+        # The second call goes through the real default transport, whose
+        # executable is absent: no process runs, and the OS error text (which
+        # carries the path) is never surfaced or chained.
+        secret = "/opt/example-host/secret/herdr"
+        snapshot_runner = FakeRunner(snapshot_response())
+
+        def runner(argv):
+            if argv[:1] == ("api",):
+                return snapshot_runner(argv)
+            return _subprocess_runner(secret, 5.0)(argv)
+
+        plugin = HerdrRuntimePlugin(runner=runner, clock=lambda: FIXED_NOW)
+        with self.assertRaises(HerdrTransportError) as caught:
+            plugin.prompt(session_ref(), self.PROMPT_TEXT)
+        message = str(caught.exception)
+        self.assertNotIn(secret, message)
+        self.assertNotIn("example-host", message)
+        self.assertNotIn(self.PROMPT_TEXT, message)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_prompt_timeout_is_sanitized_and_unchained(self) -> None:
+        snapshot_runner = FakeRunner(snapshot_response())
+
+        def runner(argv):
+            if argv[:1] == ("api",):
+                return snapshot_runner(argv)
+            return _subprocess_runner("herdr", 0.2)(argv)
+
+        plugin = HerdrRuntimePlugin(runner=runner, clock=lambda: FIXED_NOW)
+        secret_cmd = [
+            "/opt/example-host/secret/herdr",
+            "agent",
+            "prompt",
+            "ws-1:p1",
+            self.PROMPT_TEXT,
+        ]
+        with mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired(secret_cmd, 0.2)
+        ):
+            with self.assertRaises(HerdrTransportError) as caught:
+                plugin.prompt(session_ref(), self.PROMPT_TEXT)
+        message = str(caught.exception)
+        self.assertIn("timed out", message)
+        self.assertNotIn("/opt/example-host", message)
+        self.assertNotIn(self.PROMPT_TEXT, message)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_prompt_never_reaches_real_subprocess(self) -> None:
+        # K7: with the injected runner, the real transport must not run.
+        plugin, runner = make_scripted_plugin(
+            snapshot_response(), agent_prompted_response()
+        )
+        with mock.patch(
+            "subprocess.run", side_effect=AssertionError("real subprocess reached")
+        ):
+            ack = plugin.prompt(session_ref(), "hello")
+        self.assertTrue(ack.accepted)
+        self.assertEqual(
+            runner.calls,
+            [("api", "snapshot"), ("agent", "prompt", "ws-1:p1", "hello")],
+        )
+
+
 # -- explicit unsupported / unavailable capabilities -----------------------
 
 
@@ -547,26 +912,22 @@ class UnsupportedCapabilityTests(unittest.TestCase):
         request = StartRequest(workspace_id="ws-1", argv=("example",))
         self.assert_unavailable(self.client.start(request), self.runner)
 
-    def test_prompt_is_unavailable_without_a_call(self) -> None:
-        session = SessionRef("herdr", "ws-1", "term-1", "sess-1")
-        self.assert_unavailable(self.client.prompt(session, "hello"), self.runner)
-
     def test_close_is_unavailable_without_a_call(self) -> None:
-        session = SessionRef("herdr", "ws-1", "term-1", "sess-1")
+        session = session_ref()
         self.assert_unavailable(self.client.close(session), self.runner)
 
     def test_plugin_methods_raise_unsupported_capability(self) -> None:
         plugin = HerdrRuntimePlugin()
         execution = ExecutionRef("herdr", "ws-1", "term-1")
-        session = SessionRef("herdr", "ws-1", "term-1", "sess-1")
+        session = session_ref()
         with self.assertRaises(UnsupportedCapability):
             plugin.observe(execution)
         with self.assertRaises(UnsupportedCapability):
             plugin.start(StartRequest(workspace_id="ws-1", argv=("example",)))
         with self.assertRaises(UnsupportedCapability):
-            plugin.prompt(session, "hello")
-        with self.assertRaises(UnsupportedCapability):
             plugin.close(session)
+        # prompt is implemented and must no longer raise UnsupportedCapability.
+        self.assertIn(Capability.PROMPT, plugin.capabilities())
 
 
 class ClientReferenceGuardTests(unittest.TestCase):
@@ -775,6 +1136,60 @@ class UntrustedFieldSanitizationTests(unittest.TestCase):
         self.assertEqual(
             str(caught.exception), "Herdr returned output that is not JSON"
         )
+
+
+# -- plugin import boundary (the repo suite's top-level glob does not reach here)
+
+
+class PluginImportBoundaryTests(unittest.TestCase):
+    """The plugin lives outside the repo suite's ``src/cao/*.py`` glob.
+
+    The privacy denylist still applies (it uses a recursive glob), but these
+    checks close the rest of the boundary locally: standard library or cao
+    only, and no concrete sibling plugin import.
+    """
+
+    PLUGIN_PATH = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "cao"
+        / "plugins"
+        / "herdr"
+        / "__init__.py"
+    )
+    CAO_ROOT = Path(__file__).resolve().parents[1] / "src" / "cao"
+
+    def _imported_modules(self) -> set[str]:
+        tree = ast.parse(self.PLUGIN_PATH.read_text(encoding="utf-8"))
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module)
+        return modules
+
+    def test_plugin_imports_only_stdlib_or_cao(self) -> None:
+        extra: list[str] = []
+        for module in self._imported_modules():
+            top = module.split(".")[0]
+            if top == "cao":
+                continue
+            if (self.CAO_ROOT / f"{top}.py").exists():
+                # A relative import resolved to a sibling cao module.
+                continue
+            if top not in sys.stdlib_module_names:
+                extra.append(module)
+        self.assertEqual(extra, [])
+
+    def test_plugin_imports_no_concrete_sibling_plugin(self) -> None:
+        offenders = [
+            module
+            for module in self._imported_modules()
+            if module in {"plugins", "cao.plugins", "observers", "cao.observers"}
+            or module.startswith(("plugins.", "cao.plugins."))
+        ]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":

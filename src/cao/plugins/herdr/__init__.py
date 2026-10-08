@@ -25,23 +25,55 @@ Supported generic capabilities
     Exactly one ``pane get`` call for one pane target, mapped to a
     :class:`~cao.contracts.TargetInspection`.
 
+``session.prompt``
+    One ``api snapshot`` read resolves the requested session to a pane through
+    the snapshot identity model (``session_id`` -> ``target_id``, the
+    ``pane_id``), then exactly one ``herdr agent prompt <pane_id> <text>`` call
+    submits the prompt. The acknowledgement is bound to the requested session
+    and workspace, and is produced only when Herdr answers with an
+    ``agent_prompted`` result for the same pane whose agent still reports the
+    requested session.
+
+    Because a write follows the read, the resolution refuses to act on any view
+    it cannot trust. A snapshot with incomplete coverage (below 1.0), an absent
+    session, a session matching more than one pane, or a snapshot bound to
+    another workspace are each an explicit error, and none of them issues a
+    prompt call. ``snapshot()`` still reports partial coverage as data; it is
+    ``prompt()`` that declines to write against it.
+
+    Two limits are deliberate. Prompt text beginning with ``-`` is refused with
+    ``ValueError`` before any call, because ``herdr agent prompt <TARGET>
+    <TEXT>`` passes the text as a bare argument and it cannot be proven from
+    here that a leading hyphen is not parsed as an option. And once the send has
+    been issued, any later failure -- including the returned-identity checks --
+    raises even though the prompt may already have landed, so a caller that
+    simply retries can submit the same prompt twice. There is no retry,
+    idempotency or deduplication here.
+
 Everything else stays deliberately unsupported (``UNAVAILABLE``) because it
 cannot be mapped safely to the frozen generic contract against Herdr's current
 protocol:
 
 ``output.observe``
-    Herdr returns undifferentiated terminal text with no event boundaries or
-    per-event timestamps. Synthesising events would invent observations.
+    ``herdr agent read`` returns undifferentiated terminal text with no event
+    boundaries. The frozen :class:`~cao.contracts.RuntimeEvent` requires a
+    per-event ``timestamp`` that Herdr does not report, so synthesising events
+    would invent observations.
 
 ``execution.start``
-    Herdr starts named interactive agents in an already-open pane; a
-    ``StartRequest`` carries an arbitrary argv and no target, so the two do not
-    map.
+    ``herdr agent start <name> --kind <kind> --pane <id>`` requires an explicit
+    ``--pane`` in an already-open pane. A :class:`~cao.contracts.StartRequest`
+    carries a workspace, argv and label but no target pane, so choosing one
+    would invent a selection policy the contract does not express.
 
-``session.prompt`` / ``session.close``
-    Promoting an opaque agent session id to a Herdr pane/agent target is not a
-    stable, defined mapping, and both are write actions. Herdr closes a pane
-    (a layout slot), not a session.
+``session.close``
+    Herdr closes a *pane* (``herdr pane close <pane_id>``), a layout slot, not a
+    session, and a :class:`~cao.contracts.SessionRef` carries no pane identity
+    to target one safely; closing the layout slot to satisfy a session close
+    would destroy the wrong object. For the record: ``herdr`` has no
+    agent-level close -- the ``herdr agent`` subcommands are list, get, read,
+    send-keys, prompt, rename, focus, wait, attach, start and explain -- so
+    this stays unavailable rather than being re-litigated.
 
 Identity mapping
 ----------------
@@ -70,6 +102,8 @@ from typing import Any, Callable, Sequence
 
 from ...contracts import (
     Capability,
+    PromptAck,
+    SessionRef,
     Snapshot,
     SnapshotEntry,
     TargetInspection,
@@ -97,6 +131,7 @@ SUPPORTED_PROTOCOL = 22
 
 _SNAPSHOT_COMMAND = ("api", "snapshot")
 _PANE_GET_PREFIX = ("pane", "get")
+_AGENT_PROMPT_PREFIX = ("agent", "prompt")
 
 #: The only Herdr error codes this plugin acts on. A code is reflected in a
 #: public message only when it is a member of this allowlist; every other
@@ -247,7 +282,12 @@ class HerdrRuntimePlugin(RuntimePlugin):
 
     def capabilities(self) -> frozenset[Capability]:
         return frozenset(
-            {Capability.DISCOVERY, Capability.SNAPSHOT, Capability.INSPECT}
+            {
+                Capability.DISCOVERY,
+                Capability.SNAPSHOT,
+                Capability.INSPECT,
+                Capability.PROMPT,
+            }
         )
 
     # -- snapshot.capture --------------------------------------------------
@@ -312,6 +352,85 @@ class HerdrRuntimePlugin(RuntimePlugin):
             execution_id=_terminal_id(pane),
             session_id=_session_id(pane),
             detail=_pane_detail(pane),
+        )
+
+    # -- session.prompt ----------------------------------------------------
+
+    def prompt(self, session: SessionRef, text: str) -> PromptAck:
+        # ``agent prompt <TARGET> <TEXT>`` passes the text as a bare argument
+        # with no ``--`` separator, so a leading hyphen could be parsed as an
+        # option. That cannot be proven safe from here, so such text is refused
+        # before any call rather than sent unverified.
+        if text.startswith("-"):
+            raise ValueError(
+                "prompt text starting with '-' is not supported: the Herdr CLI "
+                "takes it as a bare argument and could read it as an option"
+            )
+        snapshot = self.snapshot(session.workspace_id)
+        # Resolve the requested session to a pane through the plugin's own
+        # snapshot identity model. A snapshot bound to another workspace, an
+        # incomplete (partially observed) snapshot, an absent session and an
+        # ambiguous multi-match are each explicit errors and none of them is
+        # resolved by guessing.
+        if snapshot.workspace_id != session.workspace_id:
+            raise HerdrNotFoundError(
+                f"snapshot is for workspace {snapshot.workspace_id!r}, not "
+                f"requested workspace {session.workspace_id!r}"
+            )
+        # A write follows this read, so the view must be complete: a partial
+        # snapshot cannot prove the session is unique (a hidden pane may carry
+        # the same session id), which would turn the ambiguity scan into a
+        # guess. coverage is the plugin's own observed/declared fraction, and
+        # anything below a full 1.0 is incomplete. ``snapshot()`` still reports
+        # partial coverage as data; only this write path refuses to act on it.
+        if snapshot.coverage < 1.0:
+            raise HerdrProtocolError(
+                f"snapshot coverage {snapshot.coverage} is incomplete; refusing "
+                f"to prompt against a partially observed workspace"
+            )
+        target_id = _resolve_session_target(snapshot, session)
+        result = _read_result(
+            self._runner((*_AGENT_PROMPT_PREFIX, target_id, text)),
+            "agent_prompted",
+        )
+        agent = result.get("agent")
+        if not isinstance(agent, Mapping):
+            raise HerdrProtocolError(
+                "agent_prompted result is missing an agent object"
+            )
+        # A bound ``agent_prompted`` result is Herdr's acceptance signal; a
+        # rejected submission arrives as an error envelope and never reaches
+        # here. Bind the acknowledgement to the exact requested identity before
+        # producing it: the returned pane must be the pane the session resolved
+        # to and the returned workspace must be the requested one. The requested
+        # session id is echoed from the request, never copied from the response.
+        pane_id = _require_str(agent, "pane_id")
+        if pane_id != target_id:
+            raise HerdrProtocolError(
+                f"returned pane id {pane_id!r} does not match prompted "
+                f"target {target_id!r}"
+            )
+        workspace_id = _require_str(agent, "workspace_id")
+        if workspace_id != session.workspace_id:
+            raise HerdrNotFoundError(
+                f"prompted pane {pane_id!r} belongs to workspace "
+                f"{workspace_id!r}, not requested workspace "
+                f"{session.workspace_id!r}"
+            )
+        # The send already happened and cannot be undone, but a false
+        # acknowledgement is still avoided: if the pane's agent session changed
+        # between the snapshot and the prompt, the pane no longer carries the
+        # requested session and must not be reported as a success. The returned
+        # session value is untrusted and is not echoed.
+        if _session_id(agent) != session.session_id:
+            raise HerdrProtocolError(
+                f"prompted pane {pane_id!r} no longer reports requested "
+                f"session {session.session_id!r}"
+            )
+        return PromptAck(
+            session_id=session.session_id,
+            accepted=True,
+            detail=f"prompted pane {target_id!r}",
         )
 
 
@@ -416,6 +535,37 @@ def _session_id(pane: Mapping[str, Any]) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _resolve_session_target(snapshot: Snapshot, session: SessionRef) -> str:
+    """Resolve one requested session to its pane target via snapshot identity.
+
+    Matching is on the snapshot's recorded ``session_id`` (the agent's opaque
+    session value), and the result is the pane's ``target_id``. No match is a
+    not-found error; more than one match is an explicit ambiguity error. Neither
+    is ever resolved by picking a row.
+
+    The caller must pass a *complete* snapshot (coverage 1.0): a partial listing
+    cannot prove the session is unique, so the ambiguity scan below is only
+    meaningful over a fully observed workspace.
+    """
+
+    matches = [
+        entry
+        for entry in snapshot.entries
+        if entry.session_id is not None and entry.session_id == session.session_id
+    ]
+    if not matches:
+        raise HerdrNotFoundError(
+            f"session {session.session_id!r} is not present in workspace "
+            f"{session.workspace_id!r}"
+        )
+    if len(matches) > 1:
+        raise HerdrProtocolError(
+            f"session {session.session_id!r} resolves to {len(matches)} panes; "
+            f"refusing to guess"
+        )
+    return matches[0].target_id
 
 
 def _pane_entry(pane: Mapping[str, Any]) -> SnapshotEntry:
