@@ -4,12 +4,15 @@ prompt, close, explicit selection, and no silent fallback."""
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 from cao.contracts import (
     Capability,
+    InvalidStartRequest,
+    Placement,
     StartRequest,
     UnsupportedCapability,
+    validate_placement,
 )
 from cao.evidence import EvidenceSource, Verdict
 from cao.runtime import (
@@ -412,6 +415,141 @@ class BasePluginTests(unittest.TestCase):
         with self.assertRaises(UnsupportedCapability):
             # Bypass the client to prove the base class itself refuses.
             super(FakeRuntimePlugin, plugin).snapshot("ws-1")
+
+
+class StartRequestPlacementTests(unittest.TestCase):
+    """The additive ``Placement`` contract on ``StartRequest`` (H1-H8)."""
+
+    def test_existing_constructions_still_work_with_new_fields_none(self) -> None:
+        positional = StartRequest("ws-1", ("run",))
+        labelled = StartRequest("ws-1", ("run",), "label")
+        keyword = StartRequest(workspace_id="ws-1", argv=("run",))
+        for request in (positional, labelled, keyword):
+            with self.subTest(request=request):
+                self.assertIsNone(request.target)
+                self.assertIsNone(request.placement)
+                self.assertIsNone(request.agent_kind)
+        self.assertEqual(labelled.label, "label")
+        self.assertEqual(keyword.workspace_id, "ws-1")
+        self.assertEqual(keyword.argv, ("run",))
+
+    def test_field_order_and_defaults_are_unchanged(self) -> None:
+        fields = StartRequest.__dataclass_fields__
+        self.assertEqual(
+            tuple(fields),
+            ("workspace_id", "argv", "label", "target", "placement", "agent_kind"),
+        )
+        for name in ("label", "target", "placement", "agent_kind"):
+            self.assertIs(fields[name].default, None)
+
+    def test_start_request_is_frozen(self) -> None:
+        request = StartRequest("ws-1", ("run",))
+        with self.assertRaises(FrozenInstanceError):
+            request.label = "changed"  # type: ignore[misc]
+        with self.assertRaises(FrozenInstanceError):
+            request.placement = Placement.PROVISION  # type: ignore[misc]
+
+    def test_placement_is_str_enum_with_exactly_two_members(self) -> None:
+        self.assertTrue(issubclass(Placement, str))
+        self.assertEqual(
+            {member.name: member.value for member in Placement},
+            {"EXISTING": "existing", "PROVISION": "provision"},
+        )
+        self.assertIsInstance(Placement.EXISTING, str)
+        self.assertEqual(Placement.EXISTING, "existing")
+
+    def test_unspecified_placement_is_valid(self) -> None:
+        self.assertIsNone(validate_placement(None, None, None))
+
+    def test_existing_with_target_validates(self) -> None:
+        self.assertIsNone(
+            validate_placement(Placement.EXISTING, target_ref(), None)
+        )
+
+    def test_existing_without_target_raises_named_rule(self) -> None:
+        with self.assertRaises(InvalidStartRequest) as ctx:
+            validate_placement(Placement.EXISTING, None, None)
+        self.assertEqual(ctx.exception.rule, "existing_requires_target")
+
+    def test_provision_without_target_validates(self) -> None:
+        self.assertIsNone(validate_placement(Placement.PROVISION, None, None))
+
+    def test_provision_with_target_raises_named_rule(self) -> None:
+        with self.assertRaises(InvalidStartRequest) as ctx:
+            validate_placement(Placement.PROVISION, target_ref(), None)
+        self.assertEqual(ctx.exception.rule, "provision_forbids_target")
+
+    def test_target_without_placement_is_refused(self) -> None:
+        with self.assertRaises(InvalidStartRequest) as ctx:
+            validate_placement(None, target_ref(), None)
+        self.assertEqual(ctx.exception.rule, "target_without_placement")
+
+    def test_agent_kind_none_and_opaque_string_validate(self) -> None:
+        self.assertIsNone(validate_placement(None, None, None))
+        self.assertIsNone(validate_placement(None, None, "agent"))
+        # Shape only: the value is opaque and never matched to an allowlist.
+        self.assertIsNone(validate_placement(None, None, "totally-opaque-kind"))
+
+    def test_empty_agent_kind_raises_named_rule(self) -> None:
+        with self.assertRaises(InvalidStartRequest) as ctx:
+            validate_placement(None, None, "")
+        self.assertEqual(ctx.exception.rule, "agent_kind")
+
+    def test_non_string_agent_kind_raises_named_rule(self) -> None:
+        for bad in (123, b"agent", ["agent"], object()):
+            with self.subTest(agent_kind=bad):
+                with self.assertRaises(InvalidStartRequest) as ctx:
+                    validate_placement(None, None, bad)  # type: ignore[arg-type]
+                self.assertEqual(ctx.exception.rule, "agent_kind")
+
+    def test_unknown_placement_value_is_refused(self) -> None:
+        with self.assertRaises(InvalidStartRequest) as ctx:
+            validate_placement("existing", None, None)  # type: ignore[arg-type]
+        self.assertEqual(ctx.exception.rule, "unknown_placement")
+
+    def test_every_combination_validates_or_raises_named_error(self) -> None:
+        placements = (None, Placement.EXISTING, Placement.PROVISION)
+        targets = (None, target_ref())
+        agent_kinds = (None, "agent", "", 123)
+
+        def expected_valid(placement, target, agent_kind) -> bool:
+            if agent_kind is not None and not (
+                isinstance(agent_kind, str) and agent_kind
+            ):
+                return False
+            if placement is None:
+                return target is None
+            if placement is Placement.EXISTING:
+                return target is not None
+            return target is None  # Placement.PROVISION
+
+        for placement in placements:
+            for target in targets:
+                for agent_kind in agent_kinds:
+                    with self.subTest(
+                        placement=placement,
+                        target=target,
+                        agent_kind=agent_kind,
+                    ):
+                        if expected_valid(placement, target, agent_kind):
+                            self.assertIsNone(
+                                validate_placement(placement, target, agent_kind)
+                            )
+                        else:
+                            # Named and specific, never a bare ValueError.
+                            with self.assertRaises(InvalidStartRequest):
+                                validate_placement(placement, target, agent_kind)
+
+    def test_contract_documentation_states_the_semantics(self) -> None:
+        for doc in (
+            Placement.__doc__,
+            StartRequest.__doc__,
+            validate_placement.__doc__,
+        ):
+            self.assertTrue(doc and doc.strip())
+        self.assertIn("EXISTING", StartRequest.__doc__ or "")
+        self.assertIn("PROVISION", StartRequest.__doc__ or "")
+        self.assertIn("agent_kind", validate_placement.__doc__ or "")
 
 
 if __name__ == "__main__":
