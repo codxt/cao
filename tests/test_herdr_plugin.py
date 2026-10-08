@@ -20,6 +20,7 @@ from unittest import mock
 from cao.contracts import (
     Capability,
     ExecutionRef,
+    Placement,
     SessionRef,
     Snapshot,
     StartRequest,
@@ -33,6 +34,7 @@ from cao.plugins.herdr import (
     HerdrProtocolError,
     HerdrRuntimePlugin,
     HerdrTransportError,
+    _AGENT_KINDS,
     _subprocess_runner,
     create_plugin,
 )
@@ -46,11 +48,11 @@ EXPECTED_CAPABILITIES = frozenset(
         Capability.SNAPSHOT,
         Capability.INSPECT,
         Capability.PROMPT,
+        Capability.START,
     }
 )
 UNIMPLEMENTED_CAPABILITIES = (
     Capability.OBSERVE,
-    Capability.START,
     Capability.CLOSE,
 )
 
@@ -165,6 +167,36 @@ def agent_prompted_response(
     return _envelope("agent_prompted", "agent", agent)
 
 
+def agent_started_response(
+    *,
+    pane_id: str = "ws-1:p1",
+    workspace_id: str = "ws-1",
+    terminal_id: str | None = "term-1",
+    agent_status: str = "working",
+    session: tuple[str, str] | None = ("id", "sess-1"),
+) -> str:
+    """A protocol-22 ``agent_started`` result carrying an ``AgentInfo``."""
+
+    agent: dict = {
+        "pane_id": pane_id,
+        "workspace_id": workspace_id,
+        "tab_id": "ws-1:t1",
+        "agent_status": agent_status,
+        "focused": True,
+        "revision": 4,
+    }
+    if terminal_id is not None:
+        agent["terminal_id"] = terminal_id
+    if session is not None:
+        agent["agent_session"] = {
+            "source": "herdr:example",
+            "agent": "example",
+            "kind": session[0],
+            "value": session[1],
+        }
+    return _envelope("agent_started", "agent", agent)
+
+
 def _envelope(result_type: str, key: str, value: object) -> str:
     return json.dumps(
         {
@@ -231,6 +263,56 @@ def session_ref(
     runtime_id: str = "herdr",
 ) -> SessionRef:
     return SessionRef(runtime_id, workspace_id, execution_id, session_id)
+
+
+def idle_snapshot_response(
+    *,
+    pane_id: str = "ws-1:p1",
+    workspace_id: str = "ws-1",
+    terminal_id: str = "term-1",
+    agent_status: str = "idle",
+) -> str:
+    """A one-pane snapshot whose pane is ready for a new agent."""
+
+    return snapshot_response(
+        workspaces=[make_workspace(workspace_id, pane_count=1)],
+        panes=[
+            make_pane(
+                pane_id,
+                workspace_id=workspace_id,
+                terminal_id=terminal_id,
+                agent_status=agent_status,
+                agent=None,
+                session=None,
+            )
+        ],
+    )
+
+
+def start_request(
+    *,
+    workspace_id: str = "ws-1",
+    argv: tuple = (),
+    label: str | None = "worker",
+    target_id: str | None = "ws-1:p1",
+    target_workspace_id: str = "ws-1",
+    target_runtime_id: str = "herdr",
+    placement: object = Placement.EXISTING,
+    agent_kind: str | None = "claude",
+) -> StartRequest:
+    target = (
+        None
+        if target_id is None
+        else TargetRef(target_runtime_id, target_workspace_id, target_id)
+    )
+    return StartRequest(
+        workspace_id=workspace_id,
+        argv=tuple(argv),
+        label=label,
+        target=target,
+        placement=placement,  # type: ignore[arg-type]
+        agent_kind=agent_kind,
+    )
 
 
 # -- discovery / capabilities ----------------------------------------------
@@ -887,6 +969,424 @@ class PromptTests(unittest.TestCase):
             runner.calls,
             [("api", "snapshot"), ("agent", "prompt", "ws-1:p1", "hello")],
         )
+
+
+# -- start: supported EXISTING path ----------------------------------------
+
+
+class StartSupportedTests(unittest.TestCase):
+    ARGS = ("--model", "fast")
+
+    def test_agent_kind_allowlist_is_the_closed_herdr_set(self) -> None:
+        # The kind allowlist lives in the plugin, not core. This pins the closed
+        # set so it cannot silently widen or lose a member.
+        self.assertEqual(
+            _AGENT_KINDS,
+            {
+                "pi",
+                "claude",
+                "codex",
+                "gemini",
+                "cursor",
+                "devin",
+                "agy",
+                "cline",
+                "omp",
+                "mastracode",
+                "opencode",
+                "copilot",
+                "kimi",
+                "kiro",
+                "droid",
+                "amp",
+                "grok",
+                "hermes",
+                "kilo",
+                "qodercli",
+                "qwen",
+                "letta",
+                "maki",
+                "muse",
+            },
+        )
+
+    def test_start_existing_verifies_target_and_binds_terminal_identity(
+        self,
+    ) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response()
+        )
+        result = RuntimeClient(plugin).start(start_request(argv=self.ARGS))
+
+        self.assertTrue(result.ok, result.evidence.reason)
+        # One snapshot read plus exactly one side-effecting agent start.
+        self.assertEqual(
+            runner.calls,
+            [
+                ("api", "snapshot"),
+                (
+                    "agent",
+                    "start",
+                    "worker",
+                    "--kind",
+                    "claude",
+                    "--pane",
+                    "ws-1:p1",
+                    "--",
+                    "--model",
+                    "fast",
+                ),
+            ],
+        )
+        ref = result.value
+        self.assertEqual(ref.runtime_id, "herdr")
+        self.assertEqual(ref.workspace_id, "ws-1")
+        self.assertEqual(ref.execution_id, "term-1")
+
+    def test_start_without_agent_args_omits_the_separator(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response()
+        )
+        result = RuntimeClient(plugin).start(start_request())
+
+        self.assertTrue(result.ok, result.evidence.reason)
+        self.assertEqual(
+            runner.calls,
+            [
+                ("api", "snapshot"),
+                (
+                    "agent",
+                    "start",
+                    "worker",
+                    "--kind",
+                    "claude",
+                    "--pane",
+                    "ws-1:p1",
+                ),
+            ],
+        )
+
+    def test_start_defaults_the_name_to_the_verified_target(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response()
+        )
+        self.assertTrue(
+            RuntimeClient(plugin).start(start_request(label=None)).ok
+        )
+        self.assertEqual(runner.calls[1][2], "ws-1:p1")
+
+    def test_start_never_reaches_real_subprocess(self) -> None:
+        # K7 for start: with the injected runner, the real transport must not run.
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response()
+        )
+        with mock.patch(
+            "subprocess.run", side_effect=AssertionError("real subprocess reached")
+        ):
+            result = RuntimeClient(plugin).start(start_request())
+        self.assertTrue(result.ok, result.evidence.reason)
+        self.assertEqual(len(runner.calls), 2)
+
+
+class StartUnavailableTests(unittest.TestCase):
+    def _start(self, request: StartRequest) -> None:
+        plugin, runner = make_plugin(snapshot_response())
+        result = RuntimeClient(plugin).start(request)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.value)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        # S2: refused before any Herdr call at all.
+        self.assertEqual(runner.calls, [])
+
+    def test_provision_is_unavailable_without_a_call(self) -> None:
+        self._start(
+            start_request(
+                placement=Placement.PROVISION, target_id=None, agent_kind=None
+            )
+        )
+
+    def test_provision_with_a_target_is_unavailable_without_a_call(self) -> None:
+        self._start(start_request(placement=Placement.PROVISION))
+
+    def test_unspecified_placement_is_unavailable_without_a_call(self) -> None:
+        self._start(start_request(placement=None, target_id=None))
+
+    def test_unspecified_placement_with_target_is_unavailable_without_a_call(
+        self,
+    ) -> None:
+        self._start(start_request(placement=None, target_id="ws-1:p1"))
+
+    def test_unknown_agent_kind_is_unavailable_without_a_call(self) -> None:
+        self._start(start_request(agent_kind="definitely-not-a-kind"))
+
+    def test_missing_agent_kind_is_unavailable_without_a_call(self) -> None:
+        self._start(start_request(agent_kind=None))
+
+    def test_existing_without_target_is_unavailable_without_a_call(self) -> None:
+        self._start(start_request(target_id=None))
+
+    def test_non_string_argv_is_unavailable_without_a_call(self) -> None:
+        self._start(start_request(argv=(123,)))
+
+    def test_missing_agent_kind_is_not_recovered_from_argv(self) -> None:
+        # The kind must be named explicitly. If it were silently recovered from
+        # argv[0], this otherwise-valid EXISTING target would be started; the
+        # plugin must instead refuse before any call.
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response()
+        )
+        result = RuntimeClient(plugin).start(
+            start_request(agent_kind=None, argv=("claude",))
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertIsNone(result.value)
+        self.assertEqual(runner.calls, [])
+
+    def test_label_starting_with_hyphen_is_unavailable_without_a_call(self) -> None:
+        # ``agent start <NAME>`` has no ``--`` before the name, so a leading
+        # hyphen could be parsed as an option; refused before any call.
+        self._start(start_request(label="--wait"))
+
+    def test_plugin_start_translates_invalid_placement_and_does_not_chain(
+        self,
+    ) -> None:
+        plugin, runner = make_plugin(snapshot_response())
+        request = start_request(placement="EXISTING-SECRET", target_id="ws-1:p1")
+        with self.assertRaises(UnsupportedCapability) as caught:
+            plugin.start(request)
+        self.assertEqual(
+            str(caught.exception), "capability not supported: execution.start"
+        )
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual(runner.calls, [])
+
+
+class StartTargetVerificationTests(unittest.TestCase):
+    def test_target_in_a_different_workspace_is_refused(self) -> None:
+        plugin, runner = make_plugin(snapshot_response())
+        result = RuntimeClient(plugin).start(
+            start_request(target_workspace_id="ws-other")
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertIsNone(result.value)
+        self.assertEqual(runner.calls, [])
+
+    def test_target_with_a_different_runtime_is_refused(self) -> None:
+        plugin, runner = make_plugin(snapshot_response())
+        result = RuntimeClient(plugin).start(
+            start_request(target_runtime_id="some-other-runtime")
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertIsNone(result.value)
+        self.assertEqual(runner.calls, [])
+
+    def test_target_absent_from_the_snapshot_is_refused(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(pane_id="ws-1:p2"), agent_started_response()
+        )
+        result = RuntimeClient(plugin).start(start_request(target_id="ws-1:p1"))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertIsNone(result.value)
+        # The read happened; the side-effecting start did not.
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_target_not_at_an_idle_shell_prompt_is_refused(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(agent_status="working"),
+            agent_started_response(),
+        )
+        result = RuntimeClient(plugin).start(start_request())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_partial_snapshot_is_refused_before_any_start(self) -> None:
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=2)],
+            panes=[
+                make_pane(
+                    "ws-1:p1", agent=None, session=None, agent_status="idle"
+                )
+            ],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_started_response())
+        result = RuntimeClient(plugin).start(start_request())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_idle_pane_carrying_an_agent_is_refused(self) -> None:
+        # An ``idle`` status can still host an agent and its session. State
+        # alone is not proof the pane is free, so the target is refused and the
+        # side-effecting agent-start call count is exactly zero -- asserted
+        # directly, because a later mismatch could mask a call already made.
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=1)],
+            panes=[
+                make_pane(
+                    "ws-1:p1", agent="example", agent_status="idle", session=None
+                )
+            ],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_started_response())
+        result = RuntimeClient(plugin).start(start_request())
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertIsNone(result.value)
+        # Only the snapshot read happened; zero agent starts.
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+    def test_idle_pane_carrying_a_session_is_refused(self) -> None:
+        # A session identity without an agent name is still an attached agent.
+        response = snapshot_response(
+            workspaces=[make_workspace("ws-1", pane_count=1)],
+            panes=[
+                make_pane(
+                    "ws-1:p1", agent=None, agent_status="idle", session=("id", "s1")
+                )
+            ],
+        )
+        plugin, runner = make_scripted_plugin(response, agent_started_response())
+        result = RuntimeClient(plugin).start(start_request())
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertEqual(runner.calls, [("api", "snapshot")])
+
+
+class StartResponseVerificationTests(unittest.TestCase):
+    def test_start_rejects_wrong_returned_pane_id(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response(pane_id="ws-1:p2")
+        )
+        with self.assertRaises(HerdrProtocolError):
+            plugin.start(start_request())
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_start_rejects_returned_workspace_mismatch(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(),
+            agent_started_response(workspace_id="ws-other"),
+        )
+        with self.assertRaises(HerdrNotFoundError):
+            plugin.start(start_request())
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_start_rejects_missing_terminal_identity(self) -> None:
+        # Without a reported terminal the execution identity cannot be bound to
+        # a real reported identity, so the outcome is not rounded up.
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response(terminal_id=None)
+        )
+        with self.assertRaises(HerdrProtocolError):
+            plugin.start(start_request())
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_start_zero_exit_without_detection_is_not_success(self) -> None:
+        # A zero exit is not proof: Herdr's success is a detection judgement,
+        # and a response that does not confirm the started agent is refused.
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), _envelope("agent_started", "other", {})
+        )
+        with self.assertRaises(HerdrProtocolError):
+            plugin.start(start_request())
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_start_empty_response_is_not_success(self) -> None:
+        plugin, runner = make_scripted_plugin(idle_snapshot_response(), "")
+        with self.assertRaises(HerdrProtocolError):
+            plugin.start(start_request())
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_start_rejects_wrong_result_type(self) -> None:
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(),
+            _envelope("agent_prompted", "agent", make_pane()),
+        )
+        with self.assertRaises(HerdrProtocolError):
+            plugin.start(start_request())
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_start_error_envelope_is_sanitized(self) -> None:
+        secret = "/opt/example-host/secret"
+        recognized = json.dumps(
+            {
+                "id": "cli:test",
+                "error": {"code": "pane_not_found", "message": secret},
+            }
+        )
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), recognized
+        )
+        with self.assertRaises(HerdrNotFoundError) as caught:
+            plugin.start(start_request())
+        self.assertEqual(str(caught.exception), "Herdr reports 'pane_not_found'")
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+        unrecognized = json.dumps(
+            {
+                "id": "cli:test",
+                "error": {"code": secret + "_not_found", "message": secret},
+            }
+        )
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), unrecognized
+        )
+        with self.assertRaises(HerdrProtocolError) as caught:
+            plugin.start(start_request())
+        self.assertEqual(
+            str(caught.exception), "Herdr returned an unrecognized error response"
+        )
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_start_missing_executable_is_sanitized_and_unchained(self) -> None:
+        secret = "/opt/example-host/secret/herdr"
+        snapshot_runner = FakeRunner(idle_snapshot_response())
+
+        def runner(argv):
+            if argv[:1] == ("api",):
+                return snapshot_runner(argv)
+            return _subprocess_runner(secret, 5.0)(argv)
+
+        plugin = HerdrRuntimePlugin(runner=runner, clock=lambda: FIXED_NOW)
+        with self.assertRaises(HerdrTransportError) as caught:
+            plugin.start(start_request())
+        message = str(caught.exception)
+        self.assertNotIn(secret, message)
+        self.assertNotIn("example-host", message)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_start_timeout_is_sanitized_and_unchained(self) -> None:
+        snapshot_runner = FakeRunner(idle_snapshot_response())
+
+        def runner(argv):
+            if argv[:1] == ("api",):
+                return snapshot_runner(argv)
+            return _subprocess_runner("herdr", 0.2)(argv)
+
+        plugin = HerdrRuntimePlugin(runner=runner, clock=lambda: FIXED_NOW)
+        secret_cmd = ["/opt/example-host/secret/herdr", "agent", "start", "worker"]
+        with mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired(secret_cmd, 0.2)
+        ):
+            with self.assertRaises(HerdrTransportError) as caught:
+                plugin.start(start_request())
+        message = str(caught.exception)
+        self.assertIn("timed out", message)
+        self.assertNotIn("/opt/example-host", message)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
 
 
 # -- explicit unsupported / unavailable capabilities -----------------------

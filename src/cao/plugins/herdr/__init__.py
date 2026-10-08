@@ -25,6 +25,32 @@ Supported generic capabilities
     Exactly one ``pane get`` call for one pane target, mapped to a
     :class:`~cao.contracts.TargetInspection`.
 
+``execution.start``
+    One ``api snapshot`` read positively verifies a caller-supplied
+    ``EXISTING`` target (present in the requested workspace, a pane, and at a
+    state consistent with an idle shell prompt), then exactly one ``herdr
+    agent start <name> --kind <kind> --pane <id> [-- <arg>...]`` call starts
+    the agent. ``agent_kind`` is checked against the plugin's own closed
+    allowlist and is never inferred from ``argv``, which carries only the
+    trailing agent arguments after ``--``. The execution identity is derived
+    from the started pane's reported terminal, and the returned pane and
+    workspace are checked against the request, so Herdr's zero exit code alone
+    is never treated as a started agent.
+
+    ``Placement.PROVISION`` stays unavailable with no call: allocating a fresh
+    pane needs an ownership record and a cleanup policy the control plane does
+    not have yet, so this plugin never creates a pane or workspace, and
+    ``placement=None`` is refused even with a target supplied because core
+    deliberately never guesses that it implies ``EXISTING``.
+
+    One limitation is documented rather than hidden. A snapshot exposes only
+    that a pane exists in the right workspace and its reported state; it cannot
+    see an interactive shell prompt. A bare shell and a non-shell foreground
+    program both read as ``unknown`` in Herdr's protocol, so the shell-prompt
+    part of the precondition is *inferred* from state, not verified here. The
+    real safeguard is Herdr's own detection judgement on ``agent start``, and
+    that uncertainty is never presented as proof.
+
 ``session.prompt``
     One ``api snapshot`` read resolves the requested session to a pane through
     the snapshot identity model (``session_id`` -> ``target_id``, the
@@ -59,12 +85,6 @@ protocol:
     boundaries. The frozen :class:`~cao.contracts.RuntimeEvent` requires a
     per-event ``timestamp`` that Herdr does not report, so synthesising events
     would invent observations.
-
-``execution.start``
-    ``herdr agent start <name> --kind <kind> --pane <id>`` requires an explicit
-    ``--pane`` in an already-open pane. A :class:`~cao.contracts.StartRequest`
-    carries a workspace, argv and label but no target pane, so choosing one
-    would invent a selection policy the contract does not express.
 
 ``session.close``
     Herdr closes a *pane* (``herdr pane close <pane_id>``), a layout slot, not a
@@ -102,13 +122,19 @@ from typing import Any, Callable, Sequence
 
 from ...contracts import (
     Capability,
+    ExecutionRef,
+    InvalidStartRequest,
+    Placement,
     PromptAck,
     SessionRef,
     Snapshot,
     SnapshotEntry,
+    StartRequest,
     TargetInspection,
     TargetRef,
+    UnsupportedCapability,
     WorkspaceId,
+    validate_placement,
 )
 from ...evidence import fingerprint, utc_now
 from ...runtime import RuntimePlugin
@@ -132,6 +158,47 @@ SUPPORTED_PROTOCOL = 22
 _SNAPSHOT_COMMAND = ("api", "snapshot")
 _PANE_GET_PREFIX = ("pane", "get")
 _AGENT_PROMPT_PREFIX = ("agent", "prompt")
+_AGENT_START_PREFIX = ("agent", "start")
+_START_RESULT_TYPE = "agent_started"
+
+#: The closed set of agent kinds Herdr's ``agent start --kind`` accepts. The
+#: allowlist lives here, in the plugin, and never in core: an agent kind is
+#: opaque to CAO's generic contract. A kind outside this set is refused, and a
+#: kind is never inferred from ``argv``, which carries only trailing agent
+#: arguments.
+_AGENT_KINDS = frozenset(
+    {
+        "pi",
+        "claude",
+        "codex",
+        "gemini",
+        "cursor",
+        "devin",
+        "agy",
+        "cline",
+        "omp",
+        "mastracode",
+        "opencode",
+        "copilot",
+        "kimi",
+        "kiro",
+        "droid",
+        "amp",
+        "grok",
+        "hermes",
+        "kilo",
+        "qodercli",
+        "qwen",
+        "letta",
+        "maki",
+        "muse",
+    }
+)
+
+#: Pane states consistent with an idle interactive shell prompt: a pane that
+#: is either idle or carries no observed agent. Any other reported state means
+#: an agent already occupies the pane, so ``agent start`` must not target it.
+_IDLE_SHELL_STATES = frozenset({"idle", "unknown"})
 
 #: The only Herdr error codes this plugin acts on. A code is reflected in a
 #: public message only when it is a member of this allowlist; every other
@@ -287,6 +354,7 @@ class HerdrRuntimePlugin(RuntimePlugin):
                 Capability.SNAPSHOT,
                 Capability.INSPECT,
                 Capability.PROMPT,
+                Capability.START,
             }
         )
 
@@ -352,6 +420,141 @@ class HerdrRuntimePlugin(RuntimePlugin):
             execution_id=_terminal_id(pane),
             session_id=_session_id(pane),
             detail=_pane_detail(pane),
+        )
+
+    # -- execution.start ---------------------------------------------------
+
+    def start(self, request: StartRequest) -> ExecutionRef:
+        """Start one agent in a caller-supplied, positively verified pane.
+
+        Only ``placement=Placement.EXISTING`` with a target this plugin can
+        confirm is ever acted on. ``PROVISION``, an unspecified placement (even
+        with a target supplied), a missing or unknown ``agent_kind``, a label
+        whose leading hyphen the bare-argument CLI could read as an option, and
+        a target bound to another workspace or runtime each yield the plugin's
+        explicit unavailable signal with no Herdr call at all. ``PROVISION``
+        needs pane allocation plus an ownership and cleanup policy that do not
+        exist yet, so this deliberately does not implement it.
+
+        The pane check verifies only what the snapshot exposes: the target
+        exists in the requested workspace and reports no agent, session, or
+        working state. It cannot see a shell prompt -- a bare shell and a
+        non-shell foreground program both read as ``unknown`` -- so the
+        shell-prompt part of the precondition is inferred from state, not
+        verified, and Herdr's own detection judgement remains the safeguard.
+        """
+
+        # The contract is validated by an explicit call, not at construction,
+        # so the consumer discharges it here. A contradictory request becomes
+        # this plugin's own unavailable signal: the InvalidStartRequest is not
+        # raised onward and, as the raise happens outside the handler, it is
+        # not chained as cause or context either.
+        invalid_placement = False
+        try:
+            validate_placement(
+                request.placement, request.target, request.agent_kind
+            )
+        except InvalidStartRequest:
+            invalid_placement = True
+        if invalid_placement:
+            raise UnsupportedCapability(Capability.START)
+
+        target = request.target
+        if request.placement is not Placement.EXISTING or target is None:
+            raise UnsupportedCapability(Capability.START)
+        # The validator checks the request's own shape only; it does not check
+        # the target's runtime or workspace binding, so that is done here,
+        # before any call.
+        if target.runtime_id != PLUGIN_ID:
+            raise UnsupportedCapability(Capability.START)
+        if target.workspace_id != request.workspace_id:
+            raise UnsupportedCapability(Capability.START)
+        kind = request.agent_kind
+        if kind is None or kind not in _AGENT_KINDS:
+            raise UnsupportedCapability(Capability.START)
+        agent_args = tuple(request.argv)
+        if not all(isinstance(arg, str) for arg in agent_args):
+            raise UnsupportedCapability(Capability.START)
+        # ``agent start <NAME>`` passes the name as a bare argument with no
+        # ``--`` separator, so a leading hyphen could be parsed as an option.
+        # As in the prompt lane, such a label is refused before any call
+        # rather than sent unverified.
+        if isinstance(request.label, str) and request.label.startswith("-"):
+            raise UnsupportedCapability(Capability.START)
+        name = (
+            request.label
+            if isinstance(request.label, str) and request.label
+            else target.target_id
+        )
+
+        # A write follows this read, so the pane is positively verified from a
+        # complete snapshot of the requested workspace: the target must exist
+        # there as a pane at a state consistent with an idle shell prompt.
+        # Anything that cannot be confirmed is unavailable, never a guess.
+        snapshot = self.snapshot(request.workspace_id)
+        if snapshot.workspace_id != request.workspace_id:
+            raise UnsupportedCapability(Capability.START)
+        if snapshot.coverage < 1.0:
+            raise UnsupportedCapability(Capability.START)
+        entry = next(
+            (e for e in snapshot.entries if e.target_id == target.target_id),
+            None,
+        )
+        if entry is None or entry.kind != "pane":
+            raise UnsupportedCapability(Capability.START)
+        if entry.state not in _IDLE_SHELL_STATES:
+            raise UnsupportedCapability(Capability.START)
+        # State alone is not proof the pane is free: an idle status can still
+        # carry an agent and its session. Refuse any entry whose snapshot
+        # identity model records an agent or a session, so a pane already
+        # hosting an agent never receives a start call.
+        if entry.session_id is not None or _entry_reports_agent(entry):
+            raise UnsupportedCapability(Capability.START)
+
+        command = [
+            *_AGENT_START_PREFIX,
+            name,
+            "--kind",
+            kind,
+            "--pane",
+            target.target_id,
+        ]
+        if agent_args:
+            command.append("--")
+            command.extend(agent_args)
+        result = _read_result(self._runner(tuple(command)), _START_RESULT_TYPE)
+        agent = result.get("agent")
+        if not isinstance(agent, Mapping):
+            raise HerdrProtocolError(
+                "agent_started result is missing an agent object"
+            )
+        # Herdr's success is a detection judgement, not a process exit code, so
+        # the started agent is confirmed before it becomes positive evidence:
+        # the returned pane and workspace must be the requested ones, and the
+        # execution identity is derived from the pane's reported terminal,
+        # never invented and never copied from an unverified response.
+        pane_id = _require_str(agent, "pane_id")
+        if pane_id != target.target_id:
+            raise HerdrProtocolError(
+                f"returned pane id {pane_id!r} does not match started "
+                f"target {target.target_id!r}"
+            )
+        workspace_id = _require_str(agent, "workspace_id")
+        if workspace_id != request.workspace_id:
+            raise HerdrNotFoundError(
+                f"started pane {pane_id!r} belongs to workspace "
+                f"{workspace_id!r}, not requested workspace "
+                f"{request.workspace_id!r}"
+            )
+        terminal_id = _terminal_id(agent)
+        if terminal_id is None:
+            raise HerdrProtocolError(
+                "started agent does not report a terminal identity"
+            )
+        return ExecutionRef(
+            runtime_id=PLUGIN_ID,
+            workspace_id=request.workspace_id,
+            execution_id=terminal_id,
         )
 
     # -- session.prompt ----------------------------------------------------
@@ -535,6 +738,17 @@ def _session_id(pane: Mapping[str, Any]) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _entry_reports_agent(entry: SnapshotEntry) -> bool:
+    """True when a snapshot entry records an attached agent.
+
+    The pane entry's metadata already carries the plugin's parsed agent
+    identity (the ``agent`` key, when Herdr reported one), so this reads the
+    snapshot's own model rather than re-parsing raw fields.
+    """
+
+    return any(key == "agent" for key, _ in entry.metadata)
 
 
 def _resolve_session_target(snapshot: Snapshot, session: SessionRef) -> str:
