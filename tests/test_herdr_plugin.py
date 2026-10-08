@@ -1075,6 +1075,37 @@ class StartSupportedTests(unittest.TestCase):
         )
         self.assertEqual(runner.calls[1][2], "ws-1:p1")
 
+    def test_valid_existing_start_is_not_invalid_and_starts_once(self) -> None:
+        # K4: the outer-boundary validation must not swallow a well-formed,
+        # supported request. A valid EXISTING start still reaches the plugin
+        # and succeeds, the value binds the verified execution id, and exactly
+        # one side-effecting agent start is issued (after the snapshot read).
+        plugin, runner = make_scripted_plugin(
+            idle_snapshot_response(), agent_started_response()
+        )
+        result = RuntimeClient(plugin).start(start_request())
+
+        self.assertTrue(result.ok, result.evidence.reason)
+        self.assertNotEqual(result.evidence.verdict, Verdict.INVALID)
+        self.assertEqual(result.evidence.source, EvidenceSource.PLUGIN)
+        self.assertIsNotNone(result.value)
+        self.assertEqual(result.value.execution_id, "term-1")
+        self.assertEqual(
+            runner.calls,
+            [
+                ("api", "snapshot"),
+                (
+                    "agent",
+                    "start",
+                    "worker",
+                    "--kind",
+                    "claude",
+                    "--pane",
+                    "ws-1:p1",
+                ),
+            ],
+        )
+
     def test_start_never_reaches_real_subprocess(self) -> None:
         # K7 for start: with the injected runner, the real transport must not run.
         plugin, runner = make_scripted_plugin(
@@ -1098,6 +1129,18 @@ class StartUnavailableTests(unittest.TestCase):
         # S2: refused before any Herdr call at all.
         self.assertEqual(runner.calls, [])
 
+    def _start_invalid(self, request: StartRequest) -> None:
+        # K3: a structurally contradictory request is refused at the client
+        # boundary as RUNTIME/INVALID before the plugin is consulted -- assert
+        # the whole shape, not only the verdict string.
+        plugin, runner = make_plugin(snapshot_response())
+        result = RuntimeClient(plugin).start(request)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertEqual(result.evidence.verdict, Verdict.INVALID)
+        self.assertIsNone(result.value)
+        self.assertEqual(runner.calls, [])
+
     def test_provision_is_unavailable_without_a_call(self) -> None:
         self._start(
             start_request(
@@ -1105,16 +1148,19 @@ class StartUnavailableTests(unittest.TestCase):
             )
         )
 
-    def test_provision_with_a_target_is_unavailable_without_a_call(self) -> None:
-        self._start(start_request(placement=Placement.PROVISION))
+    def test_provision_with_a_target_is_invalid_without_a_call(self) -> None:
+        # PROVISION forbids a target: naming one contradicts the placement.
+        self._start_invalid(start_request(placement=Placement.PROVISION))
 
     def test_unspecified_placement_is_unavailable_without_a_call(self) -> None:
         self._start(start_request(placement=None, target_id=None))
 
-    def test_unspecified_placement_with_target_is_unavailable_without_a_call(
+    def test_unspecified_placement_with_target_is_invalid_without_a_call(
         self,
     ) -> None:
-        self._start(start_request(placement=None, target_id="ws-1:p1"))
+        # A target without an explicit placement is refused: the client never
+        # guesses that it implies EXISTING.
+        self._start_invalid(start_request(placement=None, target_id="ws-1:p1"))
 
     def test_unknown_agent_kind_is_unavailable_without_a_call(self) -> None:
         self._start(start_request(agent_kind="definitely-not-a-kind"))
@@ -1122,11 +1168,37 @@ class StartUnavailableTests(unittest.TestCase):
     def test_missing_agent_kind_is_unavailable_without_a_call(self) -> None:
         self._start(start_request(agent_kind=None))
 
-    def test_existing_without_target_is_unavailable_without_a_call(self) -> None:
-        self._start(start_request(target_id=None))
+    def test_existing_without_target_is_invalid_without_a_call(self) -> None:
+        # EXISTING requires a caller-supplied target: naming none contradicts
+        # the placement.
+        self._start_invalid(start_request(target_id=None))
 
     def test_non_string_argv_is_unavailable_without_a_call(self) -> None:
         self._start(start_request(argv=(123,)))
+
+    def test_direct_plugin_start_declines_without_client_invalid_leak(self) -> None:
+        # K5: the client boundary refuses a structurally invalid request as
+        # INVALID before the plugin is ever reached. Direct plugin use has no
+        # such boundary, so an unsupported/declined request still surfaces the
+        # plugin's own UnsupportedCapability -- never a client INVALID result
+        # -- and still makes no Herdr call.
+        requests = (
+            # A well-formed request the plugin genuinely declines.
+            start_request(
+                placement=Placement.PROVISION, target_id=None, agent_kind=None
+            ),
+            # Structurally contradictory requests the client now refuses.
+            start_request(target_id=None),
+            start_request(placement=None, target_id="ws-1:p1"),
+            start_request(target_workspace_id="ws-other"),
+            start_request(target_runtime_id="some-other-runtime"),
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                plugin, runner = make_plugin(snapshot_response())
+                with self.assertRaises(UnsupportedCapability):
+                    plugin.start(request)
+                self.assertEqual(runner.calls, [])
 
     def test_missing_agent_kind_is_not_recovered_from_argv(self) -> None:
         # The kind must be named explicitly. If it were silently recovered from
@@ -1165,22 +1237,29 @@ class StartUnavailableTests(unittest.TestCase):
 
 class StartTargetVerificationTests(unittest.TestCase):
     def test_target_in_a_different_workspace_is_refused(self) -> None:
+        # The target's workspace binds it to the request, so a mismatch is a
+        # structural contradiction the client refuses as RUNTIME/INVALID
+        # before any plugin call.
         plugin, runner = make_plugin(snapshot_response())
         result = RuntimeClient(plugin).start(
             start_request(target_workspace_id="ws-other")
         )
         self.assertFalse(result.ok)
-        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertEqual(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertEqual(result.evidence.verdict, Verdict.INVALID)
         self.assertIsNone(result.value)
         self.assertEqual(runner.calls, [])
 
     def test_target_with_a_different_runtime_is_refused(self) -> None:
+        # A target bound to another runtime is refused at the client boundary
+        # as RUNTIME/INVALID, exactly like a mismatched inspect reference.
         plugin, runner = make_plugin(snapshot_response())
         result = RuntimeClient(plugin).start(
             start_request(target_runtime_id="some-other-runtime")
         )
         self.assertFalse(result.ok)
-        self.assertEqual(result.evidence.verdict, Verdict.UNAVAILABLE)
+        self.assertEqual(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertEqual(result.evidence.verdict, Verdict.INVALID)
         self.assertIsNone(result.value)
         self.assertEqual(runner.calls, [])
 

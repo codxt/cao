@@ -3,7 +3,9 @@
 Launching a worker is an authority-sensitive action, so the order of checks is
 the point of this module:
 
-1. the request must be a well formed :class:`StartRequest`;
+1. the request must be a well formed :class:`StartRequest` whose placement
+   fields are coherent and whose target, if any, is bound to this plugin and
+   the requested workspace;
 2. policy must authorize the exact start action;
 3. the runtime plugin must advertise :data:`Capability.START`;
 4. only then is the injected spawner invoked.
@@ -24,7 +26,10 @@ from .contracts import (
     Capability,
     CapabilityResult,
     ExecutionRef,
+    InvalidStartRequest,
     StartRequest,
+    TargetRef,
+    validate_placement,
 )
 from .evidence import (
     EvidenceSource,
@@ -103,6 +108,17 @@ class Launcher:
                 Verdict.INVALID,
                 EvidenceSource.POLICY,
                 f"start requires a PolicyDecision, got {type(decision).__name__}",
+            )
+
+        # Gate 0: the request must be well formed. Placement coherence is the
+        # contract's own explicit call, and a supplied target must also be
+        # bound to this plugin and the requested workspace, which the
+        # validator alone cannot know. Refuse before any authority, capability
+        # or spawner side effect.
+        problem = self._validate_request(request)
+        if problem is not None:
+            return self._unavailable(
+                Verdict.INVALID, EvidenceSource.RUNTIME, problem
             )
 
         # Gate 1: authority. Refuse before anything is spawned. An allowed
@@ -200,6 +216,46 @@ class Launcher:
             ),
             value=spawned,
         )
+
+    def _validate_request(self, request: StartRequest) -> str | None:
+        """Bind a start request's placement fields before any side effect.
+
+        The contract's ``validate_placement`` is an explicit call, not a
+        construction-time one, so it is discharged here. It checks the
+        request's own shape only; a supplied target is also required to name
+        this launcher's plugin and the requested workspace, which the
+        validator cannot know.
+        """
+
+        try:
+            validate_placement(
+                request.placement, request.target, request.agent_kind
+            )
+        except InvalidStartRequest as exc:
+            # ``exc.rule`` is a fixed identifier from a closed set. The
+            # exception's ``detail`` may embed the caller-supplied raw value
+            # (e.g. an unrecognized placement), so it never reaches the public
+            # reason; the full detail stays on the exception for callers.
+            return f"invalid start request: {exc.rule}"
+        target = request.target
+        if target is None:
+            return None
+        if not isinstance(target, TargetRef):
+            return (
+                f"start target must be a TargetRef, got "
+                f"{type(target).__name__}"
+            )
+        if target.runtime_id != self._plugin_id:
+            return (
+                f"target runtime_id {target.runtime_id!r} does not match "
+                f"plugin id {self._plugin_id!r}"
+            )
+        if target.workspace_id != request.workspace_id:
+            return (
+                f"target workspace_id {target.workspace_id!r} does not match "
+                f"requested workspace {request.workspace_id!r}"
+            )
+        return None
 
     def _validate_ref(self, request: StartRequest, spawned: object) -> str | None:
         if not isinstance(spawned, ExecutionRef):

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cao import launcher as launcher_module
-from cao.contracts import Capability, ExecutionRef, StartRequest
+from cao.contracts import Capability, ExecutionRef, Placement, StartRequest, TargetRef
 from cao.evidence import EvidenceSource, Verdict, build_evidence, fingerprint
 from cao.launcher import Launcher, LauncherError
 from cao.policy import ActionKind, ActionRequest, Grant, PolicyDecision, PolicyEngine
@@ -294,6 +294,152 @@ class FailClosedTests(unittest.TestCase):
         result = self._launcher(spawner).launch(request(), decision())
         self.assertIs(result.evidence.verdict, Verdict.INVALID)
         self.assertIsNone(result.value)
+
+
+class PlacementGuardTests(unittest.TestCase):
+    """DS-J: bind a start request's placement before the spawner.
+
+    Every case runs with an ALLOWED workspace-scoped START grant and the START
+    capability advertised, so the only refusal left is the new
+    placement/identity check. The spawn count is asserted directly: a guard
+    that ran only after the spawn would still have spawned once.
+    """
+
+    def _launch(self, start: StartRequest):
+        spawner = RecordingSpawner(execution_ref())
+        result = Launcher(
+            plugin_id=PLUGIN_ID,
+            capabilities=ALL_CAPABILITIES,
+            spawner=spawner,
+        ).launch(start, decision())
+        return result, spawner
+
+    def _assert_refused_before_spawn(self, start: StartRequest) -> None:
+        result, spawner = self._launch(start)
+        self.assertEqual(spawner.calls, [])
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.value)
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+
+    def test_existing_without_target_is_refused_before_spawn(self) -> None:
+        self._assert_refused_before_spawn(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.EXISTING,
+            )
+        )
+
+    def test_provision_with_target_is_refused_before_spawn(self) -> None:
+        self._assert_refused_before_spawn(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.PROVISION,
+                target=TargetRef(PLUGIN_ID, WORKSPACE_ID, "target-1"),
+            )
+        )
+
+    def test_target_in_another_workspace_is_refused_before_spawn(self) -> None:
+        self._assert_refused_before_spawn(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.EXISTING,
+                target=TargetRef(PLUGIN_ID, "ws-other", "target-1"),
+            )
+        )
+
+    def test_target_for_another_runtime_is_refused_before_spawn(self) -> None:
+        self._assert_refused_before_spawn(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.EXISTING,
+                target=TargetRef("runtime-other", WORKSPACE_ID, "target-1"),
+            )
+        )
+
+    def test_non_target_reference_is_refused_without_raising(self) -> None:
+        # A plain string must be refused as malformed input, not raise an
+        # unhandled AttributeError while its identity is read.
+        self._assert_refused_before_spawn(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.EXISTING,
+                target="ws-1:p1",  # type: ignore[arg-type]
+            )
+        )
+
+    def test_unknown_placement_raw_value_not_leaked_in_reason(self) -> None:
+        # A caller-supplied placement is opaque and may be sensitive. The
+        # public reason carries only the fixed rule identifier, never the raw
+        # value that the exception's detail embeds.
+        secret = "synthetic-secret-placement-42"
+        spawner = RecordingSpawner(execution_ref())
+        result = Launcher(
+            plugin_id=PLUGIN_ID,
+            capabilities=ALL_CAPABILITIES,
+            spawner=spawner,
+        ).launch(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=secret,  # type: ignore[arg-type]
+            ),
+            decision(),
+        )
+        self.assertEqual(spawner.calls, [])
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.value)
+        self.assertIs(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+        reason = result.evidence.reason or ""
+        self.assertNotIn(secret, reason)
+        self.assertIn("unknown_placement", reason)
+
+    def test_refusal_precedes_spawner_under_a_valid_gate(self) -> None:
+        # Allowed policy and an advertised capability: only the placement
+        # guard can stop the spawn, and the spawn count proves it did so
+        # before the spawner was reached.
+        result, spawner = self._launch(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.PROVISION,
+                target=TargetRef(PLUGIN_ID, WORKSPACE_ID, "target-1"),
+            )
+        )
+        self.assertEqual(spawner.calls, [])
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+
+    def test_unspecified_placement_still_spawns_once(self) -> None:
+        result, spawner = self._launch(request())
+        self.assertTrue(result.ok)
+        self.assertEqual(len(spawner.calls), 1)
+        self.assertEqual(result.value.runtime_id, PLUGIN_ID)
+        self.assertEqual(result.value.workspace_id, WORKSPACE_ID)
+
+    def test_bound_existing_target_still_spawns_once(self) -> None:
+        ref = execution_ref()
+        spawner = RecordingSpawner(ref)
+        result = Launcher(
+            plugin_id=PLUGIN_ID,
+            capabilities=ALL_CAPABILITIES,
+            spawner=spawner,
+        ).launch(
+            StartRequest(
+                workspace_id=WORKSPACE_ID,
+                argv=("worker",),
+                placement=Placement.EXISTING,
+                target=TargetRef(PLUGIN_ID, WORKSPACE_ID, "target-1"),
+            ),
+            decision(),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(len(spawner.calls), 1)
+        self.assertIs(result.value, ref)
 
 
 class EvidenceTests(unittest.TestCase):

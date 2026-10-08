@@ -11,6 +11,7 @@ from cao.contracts import (
     InvalidStartRequest,
     Placement,
     StartRequest,
+    TargetRef,
     UnsupportedCapability,
     validate_placement,
 )
@@ -367,6 +368,187 @@ class RuntimeBoundaryTests(unittest.TestCase):
         result = RuntimeClient(NonFiniteCoverage()).snapshot("ws-1")
         self.assertFalse(result.ok)
         self.assertIsNone(result.value)
+
+
+class StartPlacementGuardTests(unittest.TestCase):
+    """DS-J: RuntimeClient.start binds placement before any plugin call.
+
+    Case A is a structurally invalid request the client rejects without
+    consulting the plugin: RUNTIME / INVALID, value None, zero plugin calls.
+    Case B is a coherent request the plugin genuinely declines: it stays
+    PLUGIN / UNAVAILABLE. The plugin records every call, so the distinction is
+    proven by the call count rather than inferred from the verdict string.
+    """
+
+    def _assert_malformed_refused(self, start: StartRequest) -> None:
+        plugin = FakeRuntimePlugin()
+        result = RuntimeClient(plugin).start(start)
+        self.assertEqual(plugin.calls, [])
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.value)
+        self.assertIs(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+
+    def test_existing_without_target_is_runtime_invalid_without_call(self) -> None:
+        self._assert_malformed_refused(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.EXISTING,
+            )
+        )
+
+    def test_provision_with_target_is_runtime_invalid_without_call(self) -> None:
+        self._assert_malformed_refused(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.PROVISION,
+                target=target_ref(),
+            )
+        )
+
+    def test_target_in_another_workspace_is_runtime_invalid_without_call(self) -> None:
+        self._assert_malformed_refused(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.EXISTING,
+                target=TargetRef("fake", "ws-other", "target-1"),
+            )
+        )
+
+    def test_target_for_another_runtime_is_runtime_invalid_without_call(self) -> None:
+        self._assert_malformed_refused(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.EXISTING,
+                target=TargetRef("other-runtime", "ws-1", "target-1"),
+            )
+        )
+
+    def test_non_target_reference_is_runtime_invalid_without_raising(self) -> None:
+        # A plain string must be refused as malformed input, not raise an
+        # unhandled AttributeError while its identity is read.
+        self._assert_malformed_refused(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.EXISTING,
+                target="ws-1:p1",  # type: ignore[arg-type]
+            )
+        )
+
+    def test_malformed_request_full_refusal_shape(self) -> None:
+        # Lock the whole refusal shape, not just the verdict string: the
+        # client owns this refusal, so it is RUNTIME / INVALID with no call.
+        plugin = FakeRuntimePlugin()
+        result = RuntimeClient(plugin).start(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.EXISTING,
+                target=TargetRef("other-runtime", "ws-1", "target-1"),
+            )
+        )
+        self.assertEqual(plugin.calls, [])
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.value)
+        self.assertIs(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+
+    def test_unknown_placement_raw_value_not_leaked_in_reason(self) -> None:
+        # A caller-supplied placement is opaque and may be sensitive. The
+        # public reason carries only the fixed rule identifier, never the raw
+        # value that the exception's detail embeds.
+        secret = "synthetic-secret-placement-42"
+        plugin = FakeRuntimePlugin()
+        result = RuntimeClient(plugin).start(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=secret,  # type: ignore[arg-type]
+            )
+        )
+        self.assertEqual(plugin.calls, [])
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.value)
+        self.assertIs(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+        reason = result.evidence.reason or ""
+        self.assertNotIn(secret, reason)
+        self.assertIn("unknown_placement", reason)
+
+    def test_refusal_precedes_plugin_under_an_advertised_capability(self) -> None:
+        # The plugin declares START; only the placement guard can stop the
+        # call, and the empty call list proves it ran before the plugin.
+        plugin = FakeRuntimePlugin()
+        result = RuntimeClient(plugin).start(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.PROVISION,
+                target=target_ref(),
+            )
+        )
+        self.assertEqual(plugin.calls, [])
+        self.assertFalse(result.ok)
+        self.assertIs(result.evidence.source, EvidenceSource.RUNTIME)
+        self.assertIs(result.evidence.verdict, Verdict.INVALID)
+
+    def test_coherent_but_unsupported_request_stays_plugin_unavailable(self) -> None:
+        # A well-formed request the plugin genuinely declines must keep the
+        # plugin's UNAVAILABLE verdict: the guard must not reclassify it.
+
+        class DecliningStart(FakeRuntimePlugin):
+            def start(self, request: StartRequest) -> object:
+                self.calls.append(("start", request))
+                raise UnsupportedCapability(Capability.START)
+
+        for start in (
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.PROVISION,
+            ),
+            StartRequest(workspace_id="ws-1", argv=("run",)),
+        ):
+            with self.subTest(start=start):
+                plugin = DecliningStart()
+                result = RuntimeClient(plugin).start(start)
+                self.assertFalse(result.ok)
+                self.assertIsNone(result.value)
+                self.assertIs(result.evidence.source, EvidenceSource.PLUGIN)
+                self.assertIs(result.evidence.verdict, Verdict.UNAVAILABLE)
+                # The plugin was genuinely consulted and declined.
+                self.assertEqual(len(plugin.calls), 1)
+
+    def test_unspecified_placement_still_dispatches_once(self) -> None:
+        plugin = FakeRuntimePlugin()
+        result = RuntimeClient(plugin).start(
+            StartRequest(workspace_id="ws-1", argv=("run",))
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(len(plugin.calls), 1)
+        self.assertEqual(result.value.runtime_id, "fake")
+        self.assertEqual(result.value.workspace_id, "ws-1")
+        self.assertEqual(result.value.execution_id, "exec-1")
+
+    def test_bound_existing_target_still_dispatches_once(self) -> None:
+        plugin = FakeRuntimePlugin()
+        result = RuntimeClient(plugin).start(
+            StartRequest(
+                workspace_id="ws-1",
+                argv=("run",),
+                placement=Placement.EXISTING,
+                target=target_ref(),
+            )
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(len(plugin.calls), 1)
+        self.assertEqual(result.value.runtime_id, "fake")
+        self.assertEqual(result.value.workspace_id, "ws-1")
 
 
 class DiscoveryGuardTests(unittest.TestCase):

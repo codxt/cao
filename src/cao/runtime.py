@@ -29,6 +29,7 @@ from .contracts import (
     CapabilityResult,
     CloseAck,
     ExecutionRef,
+    InvalidStartRequest,
     Observation,
     PromptAck,
     RuntimeDescriptor,
@@ -39,6 +40,7 @@ from .contracts import (
     TargetRef,
     UnsupportedCapability,
     WorkspaceId,
+    validate_placement,
 )
 from .evidence import (
     EvidenceError,
@@ -355,6 +357,17 @@ class RuntimeClient:
                 Capability.START,
                 f"start requires a StartRequest, got {type(request).__name__}",
             )
+        # The request's placement fields are bound before the plugin is
+        # reached: the contract's explicit validate_placement call plus the
+        # target's runtime/workspace identity, which the validator alone
+        # cannot know. A structurally invalid request is the CLIENT's refusal
+        # -- it is known before execution and the plugin never sees it -- so
+        # it is INVALID at the RUNTIME source with no plugin call. A coherent
+        # request the plugin genuinely declines keeps its existing plugin
+        # UNAVAILABLE verdict.
+        problem = _validate_start_request(self.plugin_id, request)
+        if problem is not None:
+            return self._invalid_input(Capability.START, problem)
         return self._invoke(
             Capability.START,
             lambda: self._plugin.start(request),
@@ -647,6 +660,40 @@ def _validate_observation(
         return (
             f"observation execution_id {value.execution_id!r} does not match "
             f"requested execution {execution.execution_id!r}"
+        )
+    return None
+
+
+def _validate_start_request(plugin_id: str, request: StartRequest) -> str | None:
+    """Bind a start request's placement fields before any plugin call.
+
+    The contract's ``validate_placement`` checks the request's own shape
+    only; a supplied target is also required to name this client's plugin and
+    the requested workspace, which the validator cannot know.
+    """
+
+    try:
+        validate_placement(request.placement, request.target, request.agent_kind)
+    except InvalidStartRequest as exc:
+        # ``exc.rule`` is a fixed identifier from a closed set. The
+        # exception's ``detail`` may embed the caller-supplied raw value
+        # (e.g. an unrecognized placement), so it never reaches the public
+        # reason; the full detail stays on the exception for callers.
+        return f"invalid start request: {exc.rule}"
+    target = request.target
+    if target is None:
+        return None
+    if not isinstance(target, TargetRef):
+        return f"start target must be a TargetRef, got {type(target).__name__}"
+    if target.runtime_id != plugin_id:
+        return (
+            f"target runtime_id {target.runtime_id!r} does not match client "
+            f"plugin {plugin_id!r}"
+        )
+    if target.workspace_id != request.workspace_id:
+        return (
+            f"target workspace_id {target.workspace_id!r} does not match "
+            f"requested workspace {request.workspace_id!r}"
         )
     return None
 
