@@ -1133,6 +1133,61 @@ class ReviewCorrectionTests(unittest.TestCase):
         self.assertNotIn("\n- forged: line", rendered)
         self.assertIn("forged: line", rendered)
 
+    def test_an_item_dropped_by_the_recheck_is_not_lost_forever(self) -> None:
+        """Round-3 MAJOR: the cursor advanced past an item that was selected
+        but not delivered, and select_new's timestamp filter then made that
+        item permanently unreachable instead of merely undelivered."""
+        old = make_item("A", "old item", observed_at="2026-01-01T10:00:00Z")
+        new = make_item("B", "new item", observed_at="2026-01-01T12:00:00Z")
+        calls = {"n": 0}
+
+        def reader(source_id, since):
+            calls["n"] += 1
+            # Run 1 cycle: both. Run 1 recheck: the flaky source omits A.
+            # Every run after: both again.
+            if calls["n"] == 2:
+                return ok_read(source_id, [new])
+            return ok_read(source_id, [old, new])
+
+        sink = LocalFileSink(self.out)
+        ledger = DeliveryLedger()
+        bookmarks = Bookmarks()
+        first = self._run(
+            make_spec(["s"]), reader, sink, ledger=ledger, bookmarks=bookmarks
+        )
+        self.assertEqual([line.item_id for line in first.brief.lines], ["B"])
+        second = self._run(
+            make_spec(["s"]), reader, sink, ledger=ledger, bookmarks=bookmarks
+        )
+        self.assertIn("A", [line.item_id for line in second.brief.lines])
+        third = self._run(
+            make_spec(["s"]), reader, sink, ledger=ledger, bookmarks=bookmarks
+        )
+        # Delivered once, not twice: the unchanged-item filter takes over.
+        self.assertNotIn("A", [line.item_id for line in third.brief.lines])
+
+    def test_the_cursor_never_passes_an_undelivered_item(self) -> None:
+        """The bookmark invariant stated directly, independent of the brief."""
+        old = make_item("A", "old item", observed_at="2026-01-01T10:00:00Z")
+        new = make_item("B", "new item", observed_at="2026-01-01T12:00:00Z")
+        calls = {"n": 0}
+
+        def reader(source_id, since):
+            calls["n"] += 1
+            return ok_read(source_id, [new] if calls["n"] == 2 else [old, new])
+
+        bookmarks = Bookmarks()
+        self._run(
+            make_spec(["s"]), reader, MemorySink(), bookmarks=bookmarks
+        )
+        entry = bookmarks.get("s")
+        if entry is not None:
+            self.assertLess(
+                entry.high_water,
+                "2026-01-01T10:00:00Z",
+                "the cursor moved to or past an item that was never delivered",
+            )
+
     def test_artifact_does_not_open_with_the_same_heading_twice(self) -> None:
         """n1: the body carried its own H1 and the sink prepended another."""
         sink = LocalFileSink(self.out)

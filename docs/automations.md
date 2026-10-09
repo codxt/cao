@@ -105,6 +105,14 @@ Bookmarks advance only after a delivery is `CONFIRMED`. That is what makes an
 interrupted run safe: an interrupted run never confirmed, so it never advanced,
 so the same items are selected again — no missed items, no duplicates.
 
+The cursor also never moves **past an item that was selected but not
+delivered**. A source that drops an item on the immediate recheck — a flaky
+page, a pagination hiccup — must not turn that item into an unreachable one,
+because selection drops anything older than `high_water` minus the overlap
+window. Only the delivered prefix below the earliest such gap is consumed; the
+gap and everything after it are re-selected next run, and the brief's own
+unchanged-item filter keeps the re-selection from reporting anything twice.
+
 ## CLI
 
 ```sh

@@ -538,7 +538,12 @@ def _compose(
     max_lines: int = MAX_LINES,
     max_quoted: int = MAX_QUOTED,
 ) -> tuple[DraftBrief, tuple[SourceRead, ...]]:
-    """Compose a draft brief and return it with the final reads it used."""
+    """Compose a draft brief, its final reads, and the items it selected.
+
+    The selected set is returned because the bookmark cursor must never move
+    past an item that was selected but not delivered; see
+    :func:`_commit_bookmarks`.
+    """
 
     if not callable(reader):
         raise BriefError("reader must be callable")
@@ -706,7 +711,18 @@ def _compose(
         brief,
         content_fingerprint=fingerprint(_without_generated_at(render_markdown(brief))),
     )
-    return brief, tuple(final_reads[source_id] for source_id in ordered)
+    return (
+        brief,
+        tuple(final_reads[source_id] for source_id in ordered),
+        # (source_id, item_id, observed_at-as-selected) for every candidate.
+        # The timestamp is the one the SELECTION saw, not the one the recheck
+        # saw: an item the recheck dropped entirely is still a gap, and losing
+        # it here is exactly how it would become unreachable.
+        frozenset(
+            (source_id, item.item_id, item.observed_at)
+            for source_id, item, _change in candidates
+        ),
+    )
 
 
 def compose_brief(
@@ -733,7 +749,7 @@ def compose_brief(
     named as unqualified in the returned brief.
     """
 
-    brief, _reads = _compose(
+    brief, _reads, _selected = _compose(
         source_ids=source_ids,
         reader=reader,
         bookmarks=bookmarks,
@@ -824,22 +840,45 @@ def _commit_bookmarks(
     bookmarks: Bookmarks,
     brief: DraftBrief,
     reads: tuple[SourceRead, ...],
+    selected: frozenset[tuple[str, str, str]],
 ) -> None:
     """Advance bookmarks only for the items actually written to the brief.
 
     Committing after a confirmed delivery is what makes a repeated run produce
     no missed items: an interrupted run that never confirmed leaves the
     bookmarks untouched, so the same items are selected again.
+
+    The cursor must never move past an item that was selected but NOT
+    delivered. ``select_new`` drops anything older than ``high_water`` minus the
+    overlap window, so advancing across a gap would make that item permanently
+    unreachable rather than merely undelivered this run. Only the delivered
+    prefix below the earliest such gap is consumed; items after the gap are
+    re-selected next run, and the brief's own unchanged-item filter keeps them
+    from being reported twice.
     """
 
     by_source: dict[str, set[str]] = {}
     for line in brief.lines:
         by_source.setdefault(line.source_id, set()).add(line.item_id)
+
     for read in reads:
         wanted = by_source.get(read.source_id)
         if not wanted or not read.complete:
             continue
-        items = tuple(item for item in read.items if item.item_id in wanted)
+        observed = {entry.item_id: entry.observed_at for entry in read.items}
+        gaps = [
+            selected_at
+            for source_id, item_id, selected_at in selected
+            if source_id == read.source_id and item_id not in wanted
+        ]
+        # Nothing is consumed past the earliest selected-but-undelivered item.
+        ceiling = min(gaps) if gaps else None
+        items = tuple(
+            entry
+            for entry in read.items
+            if entry.item_id in wanted
+            and (ceiling is None or entry.observed_at < ceiling)
+        )
         if items:
             bookmarks.advance(replace(read, items=items))
 
@@ -884,7 +923,7 @@ def run_brief(
     source_ids = tuple(source.source_id for source in spec.sources)
     source_texts = {source.source_id: source.text for source in spec.sources}
 
-    brief, reads = _compose(
+    brief, reads, selected = _compose(
         source_ids=source_ids,
         reader=reader,
         bookmarks=bookmarks,
@@ -915,7 +954,7 @@ def run_brief(
     )
     delivered = receipt.state is DeliveryState.CONFIRMED
     if delivered:
-        _commit_bookmarks(bookmarks, brief, reads)
+        _commit_bookmarks(bookmarks, brief, reads, selected)
         if history is not None:
             for line in brief.lines:
                 history.record(line.source_id, line.item_id, line.fingerprint)
