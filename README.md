@@ -20,7 +20,13 @@ This repository provides a usable, **read-only** control-plane CLI:
   (`cao work list`, `cao worker list`, `cao run list`);
 - explicit intended-vs-observed reconciliation status
   (`cao coordinator status`);
-- relay deduplication-state inspection (`cao relay status`).
+- relay deduplication-state inspection (`cao relay status`);
+- declarative automation manifest validation and state inspection
+  (`cao automation validate`, `cao automation status`).
+
+`cao automation run` is present and **always reports `UNAVAILABLE` with a
+nonzero exit**: composing a brief needs a concrete source reader per declared
+source, and CAO ships none. See [`docs/automations.md`](docs/automations.md).
 
 Every command reports structured JSON, delegates to the module that owns the
 state, and fails closed. The CLI never mutates state and never fabricates a
@@ -56,6 +62,8 @@ cao worker list --ledger /path/to/registry.sqlite3
 cao run list --ledger /path/to/registry.sqlite3
 cao coordinator status --ledger /path/to/registry.sqlite3
 cao relay status --state examples/synthetic_ledger.json
+cao automation validate --config examples/automation_manifest.json
+cao automation status --bookmarks /path/to/bookmarks.json
 ```
 
 `plugins list` reports registered runtime plugins by explicit id. With no
@@ -84,7 +92,8 @@ than reimplementing any of their logic.
 
 See [`docs/architecture.md`](docs/architecture.md),
 [`docs/runtime-plugin.md`](docs/runtime-plugin.md),
-[`docs/operators.md`](docs/operators.md), and
+[`docs/operators.md`](docs/operators.md),
+[`docs/automations.md`](docs/automations.md), and
 [`docs/extraction-provenance.md`](docs/extraction-provenance.md).
 
 ## Development and validation

@@ -398,6 +398,189 @@ class QueryFailureTests(LaneFixtureTests):
                 self.assertIn("simulated corrupt page", payload["error"]["message"])
 
 
+class AutomationCommandTests(LaneFixtureTests):
+    """The automation group reports what it can prove and refuses the rest."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.manifest = self.repo_root / "examples" / "automation_manifest.json"
+        self.preferences = self.repo_root / "examples" / "automation_preferences.json"
+
+    def _manifest_argv(self, document: dict, name: str = "manifest.json") -> list[str]:
+        path = self.dir / name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return ["automation", "validate", "--config", str(path)]
+
+    def test_validate_accepts_the_shipped_synthetic_manifest(self) -> None:
+        code, output = run_cli(
+            [
+                "automation",
+                "validate",
+                "--config",
+                str(self.manifest),
+                "--preferences",
+                str(self.preferences),
+            ]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertEqual(payload["schema"], "cao.cli.automation.v0")
+        self.assertEqual(payload["status"], "OK")
+        self.assertEqual(payload["version"], "cao.automation.spec.v0")
+        self.assertEqual(payload["preferences"], "valid")
+        self.assertEqual(payload["destination"]["sink"], "local_file")
+
+    def test_validate_reports_the_schedule_as_descriptive_only(self) -> None:
+        code, output = run_cli(["automation", "validate", "--config", str(self.manifest)])
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertIn("external scheduler", payload["schedule"]["executed_by"])
+
+    def test_validate_refuses_an_unknown_version(self) -> None:
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["version"] = "cao.automation.spec.v99"
+        code, output = run_cli(self._manifest_argv(document))
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "INVALID")
+        self.assertEqual(payload["error"]["field"], "manifest.version")
+
+    def test_validate_refuses_an_unknown_sink(self) -> None:
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["destination"]["sink"] = "http_post"
+        code, output = run_cli(self._manifest_argv(document))
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["error"]["verdict"], "REFUSED")
+
+    def test_validate_refuses_corrupt_owner_preferences(self) -> None:
+        prefs = self.dir / "prefs.json"
+        prefs.write_text(
+            json.dumps({"version": "cao.automation.preferences.v0"}), encoding="utf-8"
+        )
+        code, output = run_cli(
+            [
+                "automation",
+                "validate",
+                "--config",
+                str(self.manifest),
+                "--preferences",
+                str(prefs),
+            ]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "INVALID")
+        # Absent preferences are refused, never defaulted to an empty set.
+        self.assertEqual(payload["error"]["field"], "preferences.timezone")
+
+    def test_validate_fails_closed_on_an_unreadable_document(self) -> None:
+        code, output = run_cli(
+            ["automation", "validate", "--config", str(self.dir / "absent.json")]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["schema"], "cao.cli.unavailable.v0")
+        self.assertEqual(payload["error"]["code"], "DOCUMENT_UNREADABLE")
+
+    def test_validate_fails_closed_on_a_non_object_document(self) -> None:
+        path = self.dir / "list.json"
+        path.write_text("[]", encoding="utf-8")
+        code, output = run_cli(["automation", "validate", "--config", str(path)])
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["error"]["code"], "DOCUMENT_SCHEMA")
+
+    def test_run_reports_the_missing_capability_and_exits_nonzero(self) -> None:
+        code, output = run_cli(
+            ["automation", "run", "--config", str(self.manifest), "--dry-run"]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["schema"], "cao.cli.unavailable.v0")
+        self.assertEqual(payload["group"], "automation")
+        self.assertEqual(payload["command"], "run")
+        self.assertEqual(payload["error"]["code"], "NO_SOURCE_ADAPTER")
+        self.assertEqual(payload["error"]["verdict"], "UNAVAILABLE")
+
+    def test_status_reports_absent_state_as_unavailable_not_empty(self) -> None:
+        code, output = run_cli(
+            ["automation", "status", "--bookmarks", str(self.dir / "absent.json")]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "UNAVAILABLE")
+        self.assertEqual(payload["state"]["bookmarks"], "absent")
+
+    def test_status_fails_closed_on_corrupt_persisted_state(self) -> None:
+        path = self.dir / "bookmarks.json"
+        path.write_text("{not json", encoding="utf-8")
+        code, output = run_cli(["automation", "status", "--bookmarks", str(path)])
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["state"]["bookmarks"]["status"], "INVALID")
+
+    def test_status_reads_each_state_through_its_own_loader(self) -> None:
+        from cao.brief import BriefHistory, ObservedItem
+        from cao.delivery import DeliveryLedger
+        from cao.sources import Bookmarks
+
+        paths = {}
+        for name, state in (
+            ("bookmarks", Bookmarks().as_state()),
+            ("delivery", DeliveryLedger().as_state()),
+            (
+                "history",
+                BriefHistory([ObservedItem("s", "i", "sha256:x")]).as_state(),
+            ),
+        ):
+            path = self.dir / f"{name}.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            paths[name] = str(path)
+
+        code, output = run_cli(
+            [
+                "automation",
+                "status",
+                "--bookmarks",
+                paths["bookmarks"],
+                "--delivery",
+                paths["delivery"],
+                "--history",
+                paths["history"],
+            ]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertEqual(payload["status"], "OK")
+        self.assertEqual(payload["state"]["delivery"]["receipt_count"], 0)
+        self.assertEqual(payload["state"]["brief_history"]["observed_count"], 1)
+
+    def test_automation_commands_write_nothing(self) -> None:
+        self.build()
+        before = {
+            path.name: path.read_bytes()
+            for path in sorted(self.dir.iterdir())
+            if path.is_file()
+        }
+        for argv in (
+            ["automation", "validate", "--config", str(self.manifest)],
+            ["automation", "status"],
+            ["automation", "run", "--config", str(self.manifest), "--dry-run"],
+        ):
+            with self.subTest(argv=argv):
+                code, output = run_cli(argv)
+                self.assertIn(code, (cli.EXIT_OK, cli.EXIT_UNAVAILABLE))
+                json.loads(output)
+        after = {
+            path.name: path.read_bytes()
+            for path in sorted(self.dir.iterdir())
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+
 class ReadOnlyTests(LaneFixtureTests):
     def test_every_command_leaves_state_byte_identical(self) -> None:
         self.build()

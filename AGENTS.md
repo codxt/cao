@@ -53,6 +53,12 @@ Initial disjoint implementation lanes:
   `src/cao/observers/github.py`, and dedicated coordinator/portfolio tests.
 - **Relay / progress:** `src/cao/relay.py`, `src/cao/progress.py`, and dedicated
   relay/progress tests.
+- **Automations:** `src/cao/sources.py`, `src/cao/delivery.py`, `src/cao/spec.py`,
+  `src/cao/brief.py`, and their dedicated tests. These four are one concern —
+  replay-safe source reads, outward delivery, the declarative manifest and the
+  draft-only brief — and they import only `evidence.py` and `state.py`. They
+  create no scheduler, no sink other than a local file, and no second ledger.
+  Automations never schedule anything and never send anything.
 
 Unspecified shared files, tests or docs remain with accountable integration.
 Cross-lane interface changes require manager review. CLI commands without a

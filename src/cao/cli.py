@@ -32,6 +32,7 @@ EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
 
 PLUGIN_GROUP = "plugins"
+AUTOMATION_GROUP = "automation"
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -290,6 +291,222 @@ def _cmd_relay_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _read_json_document(path: str, group: str, command: str) -> tuple[Any, int | None]:
+    """Read one JSON object from an explicitly named file, or fail closed.
+
+    An unreadable, absent, non-JSON or non-object file is a fail-closed result.
+    It is never treated as an empty or default document, because every document
+    this command group reads carries authority-bearing refusals.
+    """
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except OSError as exc:
+        return None, _unavailable(
+            group, command, "DOCUMENT_UNREADABLE", f"{type(exc).__name__}: {exc}"
+        )
+    except ValueError as exc:
+        return None, _unavailable(
+            group, command, "DOCUMENT_MALFORMED", f"{type(exc).__name__}: {exc}"
+        )
+    if not isinstance(payload, dict):
+        return None, _unavailable(
+            group,
+            command,
+            "DOCUMENT_SCHEMA",
+            f"document must contain a JSON object, got {type(payload).__name__}",
+        )
+    return payload, None
+
+
+def _cmd_automation_validate(args: argparse.Namespace) -> int:
+    """Validate an automation manifest and its owner preferences, read-only."""
+
+    manifest, code = _read_json_document(
+        args.config, AUTOMATION_GROUP, "validate"
+    )
+    if manifest is None:
+        return code if code is not None else EXIT_UNAVAILABLE
+
+    preferences = None
+    if args.preferences is not None:
+        preferences, code = _read_json_document(
+            args.preferences, AUTOMATION_GROUP, "validate"
+        )
+        if preferences is None:
+            return code if code is not None else EXIT_UNAVAILABLE
+
+    try:
+        from .spec import SpecInvalid, load_preferences, load_spec
+
+        automation = load_spec(manifest)
+    except SpecInvalid as exc:
+        _emit(
+            {
+                "schema": "cao.cli.automation.v0",
+                "status": "INVALID",
+                "config": args.config,
+                "error": {
+                    "code": exc.code,
+                    "verdict": exc.verdict.value,
+                    "field": exc.field,
+                    "message": exc.reason,
+                },
+            }
+        )
+        return EXIT_UNAVAILABLE
+
+    preference_state = "not_supplied"
+    if preferences is not None:
+        try:
+            load_preferences(preferences)
+        except SpecInvalid as exc:
+            _emit(
+                {
+                    "schema": "cao.cli.automation.v0",
+                    "status": "INVALID",
+                    "config": args.config,
+                    "preferences": args.preferences,
+                    "error": {
+                        "code": exc.code,
+                        "verdict": exc.verdict.value,
+                        "field": exc.field,
+                        "message": exc.reason,
+                    },
+                }
+            )
+            return EXIT_UNAVAILABLE
+        preference_state = "valid"
+
+    _emit(
+        {
+            "schema": "cao.cli.automation.v0",
+            "status": "OK",
+            "config": args.config,
+            "version": automation.version,
+            "name": automation.name,
+            "timezone": automation.timezone,
+            "source_count": len(automation.sources),
+            "source_ids": [source.source_id for source in automation.sources],
+            "destination": {
+                "sink": automation.destination.sink,
+                "destination_id": automation.destination.destination_id,
+                "cost_measurement": automation.destination.cost_measurement,
+            },
+            "schedule": {
+                "cadence": automation.schedule.cadence,
+                "executed_by": "an external scheduler the owner runs; CAO never fires it",
+            },
+            "limits": {
+                "max_duration_seconds": automation.limits.max_duration_seconds,
+                "max_concurrency": automation.limits.max_concurrency,
+                "max_calls": automation.limits.max_calls,
+            },
+            "stop": {"state": automation.stop.state.value},
+            "preferences": preference_state,
+        }
+    )
+    return EXIT_OK
+
+
+def _automation_state_summary(name: str, persisted: dict[str, Any]) -> dict[str, Any]:
+    """Summarize one persisted automation state file through its own loader."""
+
+    if name == "bookmarks":
+        from .sources import load_bookmarks
+
+        loaded = load_bookmarks(persisted)
+        return {
+            "status": "OK",
+            "sources": sorted(persisted["bookmarks"]),
+            "max_delivered_per_source": loaded.max_delivered_per_source,
+        }
+    if name == "delivery":
+        from .delivery import load_ledger
+
+        loaded = load_ledger(persisted)
+        return {
+            "status": "OK",
+            "receipt_count": len(loaded),
+            "pending": [
+                {"key": receipt.key, "state": receipt.state.value}
+                for receipt in loaded.pending()
+            ],
+        }
+    from .brief import load_history
+
+    loaded = load_history(persisted)
+    return {
+        "status": "OK",
+        "observed_count": len(loaded),
+        "max_entries": loaded.max_entries,
+    }
+
+
+def _cmd_automation_status(args: argparse.Namespace) -> int:
+    """Report persisted automation state truthfully, read-only.
+
+    An absent state file is a fail-closed answer, never an empty success: the
+    difference between "no run has happened" and "this is what the last run
+    actually observed" is the whole point of this command.
+    """
+
+    states: dict[str, Any] = {}
+    unavailable: list[str] = []
+    for name, path in (
+        ("bookmarks", args.bookmarks),
+        ("delivery", args.delivery),
+        ("brief_history", args.history),
+    ):
+        if path is None:
+            states[name] = "not_supplied"
+            continue
+        try:
+            persisted = state_module.read_state(path)
+            if persisted is None:
+                states[name] = "absent"
+                unavailable.append(name)
+                continue
+            states[name] = _automation_state_summary(name, persisted)
+        except Exception as exc:  # noqa: BLE001 - unreadable state fails closed
+            states[name] = {
+                "status": "INVALID",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            unavailable.append(name)
+
+    _emit(
+        {
+            "schema": "cao.cli.automation.status.v0",
+            "status": "OK" if not unavailable else "UNAVAILABLE",
+            "state": states,
+        }
+    )
+    return EXIT_UNAVAILABLE if unavailable else EXIT_OK
+
+
+def _cmd_automation_run(args: argparse.Namespace) -> int:
+    """Report that no concrete source adapter ships in this build.
+
+    Composing a brief needs a ``SourceReader`` for every declared source, and
+    CAO ships none: no runtime and no source adapter is a built-in default. This
+    command therefore never pretends to have run an automation. It reports the
+    exact missing capability and exits nonzero, which is the only honest answer
+    available until an adapter is registered by the operator.
+    """
+
+    return _unavailable(
+        AUTOMATION_GROUP,
+        "run",
+        "NO_SOURCE_ADAPTER",
+        "no concrete SourceReader is registered for this build, so no automation "
+        "can be executed; CAO ships no runtime and no source adapter as a "
+        "default. Validate a manifest with 'cao automation validate' and inspect "
+        "persisted state with 'cao automation status'.",
+    )
+
+
 def _add_ledger_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ledger",
@@ -423,6 +640,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="relay deduplication state JSON file to read",
     )
     relay_status.set_defaults(handler=_cmd_relay_status)
+
+    automation = groups.add_parser(
+        AUTOMATION_GROUP,
+        help="validate and inspect declarative automations (read-only)",
+        parents=[json_parent],
+    )
+    automation_commands = automation.add_subparsers(
+        dest="command", metavar="COMMAND"
+    )
+    automation_validate = automation_commands.add_parser(
+        "validate",
+        help="validate an automation manifest and its owner preferences",
+        parents=[json_parent],
+    )
+    automation_validate.add_argument(
+        "--config", required=True, metavar="PATH", help="automation manifest JSON"
+    )
+    automation_validate.add_argument(
+        "--preferences",
+        default=None,
+        metavar="PATH",
+        help="owner preferences JSON to validate read-only (never written)",
+    )
+    automation_validate.set_defaults(handler=_cmd_automation_validate)
+
+    automation_status = automation_commands.add_parser(
+        "status",
+        help="report persisted automation state through its own loader",
+        parents=[json_parent],
+    )
+    for flag, help_text in (
+        ("--bookmarks", "per-source bookmark state JSON (cao.automation.sources.v0)"),
+        ("--delivery", "delivery receipt ledger JSON (cao.automation.delivery.v0)"),
+        ("--history", "brief observation history JSON (cao.automation.brief.history.v0)"),
+    ):
+        automation_status.add_argument(
+            flag, default=None, metavar="PATH", help=help_text
+        )
+    automation_status.set_defaults(handler=_cmd_automation_status)
+
+    automation_run = automation_commands.add_parser(
+        "run",
+        help="report that no concrete source adapter ships in this build",
+        parents=[json_parent],
+    )
+    automation_run.add_argument(
+        "--config", required=True, metavar="PATH", help="automation manifest JSON"
+    )
+    automation_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="accepted and reported truthfully; there is nothing to execute",
+    )
+    automation_run.set_defaults(handler=_cmd_automation_run)
 
     return parser
 
