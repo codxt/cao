@@ -114,3 +114,14 @@ The `-S` run proves the core imports with no third-party packages on the path.
 
 See [`AGENTS.md`](AGENTS.md) for contribution boundaries and
 [`examples/`](examples) for a synthetic demo runtime.
+
+## License
+
+CAO is licensed under the Apache License, Version 2.0. The full text is in
+[`LICENSE`](LICENSE).
+
+That is the standard grant, including the express patent grant in section 3 and
+its patent-termination clause. The copyright owner is **not named** in the
+`LICENSE` file: the appendix still reads
+`Copyright [yyyy] [name of copyright owner]`, because no holder has been
+named yet.

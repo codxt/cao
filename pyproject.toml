@@ -7,10 +7,12 @@ name = "cao"
 version = "0.0.0"
 description = "Open-source AgentOps control plane for agentic runtimes"
 readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = []
 keywords = ["agentops", "control-plane", "agents", "runtime", "orchestration"]
 classifiers = [
+    "License :: OSI Approved :: Apache Software License",
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
