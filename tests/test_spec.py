@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -400,8 +401,12 @@ class ReviewCorrectionTests(unittest.TestCase):
     def test_pathological_nesting_is_a_spec_invalid_not_a_recursion_error(self) -> None:
         """m4: the credential scan recursed before any bound, so a deeply
         nested payload escaped as RecursionError instead of SpecInvalid."""
+        # Deeper than the interpreter's own recursion limit, so the UNBOUNDED
+        # scan this replaced would raise RecursionError rather than finishing.
+        # A payload merely past MAX_SCAN_DEPTH would not prove anything.
+        depth = sys.getrecursionlimit() * 2
         payload = {"leaf": True}
-        for _ in range(spec_module.MAX_SCAN_DEPTH + 50):
+        for _ in range(depth):
             payload = {"nested": payload}
         with self.assertRaises(SpecInvalid):
             load_spec(payload)
