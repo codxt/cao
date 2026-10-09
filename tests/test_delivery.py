@@ -10,12 +10,14 @@ import ast
 import importlib
 import tempfile
 import unittest
+from tempfile import TemporaryDirectory
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cao.delivery import (
     DELIVERY_STATE_SCHEMA,
     DeliveryCapacityError,
+    DeliveryError,
     DeliveryLedger,
     DeliveryMismatchError,
     DeliveryReceipt,
@@ -610,6 +612,43 @@ class LedgerUnitTests(unittest.TestCase):
         ledger.hold("h", "paused", clock=fixed_clock)
         pending = {receipt.key for receipt in ledger.pending()}
         self.assertEqual(pending, {"p", "s"})
+
+
+class ReviewCorrectionTests(unittest.TestCase):
+    """Regressions for the independent review of ea83df3."""
+
+    def test_key_cannot_escape_the_destination_directory(self) -> None:
+        """m3: the key was joined unchecked, so a key carrying a separator
+        wrote outside the directory the docstring promised."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            sink = LocalFileSink(root / "out")
+            with self.assertRaises(DeliveryError):
+                sink.deliver("../escape", "t", "body")
+            with self.assertRaises(DeliveryError):
+                sink.deliver("sub/dir", "t", "body")
+            with self.assertRaises(DeliveryError):
+                sink.deliver("..", "t", "body")
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_hold_refuses_a_confirmed_delivery(self) -> None:
+        """m6: hold had no state guard, so it could erase the only positive
+        receipt in the ledger and re-open the key for a resend."""
+        ledger = DeliveryLedger(clock=fixed_clock)
+        ledger.prepare("k", "dest")
+        ledger.confirm("k", "receipt-1")
+        with self.assertRaises(DeliveryError):
+            ledger.hold("k", "operator asked")
+        self.assertIs(ledger.get("k").state, DeliveryState.CONFIRMED)
+        self.assertEqual(ledger.get("k").receipt_id, "receipt-1")
+
+    def test_empty_title_does_not_duplicate_a_heading(self) -> None:
+        """n1: the sink prepended an H1 to a body that already had one."""
+        with TemporaryDirectory() as directory:
+            sink = LocalFileSink(directory)
+            sink.deliver("k", "", "# Heading\n\nbody\n")
+            written = (Path(directory) / "k.md").read_text(encoding="utf-8")
+            self.assertEqual(written, "# Heading\n\nbody\n\n")
 
 
 if __name__ == "__main__":

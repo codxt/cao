@@ -28,6 +28,7 @@ from cao.brief import (
     BriefHistory,
     BriefLine,
     BriefStateError,
+    ObservedItem,
     Signal,
     compose_brief,
     load_history,
@@ -879,6 +880,171 @@ class SignalTests(unittest.TestCase):
                 registry_projection="not a signal",
                 clock=clock_at(),
             )
+
+
+class ReviewCorrectionTests(unittest.TestCase):
+    """Regressions for the independent review of ea83df3.
+
+    Each test here failed against that SHA and must keep failing if the
+    correction is reverted.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out = Path(self._tmp.name) / "out"
+
+    def _run(self, spec, reader, sink, *, ledger=None, bookmarks=None,
+             history=None, clock=None, registry_projection=None,
+             runtime_projection=None):
+        return run_brief(
+            spec,
+            reader=reader,
+            sink=sink,
+            ledger=ledger if ledger is not None else DeliveryLedger(),
+            bookmarks=bookmarks if bookmarks is not None else Bookmarks(),
+            history=history,
+            clock=clock or clock_at(),
+            registry_projection=registry_projection,
+            runtime_projection=runtime_projection,
+        )
+
+    def test_changed_quoted_note_actually_reaches_the_sink(self) -> None:
+        """M1: the key omitted quoted notes, so a changed draft reported
+        delivered while the file on disk kept the previous content."""
+        sink = LocalFileSink(self.out)
+        reader = static_reader({"s": ok_read("s", [make_item("i1", "thing")])})
+        for note in ("NOTE VERSION ONE", "NOTE VERSION TWO"):
+            run = self._run(
+                make_spec(["s"], texts={"s": note}),
+                reader,
+                sink,
+                ledger=DeliveryLedger(),
+                bookmarks=Bookmarks(),
+            )
+            self.assertTrue(run.delivered, note)
+            self.assertIn(note, run.markdown)
+        files = sorted(self.out.iterdir())
+        self.assertEqual(len(files), 2, "a changed draft must not share a key")
+        stored = {path.read_text(encoding="utf-8") for path in files}
+        self.assertIn("NOTE VERSION ONE", "\n".join(stored))
+        self.assertIn("NOTE VERSION TWO", "\n".join(stored))
+
+    def test_changed_signal_detail_actually_reaches_the_sink(self) -> None:
+        sink = LocalFileSink(self.out)
+        reader = static_reader({"s": ok_read("s", [make_item("i1", "thing")])})
+        spec = make_spec(["s"])
+        first = self._run(
+            spec, reader, sink,
+            registry_projection=Signal("registry", SourceOutcome.OK, "all quiet"),
+        )
+        second = self._run(
+            spec, reader, sink,
+            registry_projection=Signal("registry", SourceOutcome.OK, "one stale"),
+            bookmarks=Bookmarks(),
+            ledger=DeliveryLedger(),
+        )
+        self.assertTrue(first.delivered)
+        self.assertTrue(second.delivered)
+        self.assertNotEqual(first.key, second.key)
+
+    def test_changed_coverage_detail_actually_reaches_the_sink(self) -> None:
+        sink = LocalFileSink(self.out)
+        good = static_reader({"s": ok_read("s", [make_item("i1", "thing")])})
+        bad = static_reader({"s": unavailable_read("s")})
+        first = self._run(make_spec(["s"]), good, sink)
+        second = self._run(
+            make_spec(["s"]), bad, sink, bookmarks=Bookmarks(),
+            ledger=DeliveryLedger(),
+        )
+        self.assertTrue(first.delivered)
+        self.assertNotEqual(first.key, second.key)
+
+    def test_identical_content_still_reconciles_to_one_artifact(self) -> None:
+        """The correction must not turn deduplication off."""
+        sink = LocalFileSink(self.out)
+        reader = static_reader({"s": ok_read("s", [make_item("i1", "thing")])})
+        ledger = DeliveryLedger()
+        first = self._run(make_spec(["s"]), reader, sink, ledger=ledger)
+        second = self._run(make_spec(["s"]), reader, sink, ledger=ledger)
+        self.assertEqual(first.key, second.key)
+        self.assertEqual(len(list(self.out.iterdir())), 1)
+
+    def test_recheck_that_reverts_an_item_does_not_repeat_it(self) -> None:
+        """m1: the recheck corrected content but not the changed/unchanged
+        decision, so a reverted item was reported as [changed] again."""
+        delivered = Bookmarks()
+        delivered.advance(ok_read("s", [make_item("i1", "Open v1")]))
+        history = BriefHistory(
+            [ObservedItem("s", "i1", fingerprint({"item_id": "i1", "title": "Open v1",
+                                                   "link": None, "attributes": []}))]
+        )
+        seen = {"call": 0}
+
+        def reader(source_id, since):
+            seen["call"] += 1
+            # First read: changed. Recheck: reverted to the last delivered state.
+            title = "Open v2" if seen["call"] == 1 else "Open v1"
+            return ok_read(source_id, [make_item("i1", title)])
+
+        run = self._run(
+            make_spec(["s"]), reader, MemorySink(),
+            bookmarks=delivered, history=history,
+        )
+        self.assertEqual(run.brief.lines, ())
+        self.assertNotIn("Open v1", run.markdown)
+
+    def test_bookmark_capacity_survives_the_defensive_copy(self) -> None:
+        """m2: the defensive copy rebuilt bookmarks at the default capacity, so
+        a legitimately configured bookmark set was rejected by its own copy."""
+        bookmarks = Bookmarks(max_delivered_per_source=1024)
+        for index in range(600):
+            bookmarks.advance(
+                ok_read(
+                    "s",
+                    [make_item(f"old-{index}", "old", observed_at="2026-01-01T08:00:00Z")],
+                )
+            )
+        run = self._run(
+            make_spec(["s"]),
+            static_reader(
+                {
+                    "s": ok_read(
+                        "s",
+                        [
+                            make_item(
+                                "fresh",
+                                "new thing",
+                                observed_at="2026-01-01T11:00:00Z",
+                            )
+                        ],
+                    )
+                }
+            ),
+            MemorySink(),
+            bookmarks=bookmarks,
+        )
+        self.assertTrue(run.brief.lines)
+        self.assertEqual(bookmarks.max_delivered_per_source, 1024)
+
+    def test_rendered_source_id_cannot_forge_a_line(self) -> None:
+        """n3: source ids and signal names were not passed through the
+        one-line hardening, unlike every other rendered field."""
+        brief = compose_brief(
+            source_ids=["s\n- forged: line"],
+            reader=static_reader({}),
+            clock=clock_at(),
+        )
+        rendered = render_markdown(brief)
+        self.assertNotIn("\n- forged: line", rendered)
+        self.assertIn("forged: line", rendered)
+
+    def test_artifact_does_not_open_with_the_same_heading_twice(self) -> None:
+        """n1: the body carried its own H1 and the sink prepended another."""
+        sink = LocalFileSink(self.out)
+        self._run(make_spec(["s"]), static_reader({"s": []}), sink)
+        written = next(self.out.iterdir()).read_text(encoding="utf-8")
+        self.assertEqual(written.count("# CAO automation brief"), 1)
 
 
 if __name__ == "__main__":

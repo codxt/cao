@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from .evidence import fingerprint, utc_now
-from .state import read_state, write_state
+from .state import write_state
 
 __all__ = [
     "DELIVERY_STATE_SCHEMA",
@@ -162,14 +162,24 @@ class LocalFileSink:
         return self._directory
 
     def _path(self, key: str) -> Path:
-        return self._directory / f"{_non_empty_str(key, 'key')}.md"
+        key = _non_empty_str(key, "key")
+        # The key names a file INSIDE the caller's directory. Without this a key
+        # carrying a separator or an absolute path would write outside it while
+        # the docstring still promised a file "under" the directory.
+        if key in (".", "..") or "/" in key or "\\" in key or "\0" in key:
+            raise DeliveryError(
+                "delivery key must be a single safe filename component"
+            )
+        return self._directory / f"{key}.md"
 
     def deliver(self, key: str, title: str, body: str) -> SinkAck:
         if not isinstance(title, str) or not isinstance(body, str):
             raise DeliveryError("title and body must be strings")
         target = self._path(key)
         target.parent.mkdir(parents=True, exist_ok=True)
-        text = f"# {title}\n\n{body}\n"
+        # An empty title lets a caller supply a body that already carries its
+        # own heading, instead of producing two identical H1 lines.
+        text = f"# {title}\n\n{body}\n" if title else f"{body}\n"
         _write_atomic(target, text)
         return SinkAck(ack_id=key, positive=True, detail="local file written")
 
@@ -412,6 +422,14 @@ class DeliveryLedger:
 
     def hold(self, key: str, reason: str, *, clock: Clock | None = None) -> DeliveryReceipt:
         receipt = self._require(key)
+        if receipt.state is DeliveryState.CONFIRMED:
+            # A confirmed delivery is the only positive fact in the ledger.
+            # Holding must not be able to erase it and re-open the key for a
+            # resend, so a hold on CONFIRMED is refused rather than applied.
+            raise DeliveryError(
+                "refusing to hold a CONFIRMED delivery: it is the only positive "
+                "receipt in the ledger and holding it would re-open the key"
+            )
         updated = replace(receipt, state=DeliveryState.HELD, reason=reason)
         self._receipts[key] = updated
         return updated

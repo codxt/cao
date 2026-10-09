@@ -6,7 +6,9 @@ nothing else: no timer, queue, cron entry, subprocess, background worker,
 network call or clock read exists here, and nothing in the module ever fires
 the cadence it records. ``schedule`` is DESCRIPTIVE: CAO records what the owner
 says the cadence is, and an external scheduler the owner already runs is what
-actually fires it.
+actually fires it. The single read the loader performs is the timezone
+database lookup ``zoneinfo`` needs to validate a declared zone; nothing is
+written and nothing is contacted.
 
 Owner preferences are READ-ONLY to an agent. The owner edits them in the
 governed system; an agent may read them and may never write, merge, default,
@@ -41,6 +43,7 @@ __all__ = [
     "KNOWN_COST_MEASUREMENTS",
     "MAX_SOURCES",
     "MAX_NOTES",
+    "MAX_SCAN_DEPTH",
     "StopState",
     "SpecInvalid",
     "UntrustedData",
@@ -73,6 +76,11 @@ KNOWN_COST_MEASUREMENTS = frozenset({"none", "tokens", "seconds", "bytes", "call
 # rather than trusting the payload to be small.
 MAX_SOURCES = 256
 MAX_NOTES = 256
+
+# Depth bound for the recursive credential scan, so a pathologically nested
+# payload is a SpecInvalid rather than an uncatchable-as-a-spec-failure
+# RecursionError.
+MAX_SCAN_DEPTH = 64
 
 # Exactly the keys each object may carry. Anything else is a misspelling or a
 # surprise, and must make the whole payload invalid rather than be ignored.
@@ -295,9 +303,21 @@ def _reject_unknown_keys(
         raise SpecInvalid(field, f"unsupported field(s): {names}")
 
 
-def _scan_literal_secrets(value: object, field: str) -> None:
-    """Refuse a credential-looking key or value anywhere in ``value``."""
+def _scan_literal_secrets(
+    value: object, field: str, _depth: int = 0
+) -> None:
+    """Refuse a credential-looking key or value anywhere in ``value``.
 
+    Depth is bounded so a pathologically nested payload raises
+    :class:`SpecInvalid` like every other refusal, instead of escaping as a
+    ``RecursionError`` that a caller cannot catch as a spec failure.
+    """
+
+    if _depth > MAX_SCAN_DEPTH:
+        raise SpecInvalid(
+            field,
+            f"nesting exceeds the maximum scan depth of {MAX_SCAN_DEPTH}",
+        )
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
@@ -309,7 +329,7 @@ def _scan_literal_secrets(value: object, field: str) -> None:
                     "credential-looking key is refused",
                     verdict=Verdict.REFUSED,
                 )
-            _scan_literal_secrets(item, f"{field}.{key}")
+            _scan_literal_secrets(item, f"{field}.{key}", _depth + 1)
     elif isinstance(value, str):
         lowered = value.lower()
         if any(marker in lowered for marker in _SECRET_MARKERS):
@@ -322,7 +342,7 @@ def _scan_literal_secrets(value: object, field: str) -> None:
         value, (str, bytes, bytearray)
     ):
         for index, item in enumerate(value):
-            _scan_literal_secrets(item, f"{field}[{index}]")
+            _scan_literal_secrets(item, f"{field}[{index}]", _depth + 1)
 
 
 def _require_timezone(value: object, field: str) -> str:

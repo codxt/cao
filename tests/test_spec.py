@@ -394,5 +394,27 @@ class SpecLoaderTests(unittest.TestCase):
             self.assertEqual(list(Path(temp).iterdir()), [])
 
 
+class ReviewCorrectionTests(unittest.TestCase):
+    """Regressions for the independent review of ea83df3."""
+
+    def test_pathological_nesting_is_a_spec_invalid_not_a_recursion_error(self) -> None:
+        """m4: the credential scan recursed before any bound, so a deeply
+        nested payload escaped as RecursionError instead of SpecInvalid."""
+        payload = {"leaf": True}
+        for _ in range(spec_module.MAX_SCAN_DEPTH + 50):
+            payload = {"nested": payload}
+        with self.assertRaises(SpecInvalid):
+            load_spec(payload)
+        with self.assertRaises(SpecInvalid):
+            load_preferences(payload)
+
+    def test_the_scan_depth_bound_is_a_declared_positive_limit(self) -> None:
+        """The bound is an explicit finite limit, not an accident."""
+        depth = spec_module.MAX_SCAN_DEPTH
+        self.assertIsInstance(depth, int)
+        self.assertNotIsInstance(depth, bool)
+        self.assertGreater(depth, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -531,8 +531,13 @@ def _compose(
         working = _empty_bookmarks()
     elif isinstance(bookmarks, Bookmarks):
         # A copy: selection must use the caller's committed pre-state, and
-        # ``collect``'s in-memory advancement must not leak on failure.
-        working = load_bookmarks(bookmarks.as_state())
+        # ``collect``'s in-memory advancement must not leak on failure. The
+        # caller's own capacity carries over, so a legitimately configured
+        # bookmark set is not rejected by its own defensive copy.
+        working = load_bookmarks(
+            bookmarks.as_state(),
+            max_delivered_per_source=bookmarks.max_delivered_per_source,
+        )
     else:
         raise BriefError(
             f"bookmarks must be a Bookmarks, got {type(bookmarks).__name__}"
@@ -625,6 +630,14 @@ def _compose(
         if fresh_item is None:
             # The item is no longer observed; it is not reported as current.
             continue
+        fresh_fingerprint = _item_fingerprint(fresh_item)
+        if change == "changed" and history is not None:
+            # The recheck corrected the CONTENT; it must also correct the
+            # DECISION. An item the recheck reverted to its last delivered
+            # state is unchanged again, so repeating it would duplicate it.
+            prior = history.get(source_id, fresh_item.item_id)
+            if prior is not None and prior.fingerprint == fresh_fingerprint:
+                continue
         lines.append(
             BriefLine(
                 source_id=source_id,
@@ -634,7 +647,7 @@ def _compose(
                 observed_at=fresh_item.observed_at,
                 change=change,
                 state=_state_of(fresh_item),
-                fingerprint=_item_fingerprint(fresh_item),
+                fingerprint=fresh_fingerprint,
             )
         )
 
@@ -662,10 +675,25 @@ def _compose(
         {
             "schema": BRIEF_SCHEMA,
             "coverage": [
-                [entry.source_id, entry.outcome.value] for entry in coverage
+                [
+                    entry.source_id,
+                    entry.outcome.value,
+                    entry.item_count,
+                    entry.detail,
+                ]
+                for entry in coverage
             ],
             "lines": [
                 [line.source_id, line.item_id, line.fingerprint] for line in lines
+            ],
+            # Quoted notes and signals both reach the rendered artifact, so
+            # they must reach the key too. A key that omitted them let a
+            # changed draft report delivered while the file on disk kept the
+            # previous content.
+            "quoted": [[note.kind, note.fingerprint] for note in quoted],
+            "signals": [
+                [signal.name, signal.outcome.value, signal.detail]
+                for signal in signals
             ],
         }
     )
@@ -743,19 +771,22 @@ def render_markdown(brief: DraftBrief) -> str:
     out.append("")
     out.append("## Coverage")
     for entry in brief.coverage:
+        source = _one_line(entry.source_id)
         if entry.complete:
             count = entry.item_count
             noun = "item" if count == 1 else "items"
-            out.append(f"- {entry.source_id}: {entry.outcome.value} ({count} {noun})")
+            out.append(f"- {source}: {entry.outcome.value} ({count} {noun})")
         else:
             detail = f" - {_one_line(entry.detail)}" if entry.detail else ""
-            out.append(f"- {entry.source_id}: {entry.outcome.value}{detail}")
+            out.append(f"- {source}: {entry.outcome.value}{detail}")
 
     out.append("")
     unqualified = brief.unqualified
     if unqualified:
         out.append(
-            "UNQUALIFIED SOURCES: " + ", ".join(unqualified) + ". This brief "
+            "UNQUALIFIED SOURCES: "
+            + ", ".join(_one_line(name) for name in unqualified)
+            + ". This brief "
             "does not fully cover them; the items below come only from sources "
             "that were read completely."
         )
@@ -767,7 +798,7 @@ def render_markdown(brief: DraftBrief) -> str:
         out.append("## Signals")
         for signal in brief.signals:
             detail = f" - {_one_line(signal.detail)}" if signal.detail else ""
-            out.append(f"- {signal.name}: {signal.outcome.value}{detail}")
+            out.append(f"- {_one_line(signal.name)}: {signal.outcome.value}{detail}")
 
     if brief.quoted:
         out.append("")
@@ -783,7 +814,7 @@ def render_markdown(brief: DraftBrief) -> str:
         state = f" [{_one_line(line.state)}]" if line.state else ""
         link = f" | {_one_line(line.link)}" if line.link else ""
         out.append(
-            f"- {line.source_id}: [{line.change}]{state} "
+            f"- {_one_line(line.source_id)}: [{line.change}]{state} "
             f"{_one_line(line.title)}{link}"
         )
     out.append("")
@@ -877,7 +908,9 @@ def run_brief(
         sink,
         key=key,
         destination_id=destination_id,
-        title=BRIEF_TITLE,
+        # The rendered body already carries its own H1; an empty title keeps the
+        # artifact from opening with the same heading twice.
+        title="",
         body=markdown,
         clock=clock,
     )

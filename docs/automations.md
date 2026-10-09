@@ -59,9 +59,34 @@ Markdown file per distinct brief under a directory the caller supplies. There
 is no HTTP, socket, SMTP, webhook, credential or environment path anywhere in
 this feature.
 
-The delivery key is derived from the brief's *content*, so a repeated or
-interrupted run reconciles to the same artifact instead of writing a second
-one, and two genuinely different briefs get two different files.
+The delivery key is derived from the brief's *content* — every line, every
+quoted note, every signal, and the full per-source coverage including item
+counts and failure reasons. So a repeated or interrupted run reconciles to the
+same artifact instead of writing a second one, and a genuinely changed draft
+gets its own file rather than silently reusing the previous one.
+
+`generated_at` is deliberately **not** part of the key. A second run that
+observes exactly the same things is the same logical delivery, so it
+reconciles; the timestamp on disk is the one from the run that actually wrote
+it.
+
+## Bounded by design, not incidentally
+
+Every collection has a stated ceiling, and exceeding one raises rather than
+truncating:
+
+| Bound | Value | What happens past it |
+|---|---|---|
+| `MAX_SCAN_DEPTH` (manifest) | 64 | `SpecInvalid`, never a `RecursionError` |
+| `max_delivered_per_source` | 512 | `SourcesCapacityError`, nothing mutated |
+| `max_receipts` (delivery) | 512 | `DeliveryCapacityError`, no eviction |
+| `max_lines` (brief) | 5000 | `BriefCapacityError`, items are not dropped |
+
+The delivery ledger never evicts, because a receipt may recur and forgetting it
+would be a silent loss. That is a deliberate ceiling with a real consequence:
+after 512 *distinct* brief contents the ledger refuses new keys and a run fails
+loudly. An operator running a recurring brief should plan to archive or rotate
+the delivery state before that, not discover it as a production failure.
 
 ## Persisted state and what it is not
 
