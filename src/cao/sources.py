@@ -267,19 +267,33 @@ class Bookmarks:
             return False
         return item_id in entry.delivered
 
-    def advance(self, read: SourceRead) -> bool:
+    def advance(
+        self,
+        read: SourceRead,
+        *,
+        high_water_cap: str | None = None,
+    ) -> bool:
         """Advance the bookmark for an ``OK`` read; a no-op otherwise.
 
         Returns ``True`` only when the bookmark mutates. ``high_water`` never
         lowers, duplicate item ids collapse, and a read that would push the
         bounded ``delivered`` set past its maximum raises
         :class:`SourcesCapacityError` without mutating anything.
+
+        ``high_water_cap`` records the delivered ids while holding the cursor
+        below a stated timestamp. That separation matters whenever delivery is
+        partial: recording an id without moving the cursor stops the item being
+        delivered twice, while refusing to move the cursor keeps an older,
+        still-pending item selectable. Without the cap the caller must choose
+        between those two, and both choices are wrong for somebody.
         """
 
         if not isinstance(read, SourceRead):
             raise SourcesError("advance expects a SourceRead")
         if read.outcome is not SourceOutcome.OK:
             return False
+        if high_water_cap is not None:
+            _timestamp(high_water_cap, "high_water_cap")
         existing = self._entries.get(read.source_id)
         delivered: list[str] = list(existing.delivered) if existing else []
         seen = set(delivered)
@@ -297,6 +311,8 @@ class Bookmarks:
         for item in read.items:
             if item.observed_at > high_water:
                 high_water = item.observed_at
+        if high_water_cap is not None and high_water_cap < high_water:
+            high_water = high_water_cap
         self._entries[read.source_id] = Bookmark(
             source_id=read.source_id,
             high_water=high_water,

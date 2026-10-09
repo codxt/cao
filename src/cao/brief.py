@@ -72,6 +72,7 @@ __all__ = [
     "MAX_QUOTED",
     "MAX_SIGNALS",
     "MAX_HISTORY",
+    "MAX_MISSES",
     "BriefError",
     "BriefCapacityError",
     "BriefStateError",
@@ -105,6 +106,10 @@ MAX_LINES = 5000
 MAX_QUOTED = 256
 MAX_SIGNALS = 64
 MAX_HISTORY = 4096
+# Consecutive runs an item may be selected-but-not-observed before it is
+# retired. Bounded so a permanently flaky item cannot hold a retry open
+# forever, and small so a transient source omission is nearly always retried.
+MAX_MISSES = 2
 MAX_FIELD_CHARS = 500
 
 
@@ -280,10 +285,15 @@ class BriefHistory:
         self,
         entries: Iterable[ObservedItem] | None = None,
         *,
+        misses: Iterable[tuple[str, str]] | None = None,
         max_entries: int = MAX_HISTORY,
     ) -> None:
         self._max_entries = _positive_int(max_entries, "max_entries")
         self._entries: dict[tuple[str, str], ObservedItem] = {}
+        self._misses: dict[tuple[str, str], tuple[int, str]] = {}
+        for entry in misses or ():
+            source_id, item_id, observed_at = entry
+            self.record_miss(source_id, item_id, observed_at)
         for entry in entries or ():
             if not isinstance(entry, ObservedItem):
                 raise BriefStateError(
@@ -323,9 +333,59 @@ class BriefHistory:
             source_id=source_id, item_id=item_id, fingerprint=item_fingerprint
         )
 
+    def misses(self, source_id: str, item_id: str) -> int:
+        """How many consecutive runs selected this item without observing it."""
+
+        entry = self._misses.get((source_id, item_id))
+        return entry[0] if entry else 0
+
+    def record_miss(self, source_id: str, item_id: str, observed_at: str) -> int:
+        """Record one more consecutive miss, bounded and fail closed.
+
+        The observed timestamp is stored with the count because the cursor cap
+        needs it: an item still awaiting its retry must hold the cursor even on
+        the runs where the source does not report it at all.
+        """
+
+        _require_non_empty_str(source_id, "source_id")
+        _require_non_empty_str(item_id, "item_id")
+        _require_non_empty_str(observed_at, "observed_at")
+        key = (source_id, item_id)
+        if key not in self._misses and len(self._misses) >= self._max_entries:
+            raise BriefCapacityError(
+                f"brief history exceeds max_entries={self._max_entries}; "
+                "refusing to track another unobserved item"
+            )
+        count = self._misses.get(key, (0, observed_at))[0] + 1
+        self._misses[key] = (count, observed_at)
+        return count
+
+    def clear_miss(self, source_id: str, item_id: str) -> None:
+        """Forget an item's misses: it was observed, so it is no longer pending."""
+
+        self._misses.pop((source_id, item_id), None)
+
+    def pending_misses(self) -> tuple[tuple[str, str, str], ...]:
+        """Items awaiting a retry as (source_id, item_id, observed_at)."""
+
+        return tuple(
+            (source_id, item_id, observed_at)
+            for (source_id, item_id), (_count, observed_at) in sorted(self._misses.items())
+        )
+
     def as_state(self) -> dict[str, Any]:
         return {
             "schema": BRIEF_HISTORY_SCHEMA,
+            "misses": [
+                {
+                    "source_id": source_id,
+                    "item_id": item_id,
+                    "count": count,
+                    "observed_at": observed_at,
+                }
+                for (source_id, item_id), (count, observed_at)
+                in sorted(self._misses.items())
+            ],
             "observed": [
                 {
                     "source_id": entry.source_id,
@@ -356,6 +416,31 @@ def load_history(
         raise BriefStateError(
             f"unsupported brief history schema: {payload.get('schema')!r}"
         )
+    raw_misses = payload.get("misses", [])
+    if not isinstance(raw_misses, list):
+        raise BriefStateError("brief history 'misses' must be a list")
+    misses: list[tuple[str, str]] = []
+    for item in raw_misses:
+        if not isinstance(item, Mapping):
+            raise BriefStateError("brief history miss entries must be mappings")
+        source_id = item.get("source_id")
+        item_id = item.get("item_id")
+        count = item.get("count")
+        observed_at = item.get("observed_at")
+        if not _is_non_empty_str(source_id) or not _is_non_empty_str(item_id):
+            raise BriefStateError(
+                "brief history miss entries need non-empty source_id and item_id"
+            )
+        if not _is_non_empty_str(observed_at):
+            raise BriefStateError(
+                "brief history miss entries need a non-empty observed_at"
+            )
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise BriefStateError(
+                "brief history miss entries need a positive integer count"
+            )
+        misses.extend([(source_id, item_id, observed_at)] * count)
+
     raw = payload.get("observed")
     if not isinstance(raw, list):
         raise BriefStateError("brief history 'observed' must be a list")
@@ -382,7 +467,7 @@ def load_history(
         entries.append(
             ObservedItem(source_id=source_id, item_id=item_id, fingerprint=stored)
         )
-    return BriefHistory(entries, max_entries=max_entries)
+    return BriefHistory(entries, misses=misses, max_entries=max_entries)
 
 
 @dataclass(frozen=True)
@@ -395,6 +480,11 @@ class DraftBrief:
     lines: tuple[BriefLine, ...]
     quoted: tuple[UntrustedData, ...]
     signals: tuple[Signal, ...]
+    # Items selected for this brief that a fresh re-read no longer observes.
+    # They are retired rather than dropped silently: a source that stops
+    # reporting an item has, from CAO's point of view, resolved it, and the
+    # reader is told that is what happened.
+    retired: tuple[tuple[str, str], ...]
     content_fingerprint: str
 
     @property
@@ -637,6 +727,8 @@ def _compose(
             recheck_failed.add(source_id)
 
     lines: list[BriefLine] = []
+    delivered_ids: set[tuple[str, str]] = set()
+    absent: list[tuple[str, str, str]] = []
     for source_id, _item, change in candidates:
         if source_id in recheck_failed:
             # The fresh observation is a non-answer: the stale item may not be
@@ -648,9 +740,14 @@ def _compose(
             None,
         )
         if fresh_item is None:
-            # The item is no longer observed; it is not reported as current.
+            # Not observed at the re-read. It is never reported as current and
+            # never consumed while a retry is still owed; once MAX_MISSES
+            # consecutive runs have missed it, it is retired and named in the
+            # brief rather than dropped silently.
+            absent.append((source_id, _item.item_id, _item.observed_at))
             continue
         fresh_fingerprint = _item_fingerprint(fresh_item)
+        delivered_ids.add((source_id, fresh_item.item_id))
         if change == "changed" and history is not None:
             # The recheck corrected the CONTENT; it must also correct the
             # DECISION. An item the recheck reverted to its last delivered
@@ -670,6 +767,25 @@ def _compose(
                 fingerprint=fresh_fingerprint,
             )
         )
+
+    # Everything selected that the fresh read did not observe, split by
+    # whether a retry is still owed. Without a history there is nowhere to keep
+    # a retry, so the item is retired at once and said so.
+    def _exhausted(item_id: tuple[str, str]) -> bool:
+        return history is None or history.misses(*item_id) >= MAX_MISSES
+
+    retired = tuple(
+        sorted(
+            (source_id, item_id)
+            for source_id, item_id, _observed_at in absent
+            if _exhausted((source_id, item_id))
+        )
+    )
+    held = tuple(
+        (source_id, item_id, observed_at)
+        for source_id, item_id, observed_at in absent
+        if not _exhausted((source_id, item_id))
+    )
 
     coverage = tuple(_coverage_of(final_reads[source_id]) for source_id in ordered)
 
@@ -705,23 +821,34 @@ def _compose(
         lines=tuple(lines),
         quoted=tuple(quoted),
         signals=signals,
+        retired=retired,
         content_fingerprint="",
     )
     brief = replace(
         brief,
         content_fingerprint=fingerprint(_without_generated_at(render_markdown(brief))),
     )
+    # The cursor caps come from the PERSISTED pending set, not only from this
+    # run's absent list: an item awaiting its retry must hold the cursor on the
+    # runs where the source does not report it at all, or the cursor would jump
+    # over it while nothing is holding it back.
+    # This run's held items plus everything already pending from earlier runs.
+    # The first run an item goes missing it is held without being in the
+    # persisted set yet; every later run it is in the persisted set even when
+    # this run never saw it at all.
+    pending = history.pending_misses() if history is not None else ()
+    caps = tuple(held) + tuple(
+        entry for entry in pending if entry not in held
+    )
     return (
         brief,
         tuple(final_reads[source_id] for source_id in ordered),
-        # (source_id, item_id, observed_at-as-selected) for every candidate.
-        # The timestamp is the one the SELECTION saw, not the one the recheck
-        # saw: an item the recheck dropped entirely is still a gap, and losing
-        # it here is exactly how it would become unreachable.
-        frozenset(
-            (source_id, item.item_id, item.observed_at)
-            for source_id, item, _change in candidates
-        ),
+        # Every selected item, with the object the SELECTION saw. All of them
+        # are consumed on a confirmed delivery EXCEPT the ones still owing a
+        # retry.
+        tuple((source_id, item) for source_id, item, _change in candidates),
+        held,
+        caps,
     )
 
 
@@ -749,7 +876,7 @@ def compose_brief(
     named as unqualified in the returned brief.
     """
 
-    brief, _reads, _selected = _compose(
+    brief, _reads, _selected, _held, _caps = _compose(
         source_ids=source_ids,
         reader=reader,
         bookmarks=bookmarks,
@@ -832,56 +959,78 @@ def render_markdown(brief: DraftBrief) -> str:
             f"- {_one_line(line.source_id)}: [{line.change}]{state} "
             f"{_one_line(line.title)}{link}"
         )
+    if brief.retired:
+        out.append("")
+        out.append(
+            "Selected for this brief but no longer observed at the final "
+            "re-read, so not reported as current: "
+            + ", ".join(
+                f"{_one_line(source)} {_one_line(item)}"
+                for source, item in brief.retired
+            )
+            + ". A source that stops reporting an item has, from CAO's point "
+            "of view, resolved it."
+        )
     out.append("")
     return "\n".join(out)
 
 
 def _commit_bookmarks(
     bookmarks: Bookmarks,
-    brief: DraftBrief,
     reads: tuple[SourceRead, ...],
-    selected: frozenset[tuple[str, str, str]],
+    selected: tuple[tuple[str, SourceItem], ...],
+    held: tuple[tuple[str, str, str], ...],
+    caps: tuple[tuple[str, str, str], ...],
 ) -> None:
-    """Advance bookmarks only for the items actually written to the brief.
+    """Consume what this run resolved, and hold the cursor for what it did not.
 
     Committing after a confirmed delivery is what makes a repeated run produce
-    no missed items: an interrupted run that never confirmed leaves the
-    bookmarks untouched, so the same items are selected again.
+    no missed items and no duplicates: an interrupted run never confirmed, so
+    it consumed nothing, so the same items are selected again.
 
-    The cursor must never move past an item that was selected but NOT
-    delivered. ``select_new`` drops anything older than ``high_water`` minus the
-    overlap window, so advancing across a gap would make that item permanently
-    unreachable rather than merely undelivered this run. Only the delivered
-    prefix below the earliest such gap is consumed; items after the gap are
-    re-selected next run, and the brief's own unchanged-item filter keeps them
-    from being reported twice.
+    Three cases, and all three matter:
+
+    * an item reported in this brief is consumed normally;
+    * an item that was selected but not observed is NOT consumed while it
+      still owes a retry, and its timestamp caps ``high_water`` so it stays
+      selectable on the next run. Without the cap the cursor would jump over
+      it and, since selection drops everything older than the cursor minus the
+      overlap, the item would become unreachable rather than merely undelivered;
+    * an item that has exhausted ``MAX_MISSES`` consecutive misses is retired:
+      consumed and named in the brief, so the reader is told rather than left
+      to infer it.
+
+    Delivered ids are recorded even under the cap. That is the whole reason
+    the cap exists: without it, everything above a pending item would be
+    delivered again on the next run.
     """
 
-    by_source: dict[str, set[str]] = {}
-    for line in brief.lines:
-        by_source.setdefault(line.source_id, set()).add(line.item_id)
+    held_ids = {(source_id, item_id) for source_id, item_id, _a in held}
+
+    by_source: dict[str, list[SourceItem]] = {}
+    for source_id, item in selected:
+        # A held item is deliberately NOT consumed: consuming it would put it
+        # in the delivered set, and selection filters on that set, so it would
+        # never be selected again and the retry would be a fiction.
+        if (source_id, item.item_id) in held_ids:
+            continue
+        by_source.setdefault(source_id, []).append(item)
 
     for read in reads:
-        wanted = by_source.get(read.source_id)
-        if not wanted or not read.complete:
+        items = tuple(by_source.get(read.source_id, ()))
+        # A source whose re-read failed contributes nothing: nothing about it is
+        # current, so nothing about it may be consumed.
+        if not items or not read.complete:
             continue
-        observed = {entry.item_id: entry.observed_at for entry in read.items}
-        gaps = [
-            selected_at
-            for source_id, item_id, selected_at in selected
-            if source_id == read.source_id and item_id not in wanted
+        limits = [
+            observed_at
+            for source_id, _item_id, observed_at in caps
+            if source_id == read.source_id
         ]
-        # Nothing is consumed past the earliest selected-but-undelivered item.
-        ceiling = min(gaps) if gaps else None
-        items = tuple(
-            entry
-            for entry in read.items
-            if entry.item_id in wanted
-            and (ceiling is None or entry.observed_at < ceiling)
+        bookmarks.advance(
+            replace(read, items=items),
+            high_water_cap=min(limits) if limits else None,
         )
-        if items:
-            bookmarks.advance(replace(read, items=items))
-
 
 def run_brief(
     spec: AutomationSpec,
@@ -923,7 +1072,7 @@ def run_brief(
     source_ids = tuple(source.source_id for source in spec.sources)
     source_texts = {source.source_id: source.text for source in spec.sources}
 
-    brief, reads, selected = _compose(
+    brief, reads, selected, held, caps = _compose(
         source_ids=source_ids,
         reader=reader,
         bookmarks=bookmarks,
@@ -954,10 +1103,15 @@ def run_brief(
     )
     delivered = receipt.state is DeliveryState.CONFIRMED
     if delivered:
-        _commit_bookmarks(bookmarks, brief, reads, selected)
+        _commit_bookmarks(bookmarks, reads, selected, held, caps)
         if history is not None:
             for line in brief.lines:
                 history.record(line.source_id, line.item_id, line.fingerprint)
+                history.clear_miss(line.source_id, line.item_id)
+            for source_id, item_id in brief.retired:
+                history.clear_miss(source_id, item_id)
+            for source_id, item_id, _observed_at in held:
+                history.record_miss(source_id, item_id, _observed_at)
 
     return BriefRun(
         brief=brief,

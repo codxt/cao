@@ -79,6 +79,7 @@ truncating:
 | `max_delivered_per_source` | 512 | `SourcesCapacityError`, nothing mutated |
 | `max_receipts` (delivery) | 512 | `DeliveryCapacityError`, no eviction |
 | `max_lines` (brief) | 5000 | `BriefCapacityError`, items are not dropped |
+| `MAX_MISSES` (brief) | 2 consecutive misses | the item is retired and stated |
 
 The delivery ledger never evicts, because a receipt may recur and forgetting it
 would be a silent loss. That is a deliberate ceiling with a real consequence:
@@ -105,13 +106,26 @@ Bookmarks advance only after a delivery is `CONFIRMED`. That is what makes an
 interrupted run safe: an interrupted run never confirmed, so it never advanced,
 so the same items are selected again — no missed items, no duplicates.
 
-The cursor also never moves **past an item that was selected but not
-delivered**. A source that drops an item on the immediate recheck — a flaky
-page, a pagination hiccup — must not turn that item into an unreachable one,
-because selection drops anything older than `high_water` minus the overlap
-window. Only the delivered prefix below the earliest such gap is consumed; the
-gap and everything after it are re-selected next run, and the brief's own
-unchanged-item filter keeps the re-selection from reporting anything twice.
+### Items the fresh re-read does not observe
+
+A brief re-reads every contributing source immediately before rendering, and
+an item the re-read does not observe is never reported as current. What happens
+next is the interesting part:
+
+- The item **owes a retry**. It is not consumed, and its timestamp caps the
+  cursor so it stays selectable on the next run — including the runs where the
+  source does not mention it at all. A flaky page or a pagination hiccup
+  therefore *delays* an item; it never deletes one.
+- After `MAX_MISSES` (2) consecutive runs without it, the item is **retired**:
+  consumed, and named in the brief's own body under "Selected for this brief
+  but no longer observed". A source that stops reporting an item has, from
+  CAO's point of view, resolved it — and the reader is told that is what
+  happened rather than left to infer it.
+
+Delivered ids are recorded *even while the cursor is held back*. That is the
+whole reason the cap is a separate value rather than a choice between "record
+it" and "move the cursor": without the separation, everything above a pending
+item would be delivered again on the next run.
 
 ## CLI
 

@@ -1133,60 +1133,123 @@ class ReviewCorrectionTests(unittest.TestCase):
         self.assertNotIn("\n- forged: line", rendered)
         self.assertIn("forged: line", rendered)
 
-    def test_an_item_dropped_by_the_recheck_is_not_lost_forever(self) -> None:
-        """Round-3 MAJOR: the cursor advanced past an item that was selected
-        but not delivered, and select_new's timestamp filter then made that
-        item permanently unreachable instead of merely undelivered."""
-        old = make_item("A", "old item", observed_at="2026-01-01T10:00:00Z")
-        new = make_item("B", "new item", observed_at="2026-01-01T12:00:00Z")
-        calls = {"n": 0}
+    def test_an_item_absent_for_a_run_is_eventually_reported(self) -> None:
+        """Round-4 MAJOR 1: the gap was remembered only for the current run, so
+        an item absent for one intervening run became permanently unreachable."""
+        d = make_item("D", "early", observed_at="2026-01-01T05:00:00Z")
+        g = make_item("G1", "flaky", observed_at="2026-01-01T10:00:00Z")
+        e = make_item("E", "late", observed_at="2026-01-01T12:00:00Z")
+        seen = {"n": 0}
 
         def reader(source_id, since):
-            calls["n"] += 1
-            # Run 1 cycle: both. Run 1 recheck: the flaky source omits A.
-            # Every run after: both again.
-            if calls["n"] == 2:
-                return ok_read(source_id, [new])
-            return ok_read(source_id, [old, new])
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return ok_read(source_id, [d, g])       # cycle
+            if seen["n"] == 2:
+                return ok_read(source_id, [d])          # recheck drops G1
+            if seen["n"] == 3:
+                return ok_read(source_id, [d, e])       # G1 absent this run too
+            return ok_read(source_id, [d, g, e])        # G1 comes back
 
         sink = LocalFileSink(self.out)
         ledger = DeliveryLedger()
         bookmarks = Bookmarks()
-        first = self._run(
-            make_spec(["s"]), reader, sink, ledger=ledger, bookmarks=bookmarks
-        )
-        self.assertEqual([line.item_id for line in first.brief.lines], ["B"])
-        second = self._run(
-            make_spec(["s"]), reader, sink, ledger=ledger, bookmarks=bookmarks
-        )
-        self.assertIn("A", [line.item_id for line in second.brief.lines])
-        third = self._run(
-            make_spec(["s"]), reader, sink, ledger=ledger, bookmarks=bookmarks
-        )
-        # Delivered once, not twice: the unchanged-item filter takes over.
-        self.assertNotIn("A", [line.item_id for line in third.brief.lines])
+        history = BriefHistory()
+        reported = []
+        for _ in range(5):
+            run = self._run(
+                make_spec(["s"]), reader, sink,
+                ledger=ledger, bookmarks=bookmarks, history=history,
+            )
+            reported.append([line.item_id for line in run.brief.lines])
 
-    def test_the_cursor_never_passes_an_undelivered_item(self) -> None:
-        """The bookmark invariant stated directly, independent of the brief."""
-        old = make_item("A", "old item", observed_at="2026-01-01T10:00:00Z")
-        new = make_item("B", "new item", observed_at="2026-01-01T12:00:00Z")
-        calls = {"n": 0}
+        flat = [item for run_lines in reported for item in run_lines]
+        self.assertIn("G1", flat, "an item absent for one run was lost forever")
+        self.assertEqual(flat.count("G1"), 1, "an item was reported more than once")
+
+    def test_nothing_is_delivered_twice_while_a_retry_is_pending(self) -> None:
+        """Round-4 MAJOR 2: items above a pending gap were delivered but never
+        recorded, so they were delivered again on the next run."""
+        a = make_item("A", "aaa-old", observed_at="2026-01-01T10:00:00Z")
+        b = make_item("B", "bbb-new", observed_at="2026-01-01T12:00:00Z")
+        seen = {"n": 0}
 
         def reader(source_id, since):
-            calls["n"] += 1
-            return ok_read(source_id, [new] if calls["n"] == 2 else [old, new])
+            seen["n"] += 1
+            return ok_read(source_id, [b] if seen["n"] == 2 else [a, b])
+
+        sink = LocalFileSink(self.out)
+        ledger = DeliveryLedger()
+        bookmarks = Bookmarks()
+        history = BriefHistory()
+        for _ in range(4):
+            self._run(
+                make_spec(["s"]), reader, sink,
+                ledger=ledger, bookmarks=bookmarks, history=history,
+            )
+        stored = "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted(self.out.iterdir())
+        )
+        # Count the title, not the substring: the "[new]" label would confuse it.
+        self.assertEqual(
+            stored.count("bbb-new"), 1, "an unchanged item was delivered twice"
+        )
+
+    def test_an_item_past_the_retry_budget_is_retired_and_stated(self) -> None:
+        """Retirement is a stated outcome, not a silent drop."""
+        g = make_item("G1", "flaky", observed_at="2026-01-01T10:00:00Z")
+        seen = {"n": 0}
+
+        def reader(source_id, since):
+            seen["n"] += 1
+            # Present on the cycle read, absent on every re-read.
+            return ok_read(source_id, [g] if seen["n"] % 2 == 1 else [])
+
+        ledger = DeliveryLedger()
+        bookmarks = Bookmarks()
+        history = BriefHistory()
+        retired_runs = []
+        for _ in range(6):
+            run = self._run(
+                make_spec(["s"]), reader, MemorySink(),
+                ledger=ledger, bookmarks=bookmarks, history=history,
+            )
+            if run.brief.retired:
+                retired_runs.append(run)
+        self.assertTrue(retired_runs, "a permanently missing item was never retired")
+        first = retired_runs[0]
+        self.assertEqual(first.brief.retired, (("s", "G1"),))
+        self.assertIn("G1", first.markdown)
+        self.assertIn("no longer observed", first.markdown)
+        # Retired means consumed: it is never selected again.
+        self.assertIn("G1", bookmarks.get("s").delivered)
+
+    def test_the_cursor_holds_for_an_item_that_owes_a_retry(self) -> None:
+        """The bookmark invariant, stated directly and unconditionally."""
+        old = make_item("A", "old item", observed_at="2026-01-01T10:00:00Z")
+        new = make_item("B", "new item", observed_at="2026-01-01T12:00:00Z")
+        seen = {"n": 0}
+
+        def reader(source_id, since):
+            seen["n"] += 1
+            return ok_read(source_id, [new] if seen["n"] == 2 else [old, new])
 
         bookmarks = Bookmarks()
         self._run(
-            make_spec(["s"]), reader, MemorySink(), bookmarks=bookmarks
+            make_spec(["s"]), reader, MemorySink(),
+            bookmarks=bookmarks, history=BriefHistory(),
         )
         entry = bookmarks.get("s")
-        if entry is not None:
-            self.assertLess(
-                entry.high_water,
-                "2026-01-01T10:00:00Z",
-                "the cursor moved to or past an item that was never delivered",
-            )
+        self.assertIsNotNone(entry, "the bookmark must record the delivered ids")
+        self.assertIn("B", entry.delivered, "a delivered id was not recorded")
+        # Selection keeps everything at or after high_water minus the overlap
+        # window, so holding the cursor AT the pending item's timestamp is what
+        # keeps that item selectable. Past it would lose the item for good.
+        self.assertLessEqual(
+            entry.high_water,
+            "2026-01-01T10:00:00Z",
+            "the cursor moved past an item that still owes a retry",
+        )
 
     def test_artifact_does_not_open_with_the_same_heading_twice(self) -> None:
         """n1: the body carried its own H1 and the sink prepended another."""
