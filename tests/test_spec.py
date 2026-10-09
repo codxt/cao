@@ -213,12 +213,19 @@ class SpecLoaderTests(unittest.TestCase):
             with self.assertRaises(SpecInvalid):
                 load_preferences(preferences)
 
-    def test_secret_looking_value_refused(self) -> None:
-        payload = _manifest()
-        payload["sources"][0]["text"] = "please use the bearer marker"
-        with self.assertRaises(SpecInvalid) as ctx:
-            load_spec(payload)
-        self.assertIs(ctx.exception.verdict, Verdict.REFUSED)
+    def test_benign_credential_words_in_text_are_accepted(self) -> None:
+        """The value scan is shape-based: ordinary prose that merely contains
+        words like "authorization", "token" or "bearer" is valid text, not a
+        credential. The earlier word-based scan refused it."""
+        for prose in (
+            "owner authorization is recorded separately",
+            "cost is measured in tokens per call",
+            "send the bearer marker in the header",
+        ):
+            payload = _manifest()
+            payload["sources"][0]["text"] = prose
+            spec = load_spec(payload)
+            self.assertEqual(spec.sources[0].text.text, prose)
 
     def test_unknown_sink_id_refused(self) -> None:
         payload = _manifest()
@@ -419,6 +426,67 @@ class ReviewCorrectionTests(unittest.TestCase):
         self.assertIsInstance(depth, int)
         self.assertNotIsInstance(depth, bool)
         self.assertGreater(depth, 0)
+
+
+class DualAdvisorCorrectionTests(unittest.TestCase):
+    """Regressions for the dual-advisor review of c955e07.
+
+    Each test here failed against that SHA and must keep failing if the
+    correction is reverted.
+    """
+
+    @staticmethod
+    def _shape(prefix: str) -> str:
+        # Built at runtime so no credential-like literal sits in the file.
+        return prefix + "A1b2C3d4" * 5
+
+    def test_documented_cost_measurement_tokens_is_accepted(self) -> None:
+        """A known enum value ("tokens") contains the substring "token", so the
+        word-based value scan refused the loader's own documented value."""
+        for measurement in sorted(KNOWN_COST_MEASUREMENTS):
+            payload = _manifest()
+            payload["destination"]["cost_measurement"] = measurement
+            spec = load_spec(payload)
+            self.assertEqual(spec.destination.cost_measurement, measurement)
+
+    def test_each_recognizable_credential_shape_is_refused_without_echo(self) -> None:
+        """The word-based scan accepted a real-looking token shape; the
+        shape-based scan must refuse it and must not echo the literal."""
+        for prefix in ("ghp_", "github_pat_", "sk-ant-", "sk-proj-"):
+            shape = self._shape(prefix)
+            with self.subTest(prefix=prefix):
+                payload = _manifest()
+                payload["sources"][0]["text"] = f"synthetic note {shape}"
+                with self.assertRaises(SpecInvalid) as ctx:
+                    load_spec(payload)
+                self.assertIs(ctx.exception.verdict, Verdict.REFUSED)
+                self.assertNotIn(shape, str(ctx.exception))
+
+    def test_benign_text_containing_a_shape_substring_is_accepted(self) -> None:
+        """Shape patterns require a leading boundary, so a benign word that
+        merely contains a prefix as a substring is not refused."""
+        text = "risk-abcdefghijklmnopqrstuvwxyz mitigation recorded"
+        payload = _manifest()
+        payload["sources"][0]["text"] = text
+        spec = load_spec(payload)
+        self.assertEqual(spec.sources[0].text.text, text)
+
+    def test_duplicate_source_id_is_rejected(self) -> None:
+        """The loader silently accepted two declarations of the same source id;
+        the brief then collapsed them last-wins. A strict loader refuses and
+        names the second declaration."""
+        payload = _manifest()
+        payload["sources"].append(dict(payload["sources"][0]))
+        with self.assertRaises(SpecInvalid) as ctx:
+            load_spec(payload)
+        self.assertEqual(
+            ctx.exception.field, "manifest.sources[1].source_id"
+        )
+        self.assertIn("duplicate", ctx.exception.reason)
+
+    def test_valid_manifest_still_loads_after_stricter_checks(self) -> None:
+        spec = load_spec(_manifest())
+        self.assertEqual(len(spec.sources), 1)
 
 
 if __name__ == "__main__":

@@ -18,17 +18,26 @@ absent or corrupt preferences payload is refused rather than replaced with a
 default.
 
 The loader is strict and total. It refuses an unknown version, an unknown key,
-a timezone ``zoneinfo`` cannot load, a literal secret-looking key or value, an
-unknown sink id (only a local-file sink exists) and an unknown cost-measurement
-id. Every failure raises :class:`SpecInvalid`, which names the offending field;
-nothing is repaired, defaulted, or carried through. Every free-text field taken
-from a source or from run state is wrapped in :class:`UntrustedData` and is data
-only: no authority decision ever reads it, and this module imports no authority
-module at all.
+a timezone ``zoneinfo`` cannot load, a credential-named key, a
+credential-shaped literal, an unknown sink id (only a local-file sink exists)
+and an unknown cost-measurement id. Every failure raises :class:`SpecInvalid`,
+which names the offending field; nothing is repaired, defaulted, or carried
+through. Every free-text field taken from a source or from run state is wrapped
+in :class:`UntrustedData` and is data only: no authority decision ever reads
+it, and this module imports no authority module at all.
+
+The credential check is a bounded heuristic, not a secret detector. Object keys
+are refused when they *name* a credential (``token``, ``secret``, ...); string
+values are refused only when they contain a recognizable credential *shape*
+(a published token prefix such as ``ghp_`` or ``sk-ant-``). Ordinary prose such
+as "tokens" or "authorization" is therefore accepted, and a secret in an
+unrecognized shape is neither accepted with confidence nor echoed. No refusal
+prints the offending literal.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -106,10 +115,12 @@ _LIMITS_KEYS = frozenset({"max_duration_seconds", "max_concurrency", "max_calls"
 _STOP_KEYS = frozenset({"state", "reason"})
 _PREFERENCES_KEYS = frozenset({"version", "timezone", "notes"})
 
-# Literal credential markers. A key or string value containing any of these is
-# refused: the loader never accepts, echoes or carries a credential-looking
-# literal. Both separator spellings are covered for the multi-word markers.
-_SECRET_MARKERS = (
+# Literal credential markers. A manifest or preferences KEY containing any of
+# these names a credential and is refused: a credential is never a declared
+# field. The markers are checked against keys only; the same words in a string
+# value are ordinary prose (see ``_CREDENTIAL_SHAPE_PATTERNS``). Both separator
+# spellings are covered for the multi-word markers.
+_SECRET_KEY_MARKERS = (
     "token",
     "secret",
     "password",
@@ -121,6 +132,33 @@ _SECRET_MARKERS = (
     "private key",
     "private_key",
 )
+
+# Recognizable credential SHAPES inside a string key or value. This is a
+# bounded heuristic: it refuses the published token prefixes of a handful of
+# well-known credential formats and nothing else. It is deliberately not a
+# secret detector -- an unrecognized format is neither accepted as safe with
+# confidence nor guessed at. Every repetition is bounded, so the scan cannot be
+# made super-linear by a long input line.
+_CREDENTIAL_SHAPE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{20,}",
+        r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}",
+        r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_\-]{16,}",
+        r"(?<![A-Za-z0-9])sk-proj-[A-Za-z0-9_\-]{16,}",
+        r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{24,}",
+        r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}",
+        r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    )
+)
+
+
+def _looks_like_credential(text: str) -> bool:
+    """Whether ``text`` contains a recognizable credential shape."""
+
+    return any(pattern.search(text) for pattern in _CREDENTIAL_SHAPE_PATTERNS)
+
 
 class SpecInvalid(Exception):
     """A manifest or preferences payload that must be refused, never repaired.
@@ -306,11 +344,13 @@ def _reject_unknown_keys(
 def _scan_literal_secrets(
     value: object, field: str, _depth: int = 0
 ) -> None:
-    """Refuse a credential-looking key or value anywhere in ``value``.
+    """Refuse a credential-named key or a credential-shaped literal.
 
-    Depth is bounded so a pathologically nested payload raises
-    :class:`SpecInvalid` like every other refusal, instead of escaping as a
-    ``RecursionError`` that a caller cannot catch as a spec failure.
+    Checks object keys for credential *names* and string keys/values for
+    credential *shapes* (see the two tables above). The depth is bounded so a
+    pathologically nested payload raises :class:`SpecInvalid` like every other
+    refusal, instead of escaping as a ``RecursionError`` that a caller cannot
+    catch as a spec failure. No branch echoes the offending text.
     """
 
     if _depth > MAX_SCAN_DEPTH:
@@ -322,20 +362,27 @@ def _scan_literal_secrets(
         for key, item in value.items():
             if not isinstance(key, str):
                 raise SpecInvalid(field, "object keys must be strings")
-            lowered = key.lower()
-            if any(marker in lowered for marker in _SECRET_MARKERS):
+            # Shape before name: a credential-shaped key is refused without
+            # echoing it, whichever marker it may also carry.
+            if _looks_like_credential(key):
                 raise SpecInvalid(
-                    f"{field}.{key}",
+                    f"{field}.<key>",
+                    "credential-shaped key is refused",
+                    verdict=Verdict.REFUSED,
+                )
+            lowered = key.lower()
+            if any(marker in lowered for marker in _SECRET_KEY_MARKERS):
+                raise SpecInvalid(
+                    f"{field}.<key>",
                     "credential-looking key is refused",
                     verdict=Verdict.REFUSED,
                 )
             _scan_literal_secrets(item, f"{field}.{key}", _depth + 1)
     elif isinstance(value, str):
-        lowered = value.lower()
-        if any(marker in lowered for marker in _SECRET_MARKERS):
+        if _looks_like_credential(value):
             raise SpecInvalid(
                 field,
-                "credential-looking value is refused",
+                "credential-shaped value is refused",
                 verdict=Verdict.REFUSED,
             )
     elif isinstance(value, Sequence) and not isinstance(
@@ -384,7 +431,19 @@ def _build_sources(value: object) -> tuple[SourceSpec, ...]:
     items = _require_sequence(value, field)
     if len(items) > MAX_SOURCES:
         raise SpecInvalid(field, f"exceeds max sources {MAX_SOURCES}")
-    return tuple(_build_source(item, index) for index, item in enumerate(items))
+    sources: list[SourceSpec] = []
+    first_index: dict[str, int] = {}
+    for index, item in enumerate(items):
+        source = _build_source(item, index)
+        if source.source_id in first_index:
+            raise SpecInvalid(
+                f"{field}[{index}].source_id",
+                f"duplicate source_id {source.source_id!r}; already declared "
+                f"at {field}[{first_index[source.source_id]}]",
+            )
+        first_index[source.source_id] = index
+        sources.append(source)
+    return tuple(sources)
 
 
 def _build_destination(value: object) -> DestinationSpec:

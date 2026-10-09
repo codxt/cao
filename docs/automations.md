@@ -76,10 +76,10 @@ truncating:
 | Bound | Value | What happens past it |
 |---|---|---|
 | `MAX_SCAN_DEPTH` (manifest) | 64 | `SpecInvalid`, never a `RecursionError` |
-| `max_delivered_per_source` | 512 | `SourcesCapacityError`, nothing mutated |
+| `max_delivered_per_source` | 512 | that one source becomes an `INVALID`, non-complete read; siblings still run; nothing mutated |
 | `max_receipts` (delivery) | 512 | `DeliveryCapacityError`, no eviction |
 | `max_lines` (brief) | 5000 | `BriefCapacityError`, items are not dropped |
-| `MAX_MISSES` (brief) | 2 consecutive misses | the item is retired and stated |
+| `max_entries` (brief history) | 4096 | `BriefCapacityError`; a pending, unobserved item is never silently written off |
 
 The delivery ledger never evicts, because a receipt may recur and forgetting it
 would be a silent loss. That is a deliberate ceiling with a real consequence:
@@ -109,18 +109,28 @@ so the same items are selected again — no missed items, no duplicates.
 ### Items the fresh re-read does not observe
 
 A brief re-reads every contributing source immediately before rendering, and
-an item the re-read does not observe is never reported as current. What happens
-next is the interesting part:
+an item the re-read does not observe is never reported as current. It is also
+never consumed: **a missing item is not proof of delivery or resolution.** A
+source that momentarily stops reporting an item may be paging, flaky or
+mid-restart, and treating that absence as "resolved" would silently delete a
+real item.
 
-- The item **owes a retry**. It is not consumed, and its timestamp caps the
-  cursor so it stays selectable on the next run — including the runs where the
-  source does not mention it at all. A flaky page or a pagination hiccup
+So a selected item the re-read does not observe is **held**:
+
+- It stays retry-eligible: it is not added to the bookmark's delivered set, so
+  it is still selectable on the next run.
+- Its timestamp caps the cursor, so it stays selectable even on the runs where
+  the source does not mention it at all. A flaky page or a pagination hiccup
   therefore *delays* an item; it never deletes one.
-- After `MAX_MISSES` (2) consecutive runs without it, the item is **retired**:
-  consumed, and named in the brief's own body under "Selected for this brief
-  but no longer observed". A source that stops reporting an item has, from
-  CAO's point of view, resolved it — and the reader is told that is what
-  happened rather than left to infer it.
+- It is named in the brief's own body under "not observed at the final
+  re-read", so the reader knows a delivery did not happen rather than inferring
+  that it did.
+
+Held items are bounded by the brief history's `max_entries`; if more unseen
+items are pending than that, the run fails closed with `BriefCapacityError`
+rather than dropping the oldest pending item. When a held item reappears it is
+reported once, then delivered and consumed normally. It is never sent twice,
+because until it is actually observed it never enters the delivered set.
 
 Delivered ids are recorded *even while the cursor is held back*. That is the
 whole reason the cap is a separate value rather than a choice between "record

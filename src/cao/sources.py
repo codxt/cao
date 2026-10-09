@@ -86,17 +86,36 @@ def _positive_int(value: Any, field: str) -> int:
 
 
 def _timestamp(value: Any, field: str) -> str:
-    """Return ``value`` if it is an RFC 3339 UTC second-precision time."""
+    """Return ``value`` if it is a canonical RFC 3339 UTC second-precision time.
+
+    Canonicality is required, not merely parseability: ``datetime.strptime`` is
+    lenient about zero padding (it accepts ``2026-9-01T00:00:00Z``), while
+    ordering and overlap math compare timestamps as strings. A non-canonical
+    value that parses would therefore sort wrongly and corrupt the cursor, so
+    the parsed value must round-trip byte-for-byte through the formatter.
+    """
 
     if not _is_non_empty_str(value):
         raise SourcesError(f"{field} must be a non-empty timestamp string")
     try:
-        _datetime.datetime.strptime(value, _TIMESTAMP_FORMAT)
+        parsed = _datetime.datetime.strptime(value, _TIMESTAMP_FORMAT)
     except ValueError as exc:
         raise SourcesError(
             f"{field} must be an RFC 3339 UTC second-precision timestamp, "
             f"got {value!r}"
         ) from exc
+    # ``strptime`` is lenient about zero padding (it accepts
+    # ``2026-9-01T00:00:00Z``), while ordering and overlap math compare
+    # timestamps as strings, so a non-canonical value would sort wrongly and
+    # corrupt the cursor. Require the value to round-trip through the parser
+    # and formatter byte-for-byte. ``isoformat`` is used rather than
+    # ``strftime`` because it zero-pads a year below 1000 (``1-...``), which
+    # ``strftime`` does not do on every platform.
+    if parsed.isoformat() + "Z" != value:
+        raise SourcesError(
+            f"{field} must be the canonical RFC 3339 UTC form "
+            f"(e.g. 2026-09-01T00:00:00Z), got {value!r}"
+        )
     return value
 
 
@@ -413,10 +432,19 @@ def _overlap_since(
 
     if bookmark is None or not bookmark.high_water:
         return None
-    moment = _parse_timestamp(bookmark.high_water) - _datetime.timedelta(
-        seconds=overlap_seconds
-    )
-    return moment.strftime(_TIMESTAMP_FORMAT)
+    try:
+        moment = _parse_timestamp(bookmark.high_water) - _datetime.timedelta(
+            seconds=overlap_seconds
+        )
+    except (OverflowError, ValueError) as exc:
+        # A cursor near the representable minimum (year 0001) plus a non-zero
+        # overlap underflows the datetime range. That is a controlled source
+        # error, not an ``OverflowError`` escaping the module's taxonomy.
+        raise SourcesError(
+            f"bookmark high_water {bookmark.high_water!r} cannot be shifted "
+            f"back by overlap_seconds={overlap_seconds}"
+        ) from exc
+    return moment.isoformat() + "Z"
 
 
 def select_new(
@@ -532,9 +560,11 @@ def collect(
     A reader that raises, returns something other than a :class:`SourceRead`,
     or reports a read for the wrong source is recorded as a non-complete read
     with no items; it never becomes an empty success and never advances that
-    source's bookmark. Other sources are unaffected, so one failure leaves the
-    rest intact and ``covered`` is false with ``unqualified`` naming exactly
-    the failures.
+    source's bookmark. A source whose bookmark cannot hold its selection
+    (``SourcesCapacityError``) is likewise recorded as an ``INVALID``,
+    non-complete read with no items rather than aborting the whole cycle. Other
+    sources are unaffected, so one failure leaves the rest intact and
+    ``covered`` is false with ``unqualified`` naming exactly the failures.
 
     Only the selected new items are committed to the bookmark, so a selection
     bounded by ``max_items_per_source`` can never advance ``high_water`` past
@@ -597,8 +627,22 @@ def collect(
                 overlap_seconds=overlap_seconds,
                 max_items=max_items_per_source,
             )
-            new_items.extend((source_id, item) for item in selected)
-            bookmarks.advance(replace(read, items=selected))
+            try:
+                bookmarks.advance(replace(read, items=selected))
+            except SourcesCapacityError as exc:
+                # One source's bookmark cannot hold its selection. That source
+                # becomes an explicit non-complete read and contributes no
+                # items; every sibling source still reads and delivers. The
+                # failure is named and fail-closed -- the source is never
+                # silently evicted, truncated or marked healthy.
+                reads[-1] = _failed_read(
+                    source_id,
+                    SourceOutcome.INVALID,
+                    f"bookmark capacity exceeded: {exc}",
+                    clock,
+                )
+            else:
+                new_items.extend((source_id, item) for item in selected)
         else:
             bookmarks.advance(read)
     return SourceCycle(reads=tuple(reads), new_items=tuple(new_items))

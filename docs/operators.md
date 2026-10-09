@@ -63,9 +63,10 @@ reports an empty, honest list and exits `0`.
         "version": "protocol-22",
         "capabilities": [
           "capability.discovery",
-          "session.prompt",
           "snapshot.capture",
-          "target.inspect"
+          "target.inspect",
+          "session.prompt",
+          "execution.start"
         ]
       },
       "reason": null
@@ -90,12 +91,21 @@ being attempted or substituted.
 | `snapshot.capture` | supported |
 | `target.inspect` | supported |
 | `session.prompt` | supported |
+| `execution.start` | supported for an **EXISTING** verified target only; `PROVISION` is **unavailable** (no ownership record or cleanup policy, so no pane or workspace is ever created) |
 | `output.observe` | **unavailable** (no event boundaries to map) |
-| `execution.start` | **unavailable** (no matching target mapping) |
 | `session.close` | **unavailable** |
 
 An unavailable capability is reported as explicit `UNAVAILABLE` evidence; there
 is no fallback runtime and no fabricated result.
+
+`execution.start` reads one snapshot to positively verify a caller-supplied
+existing target before it starts anything, and `session.prompt` submits one
+prompt. Both have a deliberate hazard worth stating: once the write has been
+issued, a later failure (including the plugin's own returned-identity check)
+still raises even though the prompt or start may already have landed. The
+plugin has no retry, idempotency or deduplication of its own, so a caller that
+blindly retries after such an error can submit the same prompt or start twice.
+Treat a post-send error as **unknown**, not as "nothing happened".
 
 ## Work registry commands
 

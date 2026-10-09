@@ -1195,8 +1195,9 @@ class ReviewCorrectionTests(unittest.TestCase):
             stored.count("bbb-new"), 1, "an unchanged item was delivered twice"
         )
 
-    def test_an_item_past_the_retry_budget_is_retired_and_stated(self) -> None:
-        """Retirement is a stated outcome, not a silent drop."""
+    def test_a_missing_item_is_held_and_never_written_off(self) -> None:
+        """A missing item is not proof of delivery or resolution: it stays
+        pending and retry-eligible instead of being consumed and lost."""
         g = make_item("G1", "flaky", observed_at="2026-01-01T10:00:00Z")
         seen = {"n": 0}
 
@@ -1208,21 +1209,97 @@ class ReviewCorrectionTests(unittest.TestCase):
         ledger = DeliveryLedger()
         bookmarks = Bookmarks()
         history = BriefHistory()
-        retired_runs = []
+        held_runs = 0
         for _ in range(6):
             run = self._run(
                 make_spec(["s"]), reader, MemorySink(),
                 ledger=ledger, bookmarks=bookmarks, history=history,
             )
-            if run.brief.retired:
-                retired_runs.append(run)
-        self.assertTrue(retired_runs, "a permanently missing item was never retired")
-        first = retired_runs[0]
-        self.assertEqual(first.brief.retired, (("s", "G1"),))
-        self.assertIn("G1", first.markdown)
-        self.assertIn("no longer observed", first.markdown)
-        # Retired means consumed: it is never selected again.
-        self.assertIn("G1", bookmarks.get("s").delivered)
+            if run.brief.held:
+                held_runs += 1
+        self.assertGreater(held_runs, 2, "a missing item was silently written off")
+        # Held, not consumed: it never enters the delivered set while absent.
+        entry = bookmarks.get("s")
+        self.assertTrue(entry is None or "G1" not in entry.delivered)
+        self.assertNotIn("G1", [line.item_id for line in run.brief.lines])
+
+    def test_an_item_missing_past_the_old_budget_reappears_and_is_reported_once(self) -> None:
+        """The old code retired an item after two absent rechecks and marked it
+        consumed, so a late reappearance was silently lost. A held item must
+        stay retry-eligible and be reported exactly once when it returns."""
+        g = make_item("G1", "flaky", observed_at="2026-01-01T10:00:00Z")
+        # Run 1-3: present on the cycle read, absent on the re-read (three
+        # misses, past the old MAX_MISSES=2). Run 4: present at both reads.
+        # Run 5-6: present at both reads but already delivered.
+        responses = [True, False, True, False, True, False, True, True, True, True]
+        calls = {"n": 0}
+
+        def reader(source_id, since):
+            present = responses[calls["n"]]
+            calls["n"] += 1
+            return ok_read(source_id, [g] if present else [])
+
+        sink = MemorySink()
+        ledger = DeliveryLedger()
+        bookmarks = Bookmarks()
+        history = BriefHistory()
+        reported: list[str] = []
+        for _ in range(6):
+            run = self._run(
+                make_spec(["s"]), reader, sink,
+                ledger=ledger, bookmarks=bookmarks, history=history,
+            )
+            reported.extend(line.item_id for line in run.brief.lines)
+
+        self.assertEqual(
+            reported.count("G1"), 1,
+            "an item missing past the old budget was lost or repeated",
+        )
+        # It was confirmed exactly once: exactly one artifact carries the line.
+        bodies = [body for _title, body in sink.artifacts.values()]
+        self.assertEqual(
+            sum("[new] flaky" in body for body in bodies), 1,
+            "a confirmed send was repeated for a reappearing item",
+        )
+
+    def test_six_hundred_items_recheck_within_1024_capacity(self) -> None:
+        """The recheck built a default-capacity (512) bookmark, so a
+        legitimately 1024-cap caller with a 600-item source failed its own
+        recheck and reported nothing."""
+        items = [
+            make_item(f"i{index:04d}", "item", observed_at="2026-01-01T10:00:00Z")
+            for index in range(600)
+        ]
+        run = self._run(
+            make_spec(["s"]),
+            static_reader({"s": ok_read("s", items)}),
+            MemorySink(),
+            bookmarks=Bookmarks(max_delivered_per_source=1024),
+        )
+        self.assertTrue(run.delivered)
+        self.assertEqual(len(run.brief.lines), 600)
+        self.assertFalse(run.brief.unqualified)
+
+    def test_over_capacity_source_does_not_lose_a_sibling(self) -> None:
+        """A bookmark overflow aborted the whole run; the sibling source's new
+        item was lost with it."""
+
+        def reader(source_id, since):
+            if source_id == "s":
+                return ok_read(
+                    "s",
+                    [make_item("a", "A"), make_item("b", "B"), make_item("c", "C")],
+                )
+            return ok_read("good", [make_item("g1", "G")])
+
+        run = self._run(
+            make_spec(["s", "good"]),
+            reader,
+            MemorySink(),
+            bookmarks=Bookmarks(max_delivered_per_source=2),
+        )
+        self.assertIn("s", run.brief.unqualified)
+        self.assertEqual([line.item_id for line in run.brief.lines], ["g1"])
 
     def test_the_cursor_holds_for_an_item_that_owes_a_retry(self) -> None:
         """The bookmark invariant, stated directly and unconditionally."""

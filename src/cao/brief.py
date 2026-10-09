@@ -72,7 +72,6 @@ __all__ = [
     "MAX_QUOTED",
     "MAX_SIGNALS",
     "MAX_HISTORY",
-    "MAX_MISSES",
     "BriefError",
     "BriefCapacityError",
     "BriefStateError",
@@ -106,10 +105,6 @@ MAX_LINES = 5000
 MAX_QUOTED = 256
 MAX_SIGNALS = 64
 MAX_HISTORY = 4096
-# Consecutive runs an item may be selected-but-not-observed before it is
-# retired. Bounded so a permanently flaky item cannot hold a retry open
-# forever, and small so a transient source omission is nearly always retried.
-MAX_MISSES = 2
 MAX_FIELD_CHARS = 500
 
 
@@ -481,10 +476,10 @@ class DraftBrief:
     quoted: tuple[UntrustedData, ...]
     signals: tuple[Signal, ...]
     # Items selected for this brief that a fresh re-read no longer observes.
-    # They are retired rather than dropped silently: a source that stops
-    # reporting an item has, from CAO's point of view, resolved it, and the
-    # reader is told that is what happened.
-    retired: tuple[tuple[str, str], ...]
+    # They are NOT consumed and NOT reported as current: absence is not proof
+    # of delivery or resolution, so they stay pending (retry-eligible) and the
+    # reader is told they were not observed rather than that they resolved.
+    held: tuple[tuple[str, str], ...]
     content_fingerprint: str
 
     @property
@@ -524,18 +519,21 @@ def _fresh_read(
     *,
     clock: Any,
     max_items_per_source: int,
+    max_delivered_per_source: int,
 ) -> SourceRead:
     """Re-read one source through ``cao.sources.collect`` (fail closed).
 
     Reusing ``collect`` here means a recheck that raises, returns a non-read or
     returns a read for the wrong source becomes an explicit non-``OK`` read
-    rather than a stale success.
+    rather than a stale success. The throwaway bookmark carries a capacity at
+    least as large as the selection it must hold, so a legitimately large
+    source is not failed by a default capacity the caller never chose.
     """
 
     cycle = collect(
         reader,
         [source_id],
-        _empty_bookmarks(),
+        Bookmarks(max_delivered_per_source=max_delivered_per_source),
         max_items_per_source=max_items_per_source,
         clock=clock,
     )
@@ -721,6 +719,13 @@ def _compose(
             source_id,
             clock=clock,
             max_items_per_source=max_items_per_source,
+            # The throwaway recheck bookmark must accept at least the selection
+            # it makes, and never less than the caller's own configured
+            # capacity. Otherwise a large-but-legitimate source would fail its
+            # recheck on a capacity the caller never selected.
+            max_delivered_per_source=max(
+                working.max_delivered_per_source, max_items_per_source
+            ),
         )
         final_reads[source_id] = fresh
         if not fresh.complete:
@@ -741,9 +746,10 @@ def _compose(
         )
         if fresh_item is None:
             # Not observed at the re-read. It is never reported as current and
-            # never consumed while a retry is still owed; once MAX_MISSES
-            # consecutive runs have missed it, it is retired and named in the
-            # brief rather than dropped silently.
+            # never consumed: absence is not proof of delivery or resolution,
+            # so the item stays pending and retry-eligible instead of being
+            # written off. It is named in the brief rather than dropped
+            # silently, and its timestamp keeps the cursor from moving past it.
             absent.append((source_id, _item.item_id, _item.observed_at))
             continue
         fresh_fingerprint = _item_fingerprint(fresh_item)
@@ -768,23 +774,18 @@ def _compose(
             )
         )
 
-    # Everything selected that the fresh read did not observe, split by
-    # whether a retry is still owed. Without a history there is nowhere to keep
-    # a retry, so the item is retired at once and said so.
-    def _exhausted(item_id: tuple[str, str]) -> bool:
-        return history is None or history.misses(*item_id) >= MAX_MISSES
-
-    retired = tuple(
-        sorted(
-            (source_id, item_id)
-            for source_id, item_id, _observed_at in absent
-            if _exhausted((source_id, item_id))
-        )
-    )
+    # Everything selected that the fresh read did not observe is HELD: never
+    # consumed and never reported as current, because absence is not proof of
+    # delivery or resolution. A held item keeps its retry eligibility (it never
+    # enters the delivered set) and its timestamp caps the cursor so it stays
+    # selectable. The pending set is bounded rather than gone: history refuses
+    # to track another unobserved item past its max_entries, fail-closed.
     held = tuple(
         (source_id, item_id, observed_at)
         for source_id, item_id, observed_at in absent
-        if not _exhausted((source_id, item_id))
+    )
+    brief_held = tuple(
+        sorted((source_id, item_id) for source_id, item_id, _a in held)
     )
 
     coverage = tuple(_coverage_of(final_reads[source_id]) for source_id in ordered)
@@ -821,7 +822,7 @@ def _compose(
         lines=tuple(lines),
         quoted=tuple(quoted),
         signals=signals,
-        retired=retired,
+        held=brief_held,
         content_fingerprint="",
     )
     brief = replace(
@@ -843,9 +844,8 @@ def _compose(
     return (
         brief,
         tuple(final_reads[source_id] for source_id in ordered),
-        # Every selected item, with the object the SELECTION saw. All of them
-        # are consumed on a confirmed delivery EXCEPT the ones still owing a
-        # retry.
+        # Every selected item, with the object the SELECTION saw. They are
+        # consumed on a confirmed delivery EXCEPT the held (unobserved) ones.
         tuple((source_id, item) for source_id, item, _change in candidates),
         held,
         caps,
@@ -959,17 +959,18 @@ def render_markdown(brief: DraftBrief) -> str:
             f"- {_one_line(line.source_id)}: [{line.change}]{state} "
             f"{_one_line(line.title)}{link}"
         )
-    if brief.retired:
+    if brief.held:
         out.append("")
         out.append(
-            "Selected for this brief but no longer observed at the final "
-            "re-read, so not reported as current: "
+            "Selected for this brief but not observed at the final re-read, "
+            "so not delivered and not confirmed: "
             + ", ".join(
                 f"{_one_line(source)} {_one_line(item)}"
-                for source, item in brief.retired
+                for source, item in brief.held
             )
-            + ". A source that stops reporting an item has, from CAO's point "
-            "of view, resolved it."
+            + ". A missing item is not proof of delivery or resolution; the "
+            "cursor stays held and the item is retried and reported if it "
+            "reappears. It is never silently written off."
         )
     out.append("")
     return "\n".join(out)
@@ -991,14 +992,14 @@ def _commit_bookmarks(
     Three cases, and all three matter:
 
     * an item reported in this brief is consumed normally;
-    * an item that was selected but not observed is NOT consumed while it
-      still owes a retry, and its timestamp caps ``high_water`` so it stays
+    * an item that was selected but not observed is NOT consumed: it stays
+      retry-eligible, and its timestamp caps ``high_water`` so it stays
       selectable on the next run. Without the cap the cursor would jump over
       it and, since selection drops everything older than the cursor minus the
-      overlap, the item would become unreachable rather than merely undelivered;
-    * an item that has exhausted ``MAX_MISSES`` consecutive misses is retired:
-      consumed and named in the brief, so the reader is told rather than left
-      to infer it.
+      overlap, the item would become unreachable rather than merely
+      undelivered;
+    * an item that was held on an earlier run but not even reported on this one
+      is still in the persisted pending set, so its cap is applied here too.
 
     Delivered ids are recorded even under the cap. That is the whole reason
     the cap exists: without it, everything above a pending item would be
@@ -1108,8 +1109,6 @@ def run_brief(
             for line in brief.lines:
                 history.record(line.source_id, line.item_id, line.fingerprint)
                 history.clear_miss(line.source_id, line.item_id)
-            for source_id, item_id in brief.retired:
-                history.clear_miss(source_id, item_id)
             for source_id, item_id, _observed_at in held:
                 history.record_miss(source_id, item_id, _observed_at)
 

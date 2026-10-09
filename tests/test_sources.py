@@ -479,5 +479,96 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(ids(second), ["c"])
 
 
+class DualAdvisorCorrectionTests(unittest.TestCase):
+    """Regressions for the dual-advisor review of c955e07.
+
+    Each test here failed against that SHA and must keep failing if the
+    correction is reverted.
+    """
+
+    def test_noncanonical_timestamp_is_refused(self) -> None:
+        """``strptime`` accepted ``2026-9-01`` while ordering compares strings,
+        so a mixed-form reader got misordered selection and a corrupt cursor."""
+        with self.assertRaises(SourcesError):
+            item("a", "2026-9-01T00:00:00Z")
+        with self.assertRaises(SourcesError):
+            SourceRead(
+                source_id="s",
+                outcome=SourceOutcome.OK,
+                items=(),
+                evidence=build_evidence(
+                    EvidenceSource.INTERNAL, Verdict.SUPPORTED, coverage=1.0
+                ),
+                captured_at="2026-9-01T00:00:00Z",
+            )
+
+    def test_canonical_timestamp_is_accepted(self) -> None:
+        self.assertEqual(item("a", "2026-09-01T00:00:00Z").observed_at,
+                         "2026-09-01T00:00:00Z")
+
+    def test_overlap_underflow_is_a_sources_error(self) -> None:
+        """A cursor at the representable minimum (year 0001) minus the overlap
+        window overflowed a raw ``OverflowError`` outside this module's
+        taxonomy."""
+        bookmark = Bookmark(
+            source_id="s",
+            high_water="0001-01-01T00:00:00Z",
+            delivered=(),
+            updated_at=CAPTURED,
+        )
+        with self.assertRaises(SourcesError):
+            select_new(ok_read("s", [item("a", T1)]), bookmark, overlap_seconds=60)
+
+    def test_overlap_underflow_in_collect_is_a_sources_error(self) -> None:
+        bookmarks = load_bookmarks(
+            {
+                "schema": SOURCE_STATE_SCHEMA,
+                "bookmarks": {
+                    "s": {
+                        "source_id": "s",
+                        "high_water": "0001-01-01T00:00:00Z",
+                        "delivered": [],
+                        "updated_at": CAPTURED,
+                    }
+                },
+            }
+        )
+
+        def reader(source_id, since):
+            return ok_read(source_id, [])
+
+        with self.assertRaises(SourcesError):
+            collect(reader, ["s"], bookmarks, clock=clock_at())
+
+    def test_over_capacity_source_is_invalid_and_siblings_survive(self) -> None:
+        """A bookmark capacity overflow aborted the whole cycle, losing every
+        sibling source's data and wedging the source permanently."""
+
+        def reader(source_id, since):
+            if source_id == "s":
+                return ok_read(
+                    "s", [item("a", T1), item("b", T1), item("c", T1)]
+                )
+            return ok_read("good", [item("good-1", T1)])
+
+        bookmarks = Bookmarks(max_delivered_per_source=2)
+        cycle = collect(reader, ["s", "good"], bookmarks, clock=clock_at())
+
+        self.assertFalse(cycle.covered)
+        self.assertEqual(cycle.unqualified, ("s",))
+        self.assertIs(cycle.reads[0].outcome, SourceOutcome.INVALID)
+        self.assertEqual(cycle.reads[0].items, ())
+        self.assertEqual(ids(cycle), ["good-1"])
+        self.assertEqual(bookmarks.get("good").delivered, ("good-1",))
+        self.assertIsNone(bookmarks.get("s"))
+
+        # The source is named unqualified on every run -- not silently evicted
+        # or marked healthy -- but the sibling keeps succeeding.
+        again = collect(reader, ["s", "good"], bookmarks, clock=clock_at())
+        self.assertFalse(again.covered)
+        self.assertEqual(again.unqualified, ("s",))
+        self.assertEqual(ids(again), [])
+
+
 if __name__ == "__main__":
     unittest.main()
