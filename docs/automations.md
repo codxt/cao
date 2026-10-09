@@ -59,16 +59,14 @@ Markdown file per distinct brief under a directory the caller supplies. There
 is no HTTP, socket, SMTP, webhook, credential or environment path anywhere in
 this feature.
 
-The delivery key is derived from the brief's *content* — every line, every
-quoted note, every signal, and the full per-source coverage including item
-counts and failure reasons. So a repeated or interrupted run reconciles to the
-same artifact instead of writing a second one, and a genuinely changed draft
-gets its own file rather than silently reusing the previous one.
-
-`generated_at` is deliberately **not** part of the key. A second run that
-observes exactly the same things is the same logical delivery, so it
-reconciles; the timestamp on disk is the one from the run that actually wrote
-it.
+The delivery key is the **rendered artifact itself, minus its timestamp**.
+That is deliberate: an earlier version kept a hand-maintained list of the
+fields that reach the output, and a field missing from that list meant a
+changed draft silently reused the previous file while the run reported
+success. Deriving the key from the output makes that whole class of bug
+impossible. `generated_at` is excluded because a repeat run that observes
+exactly the same things is the same logical delivery and must reconcile to
+one file rather than writing a new one every tick.
 
 ## Bounded by design, not incidentally
 
@@ -121,10 +119,12 @@ reports each state file through its own loader; an absent state file is
 `UNAVAILABLE` and exits nonzero, because "no run has happened" and "here is
 what the last run observed" are different statements.
 
-`run` **always reports `UNAVAILABLE` and exits 3** in this build. Composing a
-brief needs a `SourceReader` for each declared source, and CAO ships none: no
-runtime and no source adapter is a built-in default. The command names that
-missing capability instead of pretending to have run something.
+`run` reads and validates the manifest first, because a caller who passed a
+broken manifest deserves to be told *that* rather than told about a missing
+adapter. When the manifest is valid, it reports `UNAVAILABLE` and exits 3:
+composing a brief needs a `SourceReader` for each declared source, and CAO
+ships none. The command names that missing capability instead of pretending to
+have run something.
 
 ## Synthetic example
 

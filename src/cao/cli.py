@@ -487,23 +487,47 @@ def _cmd_automation_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_automation_run(args: argparse.Namespace) -> int:
-    """Report that no concrete source adapter ships in this build.
+    """Validate the manifest, then report that no concrete adapter ships.
 
-    Composing a brief needs a ``SourceReader`` for every declared source, and
-    CAO ships none: no runtime and no source adapter is a built-in default. This
-    command therefore never pretends to have run an automation. It reports the
-    exact missing capability and exits nonzero, which is the only honest answer
-    available until an adapter is registered by the operator.
+    The manifest is read and validated first, because a caller who passes a
+    broken manifest deserves to be told that rather than told about a missing
+    adapter. Only when the manifest is valid does the honest answer become the
+    missing capability: composing a brief needs a ``SourceReader`` for every
+    declared source, and CAO ships none. No runtime and no source adapter is a
+    built-in default.
     """
+
+    manifest, code = _read_json_document(args.config, AUTOMATION_GROUP, "run")
+    if manifest is None:
+        return code if code is not None else EXIT_UNAVAILABLE
+    try:
+        from .spec import SpecInvalid, load_spec
+
+        load_spec(manifest)
+    except SpecInvalid as exc:
+        _emit(
+            {
+                "schema": "cao.cli.automation.v0",
+                "status": "INVALID",
+                "config": args.config,
+                "error": {
+                    "code": exc.code,
+                    "verdict": exc.verdict.value,
+                    "field": exc.field,
+                    "message": exc.reason,
+                },
+            }
+        )
+        return EXIT_UNAVAILABLE
 
     return _unavailable(
         AUTOMATION_GROUP,
         "run",
         "NO_SOURCE_ADAPTER",
-        "no concrete SourceReader is registered for this build, so no automation "
-        "can be executed; CAO ships no runtime and no source adapter as a "
-        "default. Validate a manifest with 'cao automation validate' and inspect "
-        "persisted state with 'cao automation status'.",
+        "the manifest is valid, but no concrete SourceReader is registered for "
+        "this build, so nothing can be executed; CAO ships no runtime and no "
+        "source adapter as a default. Validate a manifest with 'cao automation "
+        "validate' and inspect persisted state with 'cao automation status'.",
     )
 
 

@@ -508,6 +508,21 @@ def _coverage_of(read: SourceRead) -> SourceCoverage:
     )
 
 
+def _without_generated_at(rendered: str) -> str:
+    """The rendered artifact with its single ``Generated:`` line removed.
+
+    Exactly one line can start with ``Generated: ``: every free-text field is
+    collapsed to one line before rendering, so untrusted text cannot forge a
+    second one and make this ambiguous.
+    """
+
+    return "".join(
+        line + "\n"
+        for line in rendered.splitlines()
+        if not line.startswith("Generated: ")
+    )
+
+
 def _compose(
     *,
     source_ids: Iterable[str],
@@ -671,33 +686,13 @@ def _compose(
         runtime_projection, "runtime"
     )
 
-    content_fingerprint = fingerprint(
-        {
-            "schema": BRIEF_SCHEMA,
-            "coverage": [
-                [
-                    entry.source_id,
-                    entry.outcome.value,
-                    entry.item_count,
-                    entry.detail,
-                ]
-                for entry in coverage
-            ],
-            "lines": [
-                [line.source_id, line.item_id, line.fingerprint] for line in lines
-            ],
-            # Quoted notes and signals both reach the rendered artifact, so
-            # they must reach the key too. A key that omitted them let a
-            # changed draft report delivered while the file on disk kept the
-            # previous content.
-            "quoted": [[note.kind, note.fingerprint] for note in quoted],
-            "signals": [
-                [signal.name, signal.outcome.value, signal.detail]
-                for signal in signals
-            ],
-        }
-    )
-
+    # The delivery key is derived from the RENDERED artifact, not from a
+    # hand-maintained list of fields. A list is exactly how the previous two
+    # corrections missed a field that reached the output; deriving the key from
+    # the output makes that class of bug impossible by construction. Only the
+    # timestamp is excluded, because a repeat run that observes exactly the
+    # same things is the same logical delivery and must not write a second
+    # artifact.
     brief = DraftBrief(
         schema=BRIEF_SCHEMA,
         generated_at=utc_now(clock),
@@ -705,7 +700,11 @@ def _compose(
         lines=tuple(lines),
         quoted=tuple(quoted),
         signals=signals,
-        content_fingerprint=content_fingerprint,
+        content_fingerprint="",
+    )
+    brief = replace(
+        brief,
+        content_fingerprint=fingerprint(_without_generated_at(render_markdown(brief))),
     )
     return brief, tuple(final_reads[source_id] for source_id in ordered)
 

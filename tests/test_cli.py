@@ -407,10 +407,15 @@ class AutomationCommandTests(LaneFixtureTests):
         self.manifest = self.repo_root / "examples" / "automation_manifest.json"
         self.preferences = self.repo_root / "examples" / "automation_preferences.json"
 
-    def _manifest_argv(self, document: dict, name: str = "manifest.json") -> list[str]:
+    def _manifest_path(self, document, name: str = "manifest.json") -> str:
+        if document is None:
+            return str(self.manifest)
         path = self.dir / name
         path.write_text(json.dumps(document), encoding="utf-8")
-        return ["automation", "validate", "--config", str(path)]
+        return str(path)
+
+    def _manifest_argv(self, document: dict, name: str = "manifest.json") -> list[str]:
+        return ["automation", "validate", "--config", self._manifest_path(document, name)]
 
     def test_validate_accepts_the_shipped_synthetic_manifest(self) -> None:
         code, output = run_cli(
@@ -503,6 +508,28 @@ class AutomationCommandTests(LaneFixtureTests):
         self.assertEqual(payload["command"], "run")
         self.assertEqual(payload["error"]["code"], "NO_SOURCE_ADAPTER")
         self.assertEqual(payload["error"]["verdict"], "UNAVAILABLE")
+
+    def test_run_reads_the_config_it_demands(self) -> None:
+        """--config was decorative: a broken manifest got the missing-adapter
+        answer instead of the real one."""
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        document["timezone"] = "Not/AZone"
+        code, output = run_cli(
+            ["automation", "run", "--config", self._manifest_path(document), "--dry-run"]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "INVALID")
+        self.assertEqual(payload["error"]["field"], "manifest.timezone")
+
+    def test_run_still_refuses_a_valid_manifest_with_no_adapter(self) -> None:
+        code, output = run_cli(
+            ["automation", "run", "--config", self._manifest_path(None)]
+        )
+        payload = json.loads(output)
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["error"]["code"], "NO_SOURCE_ADAPTER")
+        self.assertIn("manifest is valid", payload["error"]["message"])
 
     def test_status_reports_absent_state_as_unavailable_not_empty(self) -> None:
         code, output = run_cli(

@@ -17,12 +17,14 @@ import ast
 import importlib
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cao.brief import (
     BRIEF_HISTORY_SCHEMA,
     BRIEF_SCHEMA,
+    _without_generated_at,
     BriefCapacityError,
     BriefError,
     BriefHistory,
@@ -120,6 +122,28 @@ def unavailable_read(source_id: str) -> SourceRead:
         EvidenceSource.INTERNAL,
         Verdict.UNAVAILABLE,
         reason="synthetic transport failure",
+        capture_time=CAPTURED,
+    )
+    return SourceRead(
+        source_id=source_id,
+        outcome=SourceOutcome.UNAVAILABLE,
+        items=(),
+        evidence=evidence,
+        captured_at=CAPTURED,
+    )
+
+
+def unavailable_with_reason(source_id: str, reason: str) -> SourceRead:
+    """The SAME non-OK outcome as ``unavailable_read`` with a different reason.
+
+    Two reads that differ only in their failure reason render differently, so
+    they must also key differently.
+    """
+
+    evidence = build_evidence(
+        EvidenceSource.INTERNAL,
+        Verdict.UNAVAILABLE,
+        reason=reason,
         capture_time=CAPTURED,
     )
     return SourceRead(
@@ -948,17 +972,87 @@ class ReviewCorrectionTests(unittest.TestCase):
         self.assertTrue(second.delivered)
         self.assertNotEqual(first.key, second.key)
 
-    def test_changed_coverage_detail_actually_reaches_the_sink(self) -> None:
+    def test_changed_coverage_detail_reaches_the_sink(self) -> None:
+        """Two reads with the SAME outcome but a different reason must not
+        collide: the earlier version compared an OK read to an UNAVAILABLE
+        one, which the pre-fix key already distinguished."""
         sink = LocalFileSink(self.out)
-        good = static_reader({"s": ok_read("s", [make_item("i1", "thing")])})
-        bad = static_reader({"s": unavailable_read("s")})
-        first = self._run(make_spec(["s"]), good, sink)
+        first = self._run(
+            make_spec(["s"]),
+            static_reader({"s": unavailable_read("s")}),
+            sink,
+        )
         second = self._run(
-            make_spec(["s"]), bad, sink, bookmarks=Bookmarks(),
+            make_spec(["s"]),
+            static_reader({"s": unavailable_with_reason("s", "timeout")}),
+            sink,
+            bookmarks=Bookmarks(),
             ledger=DeliveryLedger(),
         )
         self.assertTrue(first.delivered)
+        self.assertTrue(second.delivered)
+        self.assertEqual(first.brief.coverage[0].outcome, second.brief.coverage[0].outcome)
+        self.assertNotEqual(first.brief.coverage[0].detail,
+                            second.brief.coverage[0].detail)
         self.assertNotEqual(first.key, second.key)
+        self.assertEqual(len(list(self.out.iterdir())), 2)
+
+    def test_changed_change_label_reaches_the_sink(self) -> None:
+        """The gap the second review found: the line's [new]/[changed] label
+        is rendered, so it must change the key."""
+        sink = LocalFileSink(self.out)
+        reader = static_reader({"s": ok_read("s", [make_item("i1", "T")])})
+        # Run A: nothing delivered yet, so the line is [new].
+        first = self._run(make_spec(["s"]), reader, sink)
+        # Run B: the item is already delivered, and history holds an older
+        # fingerprint for it, so the same content is now [changed].
+        delivered = Bookmarks()
+        delivered.advance(ok_read("s", [make_item("i1", "T")]))
+        history = BriefHistory([ObservedItem("s", "i1", "sha256:an-older-state")])
+        second = self._run(
+            make_spec(["s"]), reader, sink,
+            bookmarks=delivered, history=history, ledger=DeliveryLedger(),
+        )
+        self.assertEqual(first.brief.lines[0].change, "new")
+        self.assertEqual(second.brief.lines[0].change, "changed")
+        self.assertIn("[new]", first.markdown)
+        self.assertIn("[changed]", second.markdown)
+        self.assertNotEqual(first.key, second.key)
+        stored = "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted(self.out.iterdir())
+        )
+        self.assertIn("[new]", stored)
+        self.assertIn("[changed]", stored)
+
+    def test_every_rendered_field_reaches_the_key(self) -> None:
+        """The key is the rendered artifact minus its timestamp, so a field
+        cannot reach the output without reaching the key. This asserts the
+        construction itself rather than a list of fields."""
+        brief = compose_brief(
+            source_ids=["s"],
+            reader=static_reader({"s": ok_read("s", [make_item("i1", "T")])}),
+            clock=clock_at(),
+        )
+        rendered = render_markdown(brief)
+        self.assertIn("Generated: ", rendered)
+        self.assertEqual(
+            brief.content_fingerprint,
+            fingerprint(_without_generated_at(rendered)),
+        )
+        # Changing only the timestamp must NOT change the key.
+        later = replace(brief, generated_at="2026-06-06T06:06:06Z")
+        self.assertEqual(
+            fingerprint(_without_generated_at(render_markdown(later))),
+            brief.content_fingerprint,
+        )
+        # Changing anything that is rendered MUST change it.
+        moved = replace(
+            brief, lines=(replace(brief.lines[0], change="changed"),)
+        )
+        self.assertNotEqual(
+            fingerprint(_without_generated_at(render_markdown(moved))),
+            brief.content_fingerprint,
+        )
 
     def test_identical_content_still_reconciles_to_one_artifact(self) -> None:
         """The correction must not turn deduplication off."""
