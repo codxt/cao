@@ -1,0 +1,34 @@
+{
+  "version": "cao.automation.spec.v0",
+  "name": "synthetic-digest",
+  "sources": [
+    {
+      "source_id": "synthetic-feed",
+      "kind": "feed",
+      "locator": "https://example.invalid/synthetic/feed",
+      "text": "Synthetic source description, used only to exercise the loader."
+    }
+  ],
+  "destination": {
+    "sink": "local_file",
+    "destination_id": "synthetic-outbox",
+    "cost_measurement": "none"
+  },
+  "preferences_ref": "examples/automation_preferences.json",
+  "state_ref": "state/synthetic-automation-state.json",
+  "policy_ref": "examples/policy.example.json",
+  "timezone": "UTC",
+  "schedule": {
+    "cadence": "daily 08:00",
+    "description": "Descriptive only; an external scheduler the owner runs fires this."
+  },
+  "limits": {
+    "max_duration_seconds": 600,
+    "max_concurrency": 1,
+    "max_calls": 100
+  },
+  "stop": {
+    "state": "pause",
+    "reason": "Synthetic example; this loader never starts or stops a run."
+  }
+}
