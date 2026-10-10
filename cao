@@ -1,0 +1,19 @@
+#!/bin/sh
+# CAO source launcher.
+#
+# Runs the product CLI straight from this checkout with no install step and no
+# wheel: only the standard library is needed. Dispatch happens through
+# ``python3 -m cao.product_cli`` with this checkout's ``src`` on PYTHONPATH.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+python=${CAO_PYTHON:-python3}
+
+if [ -z "${PYTHONPATH:-}" ]; then
+    PYTHONPATH="$here/src"
+else
+    PYTHONPATH="$here/src:$PYTHONPATH"
+fi
+export PYTHONPATH
+
+exec "$python" -B -S -m cao.product_cli "$@"

@@ -37,6 +37,26 @@ evidence and exits nonzero.
 
 Requires Python 3.10+.
 
+### From source (no wheel)
+
+```sh
+git clone https://github.com/codxt/cao
+cd cao
+./setup.sh
+./cao doctor
+```
+
+`./setup.sh` writes an idempotent product configuration into the XDG config
+directory and installs or adopts the pinned runtime release through a
+stdlib-only installer that verifies the SHA-256 before anything is put in
+place — no `curl`-to-shell, no unverified binary. `./cao doctor` prints exact
+per-subsystem readiness evidence and fails closed: when a provider is missing
+or its credentials cannot be verified without reading a secret, the verdict is
+`NOT_READY`. See [`docs/installation.md`](docs/installation.md) and
+[`docs/quickstart.md`](docs/quickstart.md).
+
+### As a package
+
 ```sh
 python3 -m pip install -e .
 cao plugins list --json
@@ -47,7 +67,8 @@ Installing the package registers the Herdr runtime plugin under the
 its real id and advertised capabilities. There are no runtime dependencies
 (`dependencies = []`).
 
-To run straight from a checkout without installing:
+To run the read-only control-plane CLI straight from a checkout without
+installing:
 
 ```sh
 PYTHONPATH=src python3 -m cao --help

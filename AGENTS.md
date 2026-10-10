@@ -47,6 +47,16 @@ Initial disjoint implementation lanes:
 - **Registry / Git:** `src/cao/registry.py`, `src/cao/git.py`, and dedicated
   registry/Git tests.
 - **Herdr runtime plugin:** `src/cao/plugins/herdr/**` and dedicated plugin tests.
+- **Source bootstrap / product CLI:** `src/cao/bootstrap.py`,
+  `src/cao/product_config.py`, `src/cao/product_state.py`,
+  `src/cao/product_cli.py`, the root `cao` launcher, `setup.sh`, and their
+  dedicated tests. This lane writes the product configuration, installs or
+  adopts the pinned runtime release, and reports readiness. Its modules stay
+  runtime-neutral: the pinned coordinates live in `setup.sh`, no `src/cao`
+  non-plugin module names the concrete runtime, and none imports the plugin
+  package. A hash is verified before any executable is put in place, adoption
+  never replaces or stops an existing binary, `doctor` fails closed, and
+  commands owned by later lanes report structured `UNAVAILABLE`.
 - **Worker lifecycle / launcher:** `src/cao/lifecycle.py`, `src/cao/launcher.py`,
   and dedicated lifecycle/launcher tests.
 - **Coordination / portfolio:** `src/cao/coordinator.py`, `src/cao/portfolio.py`,
@@ -65,9 +75,10 @@ Cross-lane interface changes require manager review. CLI commands without a
 complete owning implementation must report structured `UNAVAILABLE` and a
 nonzero exit, never fabricate successful work.
 
-The initial implementation remains private. Do not add a `LICENSE` file, push,
-publish, deploy, introduce a runtime dependency or move private operational
-values without separate owner authorization.
+CAO is published under the Apache License, Version 2.0 (`LICENSE` is present)
+and that license must not be changed. Without separate owner authorization, do
+not push, publish, deploy, introduce a runtime dependency or move private
+operational values.
 
 ## Validation (required before handback)
 
