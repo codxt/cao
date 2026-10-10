@@ -35,7 +35,14 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from . import bootstrap, product_config, product_driver, product_state, product_task
+from . import (
+    bootstrap,
+    product_config,
+    product_daemon,
+    product_driver,
+    product_state,
+    product_task,
+)
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -209,6 +216,77 @@ def _cmd_start(args: argparse.Namespace) -> int:
     return _not_implemented("start")
 
 
+def _daemon(rest: Sequence[str]) -> int:
+    """The daemon lifecycle: start / stop / status.
+
+    ``start`` refuses (exit 3) unless the product configuration and the managed
+    runtime are both ready; it never invents a running service. ``status`` and
+    ``stop`` read the durable records and work without a configuration.
+    """
+
+    parser = argparse.ArgumentParser(prog="cao daemon", add_help=False)
+    parser.add_argument("action", choices=("start", "stop", "status"))
+    parser.add_argument("--max-ticks", type=int, default=None)
+    try:
+        args = parser.parse_args(list(rest))
+    except SystemExit:
+        return _unavailable("daemon", "USAGE", "invalid 'daemon' arguments")
+
+    try:
+        config = product_config.load_config()
+    except (product_config.ProductConfigError, StateError) as exc:
+        return _unavailable(
+            "daemon", "PRODUCT_CONFIG_INVALID", f"{type(exc).__name__}: {exc}"
+        )
+
+    if args.action == "status":
+        try:
+            payload = product_daemon.status()
+        except StateError as exc:
+            return _unavailable(
+                "daemon", "DAEMON_STATE_UNREADABLE", f"{type(exc).__name__}: {exc}"
+            )
+        _emit(payload)
+        return EXIT_OK
+
+    if args.action == "stop":
+        try:
+            payload = product_daemon.Daemon(config=config, max_ticks=args.max_ticks).stop()
+        except StateError as exc:
+            return _unavailable(
+                "daemon", "DAEMON_STATE_UNREADABLE", f"{type(exc).__name__}: {exc}"
+            )
+        _emit(payload)
+        return EXIT_OK
+
+    # start
+    if config is None:
+        return _unavailable(
+            "daemon",
+            "PRODUCT_CONFIG_NOT_READY",
+            "no product configuration is installed; run setup.sh first",
+        )
+    executable, why = _managed_executable()
+    if executable is None:
+        return _unavailable("daemon", "MANAGED_RUNTIME_NOT_READY", why or "")
+    driver = product_driver.RuntimeDriver(executable=executable)
+    daemon = product_daemon.Daemon(
+        driver=driver, config=config, max_ticks=args.max_ticks
+    )
+    try:
+        payload = daemon.start()
+    except (product_daemon.DaemonError, StateError) as exc:
+        return _unavailable(
+            "daemon", getattr(exc, "code", "PRODUCT_DAEMON_ERROR"), str(exc)
+        )
+    _emit(payload)
+    return EXIT_OK
+
+
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    return _daemon(getattr(args, "args", []) or [])
+
+
 def _cmd_run(args: argparse.Namespace) -> int:  # parser placeholder; main routes run
     return _not_implemented("run")
 
@@ -303,6 +381,16 @@ def build_parser() -> argparse.ArgumentParser:
     status = subcommands.add_parser("status", help="report the service status")
     status.set_defaults(handler=_cmd_status)
 
+    daemon = subcommands.add_parser(
+        "daemon", help="run the CAO user-level orchestration daemon"
+    )
+    daemon.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="daemon lifecycle: start|stop|status",
+    )
+    daemon.set_defaults(handler=_cmd_daemon)
+
     for name, help_text, handler in (
         ("run", "submit a task", _cmd_run),
         ("start", "start the service (unavailable in this build)", _cmd_start),
@@ -329,6 +417,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # like an option is never a usage error.
     if args_list and args_list[0] in {"run", "start", "stop", "logs"}:
         return _dispatch_task_command(args_list)
+    if args_list and args_list[0] == "daemon":
+        return _daemon(args_list[1:])
 
     parser = build_parser()
     args = parser.parse_args(args_list)

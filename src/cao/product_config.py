@@ -51,6 +51,16 @@ __all__ = [
     "TaskDefaults",
     "task_defaults",
     "registry_db_path",
+    "DAEMON_SECTION",
+    "DEFAULT_TICK_INTERVAL",
+    "MIN_TICK_INTERVAL",
+    "MAX_TICK_INTERVAL",
+    "DEFAULT_WAKE_BUDGET",
+    "DEFAULT_RETRY_BOUND",
+    "MAX_RETRY_BOUND",
+    "DEFAULT_STOP_TIMEOUT",
+    "DaemonDefaults",
+    "daemon_defaults",
 ]
 
 SCHEMA = "cao.product.config.v0"
@@ -244,7 +254,6 @@ def initialize_config(
 # Task defaults (task-orchestration lane)
 # ---------------------------------------------------------------------------
 
-
 @dataclass(frozen=True)
 class TaskDefaults:
     """Validated task defaults for the product flow.
@@ -390,3 +399,84 @@ def registry_db_path(env: Mapping[str, str] | None = None) -> str:
         os.path.expanduser("~"), ".local", "state"
     )
     return os.path.join(os.path.abspath(base), _registry.APP_DIR, _registry.DB_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Daemon defaults (daemon / autonomous-orchestration lane)
+# ---------------------------------------------------------------------------
+
+#: The optional ``daemon`` section of the product configuration. Its fields
+#: bound the orchestration loop; every one has a safe fallback.
+DAEMON_SECTION = "daemon"
+DEFAULT_TICK_INTERVAL = 30.0
+MIN_TICK_INTERVAL = 1.0
+MAX_TICK_INTERVAL = 3600.0
+DEFAULT_WAKE_BUDGET = 60
+DEFAULT_RETRY_BOUND = 3
+MAX_RETRY_BOUND = 100
+DEFAULT_STOP_TIMEOUT = 10.0
+
+
+@dataclass(frozen=True)
+class DaemonDefaults:
+    """Validated daemon bounds; a defect is refused, never silently relaxed."""
+
+    tick_interval: float
+    min_tick_interval: float
+    max_tick_interval: float
+    wake_budget: int
+    retry_bound: int
+    stop_timeout: float
+
+
+def daemon_defaults(
+    config: ProductConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> DaemonDefaults:
+    """Read and validate the optional daemon bounds, failing closed."""
+
+    raw: dict[str, Any] = {}
+    if config is not None:
+        section = config.raw.get(DAEMON_SECTION)
+        if section is not None:
+            if not isinstance(section, Mapping):
+                raise ProductConfigError("daemon must be an object")
+            raw = dict(section)
+
+    min_interval = _positive_number(
+        raw.get("min_tick_interval"), "daemon.min_tick_interval", MIN_TICK_INTERVAL
+    )
+    max_interval = _positive_number(
+        raw.get("max_tick_interval"), "daemon.max_tick_interval", MAX_TICK_INTERVAL
+    )
+    if min_interval > max_interval:
+        raise ProductConfigError(
+            "daemon.min_tick_interval must not exceed daemon.max_tick_interval"
+        )
+    interval = _positive_number(
+        raw.get("tick_interval"), "daemon.tick_interval", DEFAULT_TICK_INTERVAL
+    )
+    if not min_interval <= interval <= max_interval:
+        raise ProductConfigError(
+            f"daemon.tick_interval must be within "
+            f"[{min_interval}, {max_interval}] seconds"
+        )
+    retry_bound = _positive_int(
+        raw.get("retry_bound"), "daemon.retry_bound", DEFAULT_RETRY_BOUND
+    )
+    if retry_bound > MAX_RETRY_BOUND:
+        raise ProductConfigError(
+            f"daemon.retry_bound must be at most {MAX_RETRY_BOUND}"
+        )
+    return DaemonDefaults(
+        tick_interval=interval,
+        min_tick_interval=min_interval,
+        max_tick_interval=max_interval,
+        wake_budget=_positive_int(
+            raw.get("wake_budget"), "daemon.wake_budget", DEFAULT_WAKE_BUDGET
+        ),
+        retry_bound=retry_bound,
+        stop_timeout=_positive_number(
+            raw.get("stop_timeout"), "daemon.stop_timeout", DEFAULT_STOP_TIMEOUT
+        ),
+    )

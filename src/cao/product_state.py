@@ -9,7 +9,7 @@ Reads and writes go through :mod:`cao.state`: an unreadable or malformed state
 file raises rather than being treated as absent, and a write is atomic and
 read back.
 
-Two records are owned here:
+Records owned here:
 
 ``managed``
     The outcome of managing the runtime dependency (installed, adopted,
@@ -20,6 +20,13 @@ Two records are owned here:
     default; the orchestration lane is the only writer of a live status, so on
     a fresh clone the record is simply absent and the service is honestly
     reported as not started.
+
+``daemon``
+    The orchestration daemon's own durable control record: desired/observed
+    state, tick counters, per-run checkpoints and per-task supervision. It is
+    CAO-owned state and is deliberately distinct from the runtime's own server
+    persistence (which CAO never writes) and from the Work Registry ledger
+    (which stays the sole claim book).
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ __all__ = [
     "MANAGED_SCHEMA",
     "SERVICE_SCHEMA",
     "TASK_SCHEMA",
+    "DAEMON_SCHEMA",
     "STATE_APP_DIR",
     "TASKS_DIRNAME",
     "state_home",
@@ -43,6 +51,8 @@ __all__ = [
     "service_record_path",
     "tasks_dir",
     "task_record_path",
+    "daemon_record_path",
+    "daemon_relay_path",
     "read_managed",
     "write_managed",
     "read_service",
@@ -54,11 +64,16 @@ __all__ = [
     "list_tasks",
     "latest_task",
     "default_service_record",
+    "read_daemon",
+    "write_daemon",
+    "update_daemon",
+    "default_daemon_record",
 ]
 
 MANAGED_SCHEMA = "cao.product.managed.v0"
 SERVICE_SCHEMA = "cao.product.service.v0"
 TASK_SCHEMA = "cao.product.task.v0"
+DAEMON_SCHEMA = "cao.product.daemon.v0"
 STATE_APP_DIR = "cao"
 TASKS_DIRNAME = "tasks"
 
@@ -219,3 +234,74 @@ def list_tasks(env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
 def latest_task(env: Mapping[str, str] | None = None) -> dict[str, Any] | None:
     records = list_tasks(env)
     return records[-1] if records else None
+
+
+# ---------------------------------------------------------------------------
+# Orchestration daemon record (daemon / autonomous-orchestration lane)
+# ---------------------------------------------------------------------------
+
+
+def daemon_record_path(env: Mapping[str, str] | None = None) -> str:
+    return os.path.join(state_dir(env), "daemon.json")
+
+
+def daemon_relay_path(env: Mapping[str, str] | None = None) -> str:
+    """The daemon's persisted manager-wake deduplication ledger path."""
+
+    return os.path.join(state_dir(env), "daemon-relay.json")
+
+
+def read_daemon(env: Mapping[str, str] | None = None) -> dict[str, Any] | None:
+    """Read the daemon control record, or ``None`` when it does not exist.
+
+    An unreadable or malformed record raises; it is never treated as absent.
+    """
+
+    return state_module.read_state(daemon_record_path(env))
+
+
+def write_daemon(
+    record: Mapping[str, Any], env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Atomically write a daemon record whose schema it carries."""
+
+    if not isinstance(record, Mapping):
+        raise state_module.StateError("daemon record must be a mapping")
+    if record.get("schema") != DAEMON_SCHEMA:
+        raise state_module.StateError(f"daemon record schema must be {DAEMON_SCHEMA!r}")
+    path = daemon_record_path(env)
+    if path and not os.path.isdir(os.path.dirname(path)):
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    return state_module.write_state(path, record)
+
+
+def update_daemon(
+    patch: Mapping[str, Any], env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Merge ``patch`` into the daemon record and persist it."""
+
+    record = read_daemon(env) or default_daemon_record()
+    updated = dict(record)
+    updated.update(dict(patch))
+    return write_daemon(updated, env)
+
+
+def default_daemon_record() -> dict[str, Any]:
+    """The honest default before the daemon has ever been started."""
+
+    return {
+        "schema": DAEMON_SCHEMA,
+        "desired": "stopped",
+        "observed": "not_started",
+        "pid": None,
+        "ticks": 0,
+        "wakes": 0,
+        "errors": 0,
+        "started_at": None,
+        "last_tick_at": None,
+        "last_wake": None,
+        "retries": {},
+        "checkpoints": {},
+        "supervision": {},
+        "updated_at": None,
+    }
