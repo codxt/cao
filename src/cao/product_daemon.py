@@ -545,13 +545,15 @@ class Daemon:
         # parent's identity (and pid) is already on disk and the two writers
         # never race for it.
         record["pid_identity"] = self._identity(child)
-        record["observed"] = "running"
+        # The child has not started yet: it is waiting for _release_loop.
+        # Only the child may publish RUNNING after its own startup succeeds.
+        record["observed"] = "starting"
         record["updated_at"] = evidence.utc_now(self._clock)
         product_state.write_daemon(record, self._env)
         service = {
             "schema": product_state.SERVICE_SCHEMA,
             "desired": "running",
-            "observed": "running",
+            "observed": "starting",
             "updated_at": record["updated_at"],
         }
         product_state.write_service(service, self._env)
@@ -987,10 +989,20 @@ class Daemon:
                     product_state.read_daemon(self._env)
                     or product_state.default_daemon_record()
                 )
+                # A fast stop can race the child startup handshake. Never
+                # resurrect a daemon whose desired state is already stopped.
+                if own.get("desired") != "running":
+                    os._exit(0)
                 own["pid"] = os.getpid()
                 own["observed"] = "running"
                 own["updated_at"] = evidence.utc_now(self._clock)
                 product_state.write_daemon(own, self._env)
+                product_state.write_service(
+                    {"schema": product_state.SERVICE_SCHEMA,
+                     "desired": "running", "observed": "running",
+                     "updated_at": own["updated_at"]},
+                    self._env,
+                )
             except BaseException:  # noqa: BLE001 - a child that cannot record itself must not run
                 os._exit(1)
             try:
@@ -1040,7 +1052,7 @@ def status(
         }
     current = record or product_state.default_daemon_record()
     payload = _payload(current, service, None)
-    if str(current.get("observed") or "") == "running":
+    if str(current.get("observed") or "") in ("running", "starting"):
         state = _instance_state(
             current,
             alive if alive is not None else _pid_alive,
@@ -1050,4 +1062,7 @@ def status(
             payload["status"] = "UNKNOWN"
             payload["ok"] = False
             payload["instance"] = state
+        elif str(current.get("observed") or "") == "starting":
+            payload["status"] = "STARTING"
+            payload["ok"] = False
     return payload

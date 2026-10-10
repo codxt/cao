@@ -548,7 +548,7 @@ class DaemonTickTests(E2ECase):
         daemon = self._daemon(spawns)
 
         first = daemon.start()
-        self.assertEqual(first["observed"], "running")
+        self.assertEqual(first["observed"], "starting")
         self.assertFalse(first["already_running"])
         daemon.tick()
 

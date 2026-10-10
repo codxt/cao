@@ -209,7 +209,20 @@ class StatusCliTests(CliCase):
         )
         code, output = run_cli(["status"])
         self.assertEqual(code, product_cli.EXIT_OK)
-        self.assertEqual(json.loads(output)["status"], "RUNNING")
+        self.assertEqual(json.loads(output)["status"], "UNKNOWN")
+
+    def test_stale_service_does_not_claim_running(self) -> None:
+        product_state.write_service({
+            "schema": product_state.SERVICE_SCHEMA,
+            "desired": "running", "observed": "running",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+        # No actual daemon record or live instance exists.
+        code, output = run_cli(["status"])
+        self.assertEqual(code, product_cli.EXIT_OK)
+        result = json.loads(output)
+        self.assertNotEqual(result["status"], "RUNNING")
+        self.assertNotEqual(result["observed"], "running")
 
     def test_corrupt_state_fails_closed(self) -> None:
         path = product_state.service_record_path()

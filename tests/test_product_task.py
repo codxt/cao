@@ -177,12 +177,23 @@ class IdentityTests(TaskCase):
         config = product_config.validate_config({
             "schema": product_config.SCHEMA,
             "provider": {"cli": "opencode", "model": "pinned"},
-            "task": {"agent_args": ["mini", "--model", "explicit"]},
+            "task": {"agent_args": ["mini", "--model", "pinned"]},
         })
         self.assertEqual(
             product_config.task_defaults(config).agent_args,
-            ("mini", "--model", "explicit"),
+            ("mini", "--model", "pinned"),
         )
+
+    def test_explicit_opencode_args_cannot_change_or_omit_configured_model(self) -> None:
+        for arguments in ([], ["mini", "--model", "different"], ["--model", "pinned"]):
+            with self.subTest(arguments=arguments):
+                config = product_config.validate_config({
+                    "schema": product_config.SCHEMA,
+                    "provider": {"cli": "opencode", "model": "pinned"},
+                    "task": {"agent_args": arguments},
+                })
+                with self.assertRaises(product_config.ProductConfigError):
+                    product_config.task_defaults(config)
 
     def test_non_opencode_provider_args_remain_explicit(self) -> None:
         config = product_config.validate_config({

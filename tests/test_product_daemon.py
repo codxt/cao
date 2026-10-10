@@ -295,11 +295,12 @@ class LifecycleTests(DaemonCase):
 
         started = daemon.start()
         self.assertEqual(started["desired"], "running")
-        self.assertEqual(started["observed"], "running")
+        self.assertEqual(started["observed"], "starting")
+        self.assertEqual(started["status"], "STARTING")
         self.assertFalse(started["already_running"])
         service = product_state.read_service(self.env)
         self.assertEqual(service["desired"], "running")
-        self.assertEqual(service["observed"], "running")
+        self.assertEqual(service["observed"], "starting")
 
         first_tick = daemon.tick()
         self.assertTrue(first_tick["ticked"])
@@ -312,6 +313,19 @@ class LifecycleTests(DaemonCase):
         self.assertEqual(len(spawns), 1)
         self.assertEqual(product_state.read_daemon(self.env)["ticks"], 1)
 
+    def test_start_requires_child_handshake_before_reporting_running(self) -> None:
+        daemon = self.build(
+            FakeDriver(), spawn=lambda: 4321,
+            alive=lambda _pid: False,
+            identity=lambda pid: {"pid": pid, "boot_id": "boot", "starttime": "100"},
+        )
+        started = daemon.start()
+        self.assertEqual(started["status"], "STARTING")
+        self.assertEqual(started["observed"], "starting")
+        self.assertEqual(product_state.read_service(self.env)["observed"], "starting")
+        seen = product_daemon.status(self.env, alive=lambda _pid: False)
+        self.assertEqual(seen["status"], "UNKNOWN")
+
     def test_status_reports_the_durable_record(self) -> None:
         driver = FakeDriver()
         identity = lambda pid: {"pid": pid, "boot_id": "boot", "starttime": "100"}
@@ -322,6 +336,11 @@ class LifecycleTests(DaemonCase):
             identity=identity,
         )
         daemon.start()
+        # In this unit seam no child exists to acknowledge startup. Simulate
+        # the child's verified RUNNING handback before checking status.
+        child_record = product_state.read_daemon(self.env)
+        child_record["observed"] = "running"
+        product_state.write_daemon(child_record, self.env)
         daemon.tick()
         payload = product_daemon.status(
             self.env, alive=lambda pid: pid == 4321, identity=identity
@@ -923,7 +942,7 @@ class ForkDetachTests(DaemonCase):
         )
         self.assertEqual(start.returncode, 0, start.stderr)
         payload = json.loads(start.stdout)
-        self.assertEqual(payload["status"], "RUNNING")
+        self.assertEqual(payload["status"], "STARTING")
         self.assertIsInstance(payload["pid"], int)
         pid = payload["pid"]
         self.addCleanup(self._reap, pid)

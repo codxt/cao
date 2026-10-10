@@ -1116,15 +1116,20 @@ def doctor(
     daemon = _daemon_section(source)
     daemon_running = daemon.get("status") == "RUNNING"
 
+    model_configured = bool(
+        config is not None and config.provider is not None and config.provider.model
+    )
+    if model_configured:
+        try:
+            product_config.task_defaults(config, source)
+        except product_config.ProductConfigError:
+            model_configured = False
+
     gates = {
         "managed_runtime": runtime["status"] in _READY_RUNTIME_STATES,
         "runtime_server": server["status"] == "AVAILABLE",
         "provider_found": provider["status"] == "FOUND",
-        "model_configured": bool(
-            config is not None
-            and config.provider is not None
-            and config.provider.model
-        ),
+        "model_configured": model_configured,
         "credentials_verified": credentials["status"] == "VERIFIED",
     }
     reasons: list[str] = []
@@ -1135,7 +1140,7 @@ def doctor(
     if not gates["provider_found"]:
         reasons.append(f"provider is {provider['status']}")
     if not gates["model_configured"]:
-        reasons.append("no explicit model is configured")
+        reasons.append("the configured model is missing or the effective agent arguments differ")
     if not gates["credentials_verified"]:
         reasons.append(f"credentials are {credentials['status']}")
 

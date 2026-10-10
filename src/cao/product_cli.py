@@ -108,6 +108,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return EXIT_OK
     service = record or product_state.default_service_record()
     observed = service.get("observed", "unknown")
+    if observed == "running":
+        # A service record is only an intention/last observation. Confirm the
+        # daemon's live PID identity before telling an operator it is running.
+        try:
+            daemon = product_daemon.status()
+        except StateError as exc:
+            return _unavailable(
+                "status", "DAEMON_STATE_UNREADABLE", f"{type(exc).__name__}: {exc}"
+            )
+        if daemon.get("status") != "RUNNING":
+            observed = "unknown"
     task_view = product_task.task_payload(task) if task is not None else None
     if task_view is not None:
         status = str(task_view.get("status") or "").upper() or str(observed).upper()
@@ -214,6 +225,7 @@ def _run(rest: Sequence[str], config: product_config.ProductConfig) -> int:
         product_task.TaskUsageError,
         product_task.TaskUnavailable,
         product_task.TaskAmbiguous,
+        product_config.ProductConfigError,
     ) as exc:
         return _unavailable("run", getattr(exc, "code", "PRODUCT_TASK_ERROR"), str(exc))
     except StateError as exc:

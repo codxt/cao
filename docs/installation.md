@@ -99,6 +99,9 @@ PYTHONPATH=src python3 -m cao --help
 PYTHONPATH=src python3 -m cao plugins list --json
 ```
 
-`./cao` is the product-facing surface (bootstrap, readiness, service status).
-Commands this build does not own — `run`, `start`, `stop`, `logs` — report an
-explicit `UNAVAILABLE` with a nonzero exit rather than faking work.
+`./cao` is the product-facing surface for bootstrap, readiness and task
+lifecycle. It implements `run`, `stop`, `logs`, `status` and `daemon`
+(`start`/`stop`/`status`) with governed task ownership. The separate bare
+`./cao start` shortcut is not implemented and returns explicit `UNAVAILABLE`.
+`cao doctor` reports `NOT_READY` when an explicit OpenCode agent-argument
+override would select a different model from `provider.model`.

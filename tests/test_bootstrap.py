@@ -315,6 +315,20 @@ class CredentialProbeTests(BootstrapCase):
             "UNVERIFIED",
         )
 
+    def test_mismatched_explicit_model_cannot_be_ready(self) -> None:
+        self.write_config({
+            "schema": product_config.SCHEMA, "runtime_id": "rt",
+            "provider": {"cli": "opencode", "id": "acct", "model": "pinned"},
+            "managed": _spec(b"payload"),
+            "task": {"agent_args": ["mini", "--model", "different"]},
+        })
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertFalse(payload["gates"]["model_configured"])
+        self.assertEqual(payload["status"], "NOT_READY")
+
     def test_verified_provider_and_runtime_is_ready(self) -> None:
         self.write_config(
             {

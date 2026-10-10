@@ -360,6 +360,20 @@ def task_defaults(
         # bare OpenCode launches an interactive TUI with its own default model,
         # which can be reported idle before any governed task is performed.
         agent_args = ("mini", "--standalone", "--model", config.provider.model)
+    elif (agent_kind == "opencode" and provider_cli == "opencode"
+          and config is not None and config.provider is not None
+          and config.provider.model is not None):
+        # An advanced argv override must still identify the configured model.
+        # A bare OpenCode TUI or silent model substitution can otherwise report
+        # an idle worker without performing the intended task.
+        matches = [i for i, arg in enumerate(agent_args) if arg == "--model"]
+        if (not agent_args or agent_args[0] != "mini"
+                or len(matches) != 1
+                or matches[0] + 1 >= len(agent_args)
+                or agent_args[matches[0] + 1] != config.provider.model):
+            raise ProductConfigError(
+                "task.agent_args must select opencode mini and exactly provider.model"
+            )
 
     return TaskDefaults(
         agent_kind=agent_kind,
