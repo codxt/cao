@@ -59,14 +59,30 @@ Markdown file per distinct brief under a directory the caller supplies. There
 is no HTTP, socket, SMTP, webhook, credential or environment path anywhere in
 this feature.
 
-The delivery key is the **rendered artifact itself, minus its timestamp**.
-That is deliberate: an earlier version kept a hand-maintained list of the
-fields that reach the output, and a field missing from that list meant a
-changed draft silently reused the previous file while the run reported
-success. Deriving the key from the output makes that whole class of bug
-impossible. `generated_at` is excluded because a repeat run that observes
-exactly the same things is the same logical delivery and must reconcile to
-one file rather than writing a new one every tick.
+The delivery identity is the **rendered artifact itself, minus its timestamp**,
+scoped by a persisted confirmed-delivery revision. Content-derived is
+deliberate: an earlier version kept a hand-maintained list of the fields that
+reach the output, and a field missing from that list meant a changed draft
+silently reused the previous file while the run reported success. Deriving the
+key from the output makes that whole class of bug impossible. `generated_at` is
+excluded because a repeat run that observes exactly the same things is the same
+logical delivery and must reconcile to one file rather than writing a new one
+every tick.
+
+Content alone is not enough, and the revision closes the gap. A single issue
+that toggles `open → closed → open → closed → open` renders the *same* body on
+the two "open" runs that follow a previous "open" body. Without a sequence, the
+later one would match the earlier one's already-`CONFIRMED` receipt and be
+reported delivered while no new artifact was written — a silently lost change.
+So the brief history persists a small counter of positively confirmed
+deliveries plus the last confirmed `(destination, content, key)`. A new body,
+including an earlier body returning after an intervening change, is keyed by the
+current revision; the revision advances **only** on a `CONFIRMED` delivery. An
+unchanged re-read reuses the confirmed key and writes nothing. A retry of the
+same pending or `UNCERTAIN` event reuses the same key, because the revision does
+not move until the delivery is positively acknowledged. The counter is durable
+accepted progress, never a wall clock and never a receipt count that could be
+persisted before its bookmarks.
 
 ## Bounded by design, not incidentally
 
@@ -87,6 +103,27 @@ after 512 *distinct* brief contents the ledger refuses new keys and a run fails
 loudly. An operator running a recurring brief should plan to archive or rotate
 the delivery state before that, not discover it as a production failure.
 
+### Stop and recovery at the delivery bound
+
+There is **no live `SourceReader` and no scheduler** in this feature, so this
+bound cannot be reached unattended today: it is a pre-alpha operational contract
+for whoever runs a brief on their own cadence. When the ledger reaches its
+bound, the run fails loudly with `DeliveryCapacityError` and writes nothing new.
+It never evicts a receipt — a forgotten receipt would either re-send an artifact
+outward or falsely suppress a still-pending one, and both are silent losses.
+Recovery is a deliberate, owner-governed action, never an automatic one:
+
+1. Stop the external runner that fires the brief.
+2. Archive the delivery ledger together with the sibling bookmarks and brief
+   history; the three describe the same point in time and should move as a set.
+3. Start a fresh, empty state set, or resume against an archived set the owner
+   has chosen to restore.
+
+Do not prune the ledger in place to get back under the bound: dropping a receipt
+re-opens a key that may still recur. After a full rotation the persisted
+confirmed-delivery revision resets with the new state, so the first delivery
+under the new set is a new occurrence, not a false repeat.
+
 ## Persisted state and what it is not
 
 Three state files, each read through its own loader and each failing closed on
@@ -96,11 +133,13 @@ corrupt input:
 |---|---|---|
 | bookmarks | `cao.automation.sources.v0` | per-source cursor and delivered item ids |
 | delivery ledger | `cao.automation.delivery.v0` | one receipt per delivery key |
-| brief history | `cao.automation.brief.history.v0` | fingerprints of items already reported |
+| brief history | `cao.automation.brief.history.v0` | fingerprints of items already reported, plus a confirmed-delivery revision |
 
 The brief history is **not** a second delivery ledger. It holds item
-fingerprints used only to suppress unchanged items; nothing is delivered from
-it, and bookmarks remain the single record of what has been consumed.
+fingerprints used only to suppress unchanged items, and a single
+confirmed-delivery revision used only to scope a new occurrence's key. Nothing
+is delivered from it, no per-delivery receipt lives in it, and bookmarks remain
+the single record of what has been consumed.
 
 Bookmarks advance only after a delivery is `CONFIRMED`. That is what makes an
 interrupted run safe: an interrupted run never confirmed, so it never advanced,

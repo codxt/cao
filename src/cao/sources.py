@@ -598,10 +598,14 @@ def collect(
         try:
             read = reader(source_id, since)
         except Exception as exc:  # noqa: BLE001 - an unreadable source is not empty
+            # A type-based diagnostic, never the exception's own payload: a
+            # reader's error string can echo a credential or a server response,
+            # and this reason is rendered into the brief and persisted. The
+            # exception TYPE is a fixed, harmless qualifier.
             read = _failed_read(
                 source_id,
                 SourceOutcome.UNAVAILABLE,
-                f"source read failed: {type(exc).__name__}: {exc}",
+                f"source read failed ({type(exc).__name__})",
                 clock,
             )
         if not isinstance(read, SourceRead):
@@ -613,10 +617,12 @@ def collect(
                 clock,
             )
         elif read.source_id != source_id:
+            # The reader's own source_id is untrusted text and could carry a
+            # payload; name the failure without echoing it.
             read = _failed_read(
                 source_id,
                 SourceOutcome.INVALID,
-                f"reader returned a read for {read.source_id!r}",
+                "reader returned a read for a different source",
                 clock,
             )
         reads.append(read)

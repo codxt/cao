@@ -42,6 +42,7 @@ from cao.delivery import (
     DeliveryState,
     LocalFileSink,
     SinkAck,
+    load_ledger,
 )
 from cao.evidence import EvidenceSource, Verdict, build_evidence, fingerprint
 from cao.sources import (
@@ -49,6 +50,7 @@ from cao.sources import (
     SourceItem,
     SourceOutcome,
     SourceRead,
+    load_bookmarks,
 )
 from cao.spec import LOCAL_FILE_SINK, SPEC_SCHEMA, load_spec
 
@@ -1334,6 +1336,309 @@ class ReviewCorrectionTests(unittest.TestCase):
         self._run(make_spec(["s"]), static_reader({"s": []}), sink)
         written = next(self.out.iterdir()).read_text(encoding="utf-8")
         self.assertEqual(written.count("# CAO automation brief"), 1)
+
+
+class OccurrenceIdentityTests(unittest.TestCase):
+    """P1: a genuinely new changed selection gets a new stable delivery key even
+    when its rendered body repeats after an intervening event, while a retry of
+    the same pending event and an unchanged re-read reuse the same key.
+    """
+
+    def setUp(self) -> None:
+        self.sink = MemorySink()
+        self.ledger = DeliveryLedger(clock=clock_at())
+        self.bookmarks = Bookmarks()
+        self.history = BriefHistory()
+
+    def _run(
+        self,
+        table,
+        *,
+        sink=None,
+        ledger=None,
+        bookmarks=None,
+        history=None,
+        clock=None,
+        registry_projection=None,
+    ):
+        return run_brief(
+            make_spec(["feed-a"]),
+            reader=static_reader(table),
+            sink=sink if sink is not None else self.sink,
+            ledger=ledger if ledger is not None else self.ledger,
+            bookmarks=bookmarks if bookmarks is not None else self.bookmarks,
+            history=history if history is not None else self.history,
+            clock=clock or clock_at(),
+            registry_projection=registry_projection,
+        )
+
+    def _toggle(self, state):
+        # observed_at is deliberately identical across runs: the only thing that
+        # moves is the decision-relevant state attribute.
+        item = make_item("1", "Issue", observed_at=T1, state=state)
+        return {"feed-a": ok_read("feed-a", [item])}
+
+    def test_real_toggle_writes_every_occurrence_with_a_unique_key(self) -> None:
+        runs = []
+        for state in ("open", "closed", "open", "closed", "open"):
+            runs.append(self._run(self._toggle(state)))
+        self.assertTrue(all(run.delivered for run in runs))
+        self.assertTrue(
+            all(run.receipt.state is DeliveryState.CONFIRMED for run in runs)
+        )
+        self.assertEqual(self.sink.deliver_calls, 5)
+        self.assertEqual(len({run.key for run in runs}), 5)
+        self.assertEqual(len(self.sink.artifacts), 5)
+
+    def test_repeated_unchanged_read_does_not_write_again(self) -> None:
+        table = {"feed-a": ok_read("feed-a", [])}
+        runs = [self._run(table) for _ in range(3)]
+        self.assertTrue(all(run.delivered for run in runs))
+        self.assertEqual(self.sink.deliver_calls, 1)
+        self.assertEqual(len({run.key for run in runs}), 1)
+
+    def test_reverted_signal_after_an_intervening_change_is_delivered(self) -> None:
+        table = {"feed-a": ok_read("feed-a", [])}
+        first = self._run(
+            table,
+            registry_projection=Signal("registry", SourceOutcome.OK, "all quiet"),
+        )
+        second = self._run(
+            table,
+            registry_projection=Signal("registry", SourceOutcome.OK, "one stale"),
+        )
+        third = self._run(
+            table,
+            registry_projection=Signal("registry", SourceOutcome.OK, "all quiet"),
+        )
+        self.assertTrue(all(run.delivered for run in (first, second, third)))
+        self.assertEqual(self.sink.deliver_calls, 3)
+        self.assertEqual(len({first.key, second.key, third.key}), 3)
+        self.assertNotEqual(first.key, third.key)
+
+    def test_distinct_items_with_identical_rendered_text_both_deliver(self) -> None:
+        """Two different item ids whose lines render identically must be two
+        occurrences, not one: the rendered body alone cannot tell them apart."""
+        first_table = {
+            "feed-a": ok_read(
+                "feed-a", [make_item("item-a", "Identical title", state="open")]
+            )
+        }
+        second_table = {
+            "feed-a": ok_read(
+                "feed-a", [make_item("item-b", "Identical title", state="open")]
+            )
+        }
+        first = self._run(first_table)
+        second = self._run(second_table, clock=later_clock())
+        # The rendered bodies are byte-identical; only the non-rendered id moves.
+        self.assertEqual(
+            first.brief.content_fingerprint, second.brief.content_fingerprint
+        )
+        self.assertTrue(first.delivered)
+        self.assertTrue(second.delivered)
+        self.assertNotEqual(first.key, second.key)
+        self.assertEqual(self.sink.deliver_calls, 2)
+        self.assertEqual(len(self.sink.artifacts), 2)
+        self.assertEqual(self.history.revision, 2)
+        self.assertTrue(self.bookmarks.seen("feed-a", "item-a"))
+        self.assertTrue(self.bookmarks.seen("feed-a", "item-b"))
+
+    def test_non_rendered_attribute_difference_is_a_new_occurrence(self) -> None:
+        """A change the body does not render must still yield a new occurrence
+        when the line would otherwise render identically to the previous one."""
+
+        def item_with_priority(value):
+            return SourceItem(
+                item_id="1",
+                observed_at=T1,
+                title="Issue",
+                attributes=(("state", "open"), ("priority", value)),
+            )
+
+        self._run({"feed-a": ok_read("feed-a", [item_with_priority("low")])})
+        second = self._run(
+            {"feed-a": ok_read("feed-a", [item_with_priority("high")])},
+            clock=later_clock(),
+        )
+        third = self._run(
+            {"feed-a": ok_read("feed-a", [item_with_priority("medium")])},
+            clock=later_clock(),
+        )
+        self.assertEqual(
+            second.brief.content_fingerprint, third.brief.content_fingerprint
+        )
+        self.assertNotEqual(second.key, third.key)
+        self.assertEqual(self.sink.deliver_calls, 3)
+        self.assertEqual(self.history.revision, 3)
+
+    def test_uncertain_event_reuses_key_and_does_not_advance(self) -> None:
+        sink = NoReceiptSink()
+        ledger = DeliveryLedger(clock=clock_at())
+        bookmarks, history = Bookmarks(), BriefHistory()
+        table = self._toggle("open")
+
+        first = self._run(
+            table, sink=sink, ledger=ledger, bookmarks=bookmarks, history=history
+        )
+        self.assertFalse(first.delivered)
+        self.assertIs(first.receipt.state, DeliveryState.UNCERTAIN)
+        # The pending event advanced nothing durable.
+        self.assertEqual(history.revision, 0)
+        self.assertFalse(bookmarks.seen("feed-a", "1"))
+        self.assertEqual(sink.deliver_calls, 1)
+
+        # Restart: every persisted state round-trips through its own loader.
+        reloaded_ledger = load_ledger(ledger.as_state())
+        reloaded_bookmarks = load_bookmarks(bookmarks.as_state())
+        reloaded_history = load_history(history.as_state())
+        second = self._run(
+            table,
+            sink=sink,
+            ledger=reloaded_ledger,
+            bookmarks=reloaded_bookmarks,
+            history=reloaded_history,
+            clock=later_clock(),
+        )
+        self.assertEqual(second.key, first.key)
+        self.assertTrue(second.delivered)
+        self.assertIs(second.receipt.state, DeliveryState.CONFIRMED)
+        self.assertEqual(sink.deliver_calls, 1)  # reconciled, never resent
+        self.assertEqual(len(sink.artifacts), 1)
+
+    def test_confirmed_ack_before_history_persist_replays_same_key(self) -> None:
+        table = self._toggle("open")
+        first = self._run(table)
+        self.assertTrue(first.delivered)
+        self.assertEqual(self.sink.deliver_calls, 1)
+
+        # Crash after the confirmed ack but before bookmarks/history persisted:
+        # replay against the pre-run observation state and the confirmed ledger.
+        replay_bookmarks = Bookmarks()
+        replay_history = BriefHistory()
+        second = self._run(
+            table,
+            bookmarks=replay_bookmarks,
+            history=replay_history,
+            clock=later_clock(),
+        )
+        self.assertEqual(second.key, first.key)
+        self.assertTrue(second.delivered)
+        self.assertEqual(self.sink.deliver_calls, 1)  # ledger already confirmed
+        self.assertTrue(replay_bookmarks.seen("feed-a", "1"))
+        self.assertEqual(replay_history.revision, 1)
+
+    def test_history_state_loads_a_legacy_payload(self) -> None:
+        legacy = {
+            "schema": BRIEF_HISTORY_SCHEMA,
+            "misses": [],
+            "observed": [
+                {"source_id": "s", "item_id": "1", "fingerprint": "sha256:x"}
+            ],
+        }
+        history = load_history(legacy)
+        self.assertEqual(history.revision, 0)
+        self.assertIsNone(history.confirmed_key("dest", "sha256:y"))
+        self.assertEqual(len(history), 1)
+
+
+class PreflightAtomicityTests(unittest.TestCase):
+    """P1 addendum: a deterministic capacity rejection must be decided on
+    throwaway copies BEFORE the sink is called. It can never leave an artifact
+    written and caller state half-mutated.
+    """
+
+    def _reader(self, calls, second):
+        def reader(source_id, since):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ok_read(
+                    source_id,
+                    [make_item("good", "good"), make_item("held3", "held3")],
+                )
+            return ok_read(source_id, second)
+
+        return reader
+
+    def test_capacity_rejection_before_send_leaves_no_trace(self) -> None:
+        # The history is already at its bound with two unrelated pending misses;
+        # the run's held item would be a third and cannot fit.
+        history = BriefHistory(
+            max_entries=2, misses=[("s", "m1", T1), ("s", "m2", T1)]
+        )
+        bookmarks = Bookmarks()
+        ledger = DeliveryLedger(clock=clock_at())
+        sink = MemorySink()
+        before_bookmarks = bookmarks.as_state()
+        before_history = history.as_state()
+        calls = {"n": 0}
+
+        with self.assertRaises(BriefCapacityError):
+            run_brief(
+                make_spec(["s"]),
+                reader=self._reader(calls, [make_item("good", "good")]),
+                sink=sink,
+                ledger=ledger,
+                bookmarks=bookmarks,
+                history=history,
+                clock=clock_at(),
+            )
+
+        # No outward write, no receipt, and the caller objects are untouched.
+        self.assertEqual(sink.deliver_calls, 0)
+        self.assertEqual(sink.artifacts, {})
+        self.assertEqual(len(ledger.receipts()), 0)
+        self.assertEqual(bookmarks.as_state(), before_bookmarks)
+        self.assertEqual(history.as_state(), before_history)
+
+    def test_capacity_boundary_with_room_still_delivers(self) -> None:
+        # One pending miss plus one held item exactly fills the bound: it must
+        # still deliver and mutate normally.
+        history = BriefHistory(max_entries=2, misses=[("s", "m1", T1)])
+        bookmarks = Bookmarks()
+        ledger = DeliveryLedger(clock=clock_at())
+        sink = MemorySink()
+        calls = {"n": 0}
+
+        run = run_brief(
+            make_spec(["s"]),
+            reader=self._reader(calls, [make_item("good", "good")]),
+            sink=sink,
+            ledger=ledger,
+            bookmarks=bookmarks,
+            history=history,
+            clock=clock_at(),
+        )
+
+        self.assertTrue(run.delivered)
+        self.assertEqual(sink.deliver_calls, 1)
+        self.assertEqual(len(ledger.receipts()), 1)
+        self.assertTrue(bookmarks.seen("s", "good"))
+        self.assertEqual(history.misses("s", "held3"), 1)
+        self.assertEqual(history.revision, 1)
+
+
+class BriefRedactionTests(unittest.TestCase):
+    """P2: a reader exception's payload must never reach the rendered brief."""
+
+    SECRET = "SYNTHETIC_CREDENTIAL_STRING_123NOTREAL"
+
+    def test_reader_exception_secret_never_reaches_the_rendered_brief(self) -> None:
+        def reader(source_id, since):
+            raise RuntimeError(f"auth failed for {self.SECRET}")
+
+        run = run_brief(
+            make_spec(["feed-a"]),
+            reader=reader,
+            sink=MemorySink(),
+            ledger=DeliveryLedger(clock=clock_at()),
+            bookmarks=Bookmarks(),
+            history=BriefHistory(),
+            clock=clock_at(),
+        )
+        self.assertNotIn(self.SECRET, run.markdown)
+        self.assertIn("- feed-a: UNAVAILABLE", run.markdown)
+        self.assertIn("UNQUALIFIED SOURCES: feed-a", run.markdown)
 
 
 if __name__ == "__main__":

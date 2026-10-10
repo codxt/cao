@@ -583,8 +583,11 @@ def _reconcile(
     try:
         ack = reconcile(key)
     except Exception as exc:  # noqa: BLE001 - no answer means no resend
+        # A type-based diagnostic only: a reconcile error string can echo a
+        # credential or a server response, and this reason is persisted. The
+        # exception TYPE is a fixed, harmless qualifier.
         return None, ledger.mark_uncertain(
-            key, f"reconcile failed: {type(exc).__name__}: {exc}", clock=clock
+            key, f"reconcile failed ({type(exc).__name__})", clock=clock
         )
     if ack is None:
         return False, ledger._require(key)
@@ -593,9 +596,9 @@ def _reconcile(
     if not isinstance(ack, SinkAck):
         reason = f"reconcile returned {type(ack).__name__}, not SinkAck"
     elif not ack.positive:
-        reason = ack.detail or "reconcile ack was not positive"
+        reason = "reconcile ack was not positive"
     else:
-        reason = ack.detail or "reconcile ack carried no receipt id"
+        reason = "reconcile ack carried no receipt id"
     return None, ledger.mark_uncertain(key, reason, clock=clock)
 
 
@@ -654,18 +657,21 @@ def deliver(
     try:
         ack = sink.deliver(key, title, body)
     except Exception as exc:  # noqa: BLE001 - a send that raised is uncertain
+        # A type-based diagnostic only, for the same reason as reconcile: the
+        # reason is persisted, and a transport error string may echo a token or
+        # a raw response.
         return ledger.mark_uncertain(
-            key, f"send failed: {type(exc).__name__}: {exc}", clock=clock
+            key, f"send failed ({type(exc).__name__})", clock=clock
         )
     if _confirmed_ack(ack):
         return ledger.confirm(key, ack.ack_id, clock=clock)
     if not isinstance(ack, SinkAck):
         reason = f"transport returned {type(ack).__name__}, not SinkAck"
     elif not ack.positive:
-        reason = ack.detail or "transport ack was not positive"
+        reason = "transport ack was not positive"
     else:
         # Positive but no receipt id: plausible, unverifiable, not confirmed.
-        reason = ack.detail or "transport ack carried no receipt id"
+        reason = "transport ack carried no receipt id"
     return ledger.mark_uncertain(key, reason, clock=clock)
 
 

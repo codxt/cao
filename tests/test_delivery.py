@@ -651,5 +651,101 @@ class ReviewCorrectionTests(unittest.TestCase):
             self.assertEqual(written, "# Heading\n\nbody\n\n")
 
 
+class RedactionTests(unittest.TestCase):
+    """P2: an untrusted exception string or sink-supplied ack detail must never
+    be persisted into a receipt.
+
+    The marker is deliberately synthetic and obviously non-secret: it proves the
+    payload does not reach the durable ledger without embedding a real token
+    anywhere in this repository.
+    """
+
+    SECRET = "SYNTHETIC_CREDENTIAL_STRING_123NOTREAL"
+
+    def test_send_exception_payload_is_not_persisted(self) -> None:
+        secret = self.SECRET
+
+        class RaisingSink:
+            def deliver(self, key, title, body):
+                raise RuntimeError(f"rejected bearer {secret}")
+
+        ledger = DeliveryLedger(clock=fixed_clock)
+        receipt = deliver(
+            ledger,
+            RaisingSink(),
+            key=a_key(),
+            destination_id=DESTINATION_ID,
+            title="Title",
+            body="Body",
+            clock=fixed_clock,
+        )
+        self.assertIs(receipt.state, DeliveryState.UNCERTAIN)
+        self.assertNotIn(self.SECRET, receipt.reason or "")
+        self.assertNotIn(self.SECRET, str(ledger.as_state()))
+        # A bounded, harmless, type-based diagnostic is still recorded.
+        self.assertIn("RuntimeError", receipt.reason or "")
+
+    def test_reconcile_exception_payload_is_not_persisted(self) -> None:
+        ledger = DeliveryLedger(clock=fixed_clock)
+        key = a_key()
+        ledger.prepare(key, DESTINATION_ID, clock=fixed_clock)
+        ledger.mark_sending(key, clock=fixed_clock)
+
+        secret = self.SECRET
+
+        class NoisySink:
+            def deliver(self, key, title, body):
+                return SinkAck(ack_id=key, positive=True)
+
+            def reconcile(self, key):
+                raise RuntimeError(f"lookup failed with {secret}")
+
+        receipt = reconcile_delivery(ledger, NoisySink(), key=key)
+        self.assertIs(receipt.state, DeliveryState.UNCERTAIN)
+        self.assertNotIn(self.SECRET, receipt.reason or "")
+        self.assertNotIn(self.SECRET, str(ledger.as_state()))
+        self.assertIn("RuntimeError", receipt.reason or "")
+
+    def test_non_positive_ack_detail_is_not_persisted(self) -> None:
+        ledger = DeliveryLedger(clock=fixed_clock)
+        sink = MemorySink(
+            deliver_ack=SinkAck(
+                ack_id=None, positive=False, detail=f"denied {self.SECRET}"
+            )
+        )
+        receipt = deliver(
+            ledger,
+            sink,
+            key=a_key(),
+            destination_id=DESTINATION_ID,
+            title="Title",
+            body="Body",
+            clock=fixed_clock,
+        )
+        self.assertIs(receipt.state, DeliveryState.UNCERTAIN)
+        self.assertNotIn(self.SECRET, receipt.reason or "")
+        self.assertNotIn(self.SECRET, str(ledger.as_state()))
+
+    def test_unidentified_positive_ack_detail_is_not_persisted(self) -> None:
+        ledger = DeliveryLedger(clock=fixed_clock)
+        sink = MemorySink(
+            deliver_ack=SinkAck(
+                ack_id=None, positive=True, detail=f"maybe {self.SECRET}"
+            )
+        )
+        receipt = deliver(
+            ledger,
+            sink,
+            key=a_key(),
+            destination_id=DESTINATION_ID,
+            title="Title",
+            body="Body",
+            clock=fixed_clock,
+        )
+        self.assertIs(receipt.state, DeliveryState.UNCERTAIN)
+        self.assertNotIn(self.SECRET, receipt.reason or "")
+        self.assertNotIn(self.SECRET, str(ledger.as_state()))
+
+
 if __name__ == "__main__":
     unittest.main()

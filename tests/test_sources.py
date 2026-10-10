@@ -570,5 +570,34 @@ class DualAdvisorCorrectionTests(unittest.TestCase):
         self.assertEqual(ids(again), [])
 
 
+class ExceptionRedactionTests(unittest.TestCase):
+    """P2: a reader exception's payload must not become persisted evidence.
+
+    The marker is deliberately synthetic: it proves the raw string does not
+    reach the qualified read without embedding a real token in this repository.
+    """
+
+    SECRET = "SYNTHETIC_CREDENTIAL_STRING_123NOTREAL"
+
+    def test_reader_exception_payload_stays_out_of_evidence(self) -> None:
+        def reader(source_id, since):
+            raise RuntimeError(f"connect failed for {self.SECRET}")
+
+        bookmarks = Bookmarks()
+        cycle = collect(reader, ["s"], bookmarks, clock=clock_at())
+        read = cycle.reads[0]
+        # The failure state stays correct and fail closed.
+        self.assertIs(read.outcome, SourceOutcome.UNAVAILABLE)
+        self.assertFalse(read.complete)
+        self.assertEqual(read.items, ())
+        self.assertEqual(cycle.new_items, ())
+        self.assertEqual(cycle.unqualified, ("s",))
+        self.assertIsNone(bookmarks.get("s"))
+        # No exception payload, but a bounded type-based diagnostic remains.
+        reason = read.evidence.reason or ""
+        self.assertNotIn(self.SECRET, reason)
+        self.assertIn("RuntimeError", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

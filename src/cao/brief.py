@@ -29,7 +29,9 @@ Selection is delegated to :mod:`cao.sources` (bookmarks + ``collect``) and
 outward output to :mod:`cao.delivery` (a keyed ``LocalFileSink`` receipt). The
 pending recheck is a second read through the same reader, so an interrupted run
 that is repeated produces no missed items and no duplicates: bookmarks are only
-advanced after a confirmed delivery, and receipts are keyed by brief content.
+advanced after a confirmed delivery, and receipts are keyed by the rendered
+brief scoped by a persisted confirmed-delivery revision, so a new occurrence of
+an earlier body is delivered while a retry or an unchanged re-read is not.
 
 No host path is ever derived from manifest or source data. ``cao.spec``
 validates ``locator``, ``preferences_ref``, ``state_ref`` and ``policy_ref``
@@ -140,6 +142,51 @@ def _positive_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise BriefError(f"{field} must be a positive integer")
     return value
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BriefStateError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _normalize_confirmed(confirmed: Any) -> tuple[str, str, str] | None:
+    """Validate a ``(destination, occurrence, key)`` confirmed record."""
+
+    if confirmed is None:
+        return None
+    if not isinstance(confirmed, tuple) or len(confirmed) != 3:
+        raise BriefStateError(
+            "confirmed must be a (destination, occurrence, key) triple or None"
+        )
+    destination_id, occurrence, key = confirmed
+    for field, value in (
+        ("confirmed.destination_id", destination_id),
+        ("confirmed.occurrence", occurrence),
+        ("confirmed.key", key),
+    ):
+        if not _is_non_empty_str(value):
+            raise BriefStateError(f"{field} must be a non-empty string")
+    return confirmed
+
+
+def _occurrence_identity(brief: DraftBrief) -> str:
+    """Fingerprint one logical brief occurrence.
+
+    The rendered body alone cannot separate two different items whose lines
+    happen to render identically (``item_id`` is not rendered), and it cannot
+    separate two events whose only difference is a non-rendered attribute. Both
+    the rendered body (which carries quotes, signals and coverage) and the
+    sorted per-selected-line ``(source_id, item_id, fingerprint)`` identities
+    are therefore folded in. The line fingerprint already covers the item's
+    decision-relevant state.
+    """
+
+    lines = sorted(
+        [line.source_id, line.item_id, line.fingerprint]
+        for line in brief.lines
+    )
+    return fingerprint({"content": brief.content_fingerprint, "lines": lines})
 
 
 def _one_line(text: Any) -> str:
@@ -274,6 +321,13 @@ class BriefHistory:
     no source text, no credential and no operational value. It is not a second
     delivery ledger: nothing is delivered from it, and persistence is the
     caller's choice through :meth:`as_state` / :func:`load_history`.
+
+    It also carries one scalar of durable delivery progress: ``revision``, the
+    number of brief deliveries that have been positively confirmed, together
+    with the last confirmed ``(destination, occurrence, key)`` record. That is
+    what lets a genuinely new logical occurrence (the same rendered body
+    returning after an intervening change) receive a fresh key, without a raw
+    wall clock and without re-sending a re-read of an already confirmed one.
     """
 
     def __init__(
@@ -282,8 +336,12 @@ class BriefHistory:
         *,
         misses: Iterable[tuple[str, str]] | None = None,
         max_entries: int = MAX_HISTORY,
+        revision: int = 0,
+        confirmed: tuple[str, str, str] | None = None,
     ) -> None:
         self._max_entries = _positive_int(max_entries, "max_entries")
+        self._revision = _non_negative_int(revision, "revision")
+        self._confirmed = _normalize_confirmed(confirmed)
         self._entries: dict[tuple[str, str], ObservedItem] = {}
         self._misses: dict[tuple[str, str], tuple[int, str]] = {}
         for entry in misses or ():
@@ -305,6 +363,45 @@ class BriefHistory:
     @property
     def max_entries(self) -> int:
         return self._max_entries
+
+    @property
+    def revision(self) -> int:
+        """The number of brief deliveries positively confirmed so far."""
+
+        return self._revision
+
+    def confirmed_key(
+        self, destination_id: str, occurrence: str
+    ) -> str | None:
+        """The key already confirmed for this exact destination and occurrence.
+
+        A non-``None`` result means a logically unchanged re-read: it must
+        reconcile to the one artifact that already exists, not write a second
+        one.
+        """
+
+        if self._confirmed is None:
+            return None
+        destination, confirmed_occurrence, key = self._confirmed
+        if destination == destination_id and confirmed_occurrence == occurrence:
+            return key
+        return None
+
+    def record_delivery(
+        self, destination_id: str, occurrence: str, key: str
+    ) -> None:
+        """Record one positively confirmed delivery as accepted progress.
+
+        Called only after a receipt is ``CONFIRMED``, so the revision advances
+        only on a positively acknowledged delivery. A pending or uncertain event
+        never advances it, which is exactly what keeps a retry on the same key.
+        """
+
+        _require_non_empty_str(destination_id, "destination_id")
+        _require_non_empty_str(occurrence, "occurrence")
+        _require_non_empty_str(key, "key")
+        self._revision += 1
+        self._confirmed = (destination_id, occurrence, key)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -371,6 +468,16 @@ class BriefHistory:
     def as_state(self) -> dict[str, Any]:
         return {
             "schema": BRIEF_HISTORY_SCHEMA,
+            "revision": self._revision,
+            "confirmed": (
+                None
+                if self._confirmed is None
+                else {
+                    "destination_id": self._confirmed[0],
+                    "occurrence": self._confirmed[1],
+                    "key": self._confirmed[2],
+                }
+            ),
             "misses": [
                 {
                     "source_id": source_id,
@@ -410,6 +517,35 @@ def load_history(
     if payload.get("schema") != BRIEF_HISTORY_SCHEMA:
         raise BriefStateError(
             f"unsupported brief history schema: {payload.get('schema')!r}"
+        )
+    # Backward compatible: a legacy v0 payload has neither field, and loads as
+    # revision 0 with no confirmed delivery. Both fields are validated when
+    # present, and corrupt values are never rounded down to a valid state.
+    revision = payload.get("revision", 0)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise BriefStateError(
+            "brief history 'revision' must be a non-negative integer"
+        )
+    raw_confirmed = payload.get("confirmed")
+    if raw_confirmed is None:
+        confirmed: tuple[str, str, str] | None = None
+    elif isinstance(raw_confirmed, Mapping):
+        destination_id = raw_confirmed.get("destination_id")
+        occurrence = raw_confirmed.get("occurrence")
+        confirmed_key = raw_confirmed.get("key")
+        if not (
+            _is_non_empty_str(destination_id)
+            and _is_non_empty_str(occurrence)
+            and _is_non_empty_str(confirmed_key)
+        ):
+            raise BriefStateError(
+                "brief history 'confirmed' needs non-empty destination_id, "
+                "occurrence and key"
+            )
+        confirmed = (destination_id, occurrence, confirmed_key)
+    else:
+        raise BriefStateError(
+            "brief history 'confirmed' must be a mapping or null"
         )
     raw_misses = payload.get("misses", [])
     if not isinstance(raw_misses, list):
@@ -462,7 +598,13 @@ def load_history(
         entries.append(
             ObservedItem(source_id=source_id, item_id=item_id, fingerprint=stored)
         )
-    return BriefHistory(entries, misses=misses, max_entries=max_entries)
+    return BriefHistory(
+        entries,
+        misses=misses,
+        max_entries=max_entries,
+        revision=revision,
+        confirmed=confirmed,
+    )
 
 
 @dataclass(frozen=True)
@@ -808,13 +950,17 @@ def _compose(
         runtime_projection, "runtime"
     )
 
-    # The delivery key is derived from the RENDERED artifact, not from a
+    # The delivery identity is derived from the RENDERED artifact, not from a
     # hand-maintained list of fields. A list is exactly how the previous two
     # corrections missed a field that reached the output; deriving the key from
     # the output makes that class of bug impossible by construction. Only the
     # timestamp is excluded, because a repeat run that observes exactly the
     # same things is the same logical delivery and must not write a second
-    # artifact.
+    # artifact. ``run_brief`` folds this content fingerprint together with the
+    # per-line identities (item ids the body does not render) and scopes the
+    # result by the persisted confirmed-delivery revision, so a distinct item
+    # rendering identically, or the same body returning after an intervening
+    # change, is a new occurrence rather than a false repeat.
     brief = DraftBrief(
         schema=BRIEF_SCHEMA,
         generated_at=utc_now(clock),
@@ -1033,6 +1179,37 @@ def _commit_bookmarks(
             high_water_cap=min(limits) if limits else None,
         )
 
+
+def _apply_history_updates(
+    history: BriefHistory,
+    brief: DraftBrief,
+    held: tuple[tuple[str, str, str], ...],
+    *,
+    destination_id: str,
+    occurrence: str,
+    key: str,
+    already_confirmed: bool,
+) -> None:
+    """Apply this run's history mutations to ``history`` (real or staged).
+
+    It is run first against a throwaway copy BEFORE the sink is called, so a
+    capacity rejection raises with no outward write and no caller mutation; the
+    same call is then replayed against the caller's object only after a
+    ``CONFIRMED`` acknowledgement, where it cannot newly raise because the
+    starting state and the operations are identical.
+    """
+
+    for line in brief.lines:
+        history.record(line.source_id, line.item_id, line.fingerprint)
+        history.clear_miss(line.source_id, line.item_id)
+    for source_id, item_id, _observed_at in held:
+        history.record_miss(source_id, item_id, _observed_at)
+    if not already_confirmed:
+        # This delivery is new accepted progress; a replay that already had it
+        # confirmed (crash between ack and persistence) does not advance the
+        # revision a second time.
+        history.record_delivery(destination_id, occurrence, key)
+
 def run_brief(
     spec: AutomationSpec,
     *,
@@ -1051,10 +1228,16 @@ def run_brief(
     """Compose, render and deliver one draft brief to the local sink.
 
     Output goes only through :func:`cao.delivery.deliver` to the caller's sink.
-    The delivery key is derived from the brief content, so a repeated or
-    interrupted run reconciles to the same artifact instead of duplicating it.
-    Bookmarks are advanced only when the receipt is ``CONFIRMED``; an
-    ``UNCERTAIN`` or ``HELD`` delivery is never reported as delivered.
+    The delivery key is the occurrence identity (rendered brief plus per-line
+    item identities) scoped by the persisted confirmed-delivery revision, so a
+    repeated or interrupted run reconciles to the same artifact instead of
+    duplicating it, while a distinct item that renders identically, or a
+    genuinely new occurrence of an earlier body, is delivered. Bookmarks are
+    advanced only when the receipt is ``CONFIRMED``; an ``UNCERTAIN`` or
+    ``HELD`` delivery is never reported as delivered. Every post-confirm state
+    change is preflighted on a copy before the sink is called, so a
+    deterministic capacity rejection leaves no artifact written and no caller
+    state changed.
     """
 
     if not isinstance(spec, AutomationSpec):
@@ -1088,9 +1271,55 @@ def run_brief(
     )
     markdown = render_markdown(brief)
     destination_id = spec.destination.destination_id
-    key = delivery_key(
-        BRIEF_SOURCE_ID, destination_id, brief.content_fingerprint
+    # The occurrence identity folds the rendered body together with the sorted
+    # per-line decision identities (source_id, item_id, line fingerprint). The
+    # rendered body alone would treat two DIFFERENT items whose lines happen to
+    # render identically as the same delivery, silently consuming the second.
+    occurrence = _occurrence_identity(brief)
+    # An occurrence identity, not merely a content identity. A logically
+    # unchanged re-read reconciles to the artifact already confirmed for this
+    # exact occurrence; anything else is a NEW occurrence and gets a fresh cycle
+    # id built from the confirmed-delivery revision. So the same rendered body
+    # returning after an intervening change is delivered again, while a retry of
+    # the same not-yet-confirmed event (the revision has not advanced) reuses the
+    # same key. The revision is advanced only on a CONFIRMED delivery, never from
+    # a wall clock and never from a receipt count that could be persisted before
+    # its bookmarks.
+    key = (
+        history.confirmed_key(destination_id, occurrence)
+        if history is not None
+        else None
     )
+    already_confirmed = key is not None
+    if key is None:
+        revision = history.revision if history is not None else 0
+        cycle_id = fingerprint({"revision": revision, "occurrence": occurrence})
+        key = delivery_key(BRIEF_SOURCE_ID, destination_id, cycle_id)
+
+    # PREFLIGHT: apply every post-confirm state change to throwaway COPIES
+    # before any outward write. A deterministic capacity rejection must raise
+    # HERE, with zero sink writes, zero receipts and the caller's Bookmarks and
+    # BriefHistory byte-identical, rather than after a CONFIRMED artifact is
+    # already on disk with the caller objects half-mutated.
+    staged_bookmarks = load_bookmarks(
+        bookmarks.as_state(),
+        max_delivered_per_source=bookmarks.max_delivered_per_source,
+    )
+    _commit_bookmarks(staged_bookmarks, reads, selected, held, caps)
+    if history is not None:
+        staged_history = load_history(
+            history.as_state(), max_entries=history.max_entries
+        )
+        _apply_history_updates(
+            staged_history,
+            brief,
+            held,
+            destination_id=destination_id,
+            occurrence=occurrence,
+            key=key,
+            already_confirmed=already_confirmed,
+        )
+
     receipt = deliver(
         ledger,
         sink,
@@ -1104,13 +1333,19 @@ def run_brief(
     )
     delivered = receipt.state is DeliveryState.CONFIRMED
     if delivered:
+        # The identical mutation was validated on a copy above, so this replay
+        # on the caller's objects cannot newly raise.
         _commit_bookmarks(bookmarks, reads, selected, held, caps)
         if history is not None:
-            for line in brief.lines:
-                history.record(line.source_id, line.item_id, line.fingerprint)
-                history.clear_miss(line.source_id, line.item_id)
-            for source_id, item_id, _observed_at in held:
-                history.record_miss(source_id, item_id, _observed_at)
+            _apply_history_updates(
+                history,
+                brief,
+                held,
+                destination_id=destination_id,
+                occurrence=occurrence,
+                key=key,
+                already_confirmed=already_confirmed,
+            )
 
     return BriefRun(
         brief=brief,
