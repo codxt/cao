@@ -49,7 +49,7 @@ from typing import Any, Callable
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from . import product_config, product_daemon, product_state, registry
+from . import product_config, product_daemon, product_state
 from .state import StateError
 
 __all__ = [
@@ -938,7 +938,9 @@ def _runtime_section(
 
 
 def _registry_section(env: Mapping[str, str]) -> dict[str, Any]:
-    path = registry.default_db_path()
+    # Use the same selected ledger as product task claims; doctor must not
+    # advertise a different default when the operator supplied an override.
+    path = product_config.registry_db_path(env)
     present = os.path.isfile(path)
     return {
         "status": "PRESENT" if present else "ABSENT",

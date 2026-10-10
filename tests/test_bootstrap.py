@@ -193,6 +193,35 @@ class DoctorTests(BootstrapCase):
         self.assertIn("daemon", payload["sections"])
         self.assertIn("registry", payload["sections"])
 
+    def test_registry_override_reports_effective_task_ledger(self) -> None:
+        selected = self.root / "external-ledger" / "book.sqlite3"
+        env = dict(self.env, CAO_REGISTRY_DB=str(selected))
+        default = Path(product_config.registry_db_path(self.env))
+        self.assertNotEqual(selected, default)
+        before, _ = bootstrap.doctor(env=env)
+        self.assertEqual(before["sections"]["registry"]["path"], str(selected))
+        self.assertEqual(before["sections"]["registry"]["status"], "ABSENT")
+        self.assertFalse(default.exists())
+        self.assertFalse(selected.exists())
+
+        selected.parent.mkdir(parents=True)
+        selected.write_bytes(b"")
+        after, _ = bootstrap.doctor(env=env)
+        self.assertEqual(after["sections"]["registry"]["path"], str(selected))
+        self.assertEqual(after["sections"]["registry"]["status"], "PRESENT")
+        self.assertFalse(default.exists())
+
+    def test_registry_xdg_root_matches_task_ledger_without_creating_it(self) -> None:
+        expected = Path(product_config.registry_db_path(self.env))
+        first, _ = bootstrap.doctor(env=self.env)
+        self.assertEqual(first["sections"]["registry"]["path"], str(expected))
+        self.assertEqual(first["sections"]["registry"]["status"], "ABSENT")
+        self.assertFalse(expected.exists())
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(b"")
+        second, _ = bootstrap.doctor(env=self.env)
+        self.assertEqual(second["sections"]["registry"]["status"], "PRESENT")
+
     def test_malformed_config_is_not_ready_with_evidence(self) -> None:
         path = product_config.config_path(self.env)
         os.makedirs(os.path.dirname(path), exist_ok=True)

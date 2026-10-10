@@ -85,10 +85,15 @@ value. If a provider cannot be verified this way, the verdict stays
 | --- | --- | --- |
 | Configuration | `XDG_CONFIG_HOME` | `~/.config` |
 | Product state and managed binaries | `XDG_STATE_HOME` | `~/.local/state` |
-| Work Registry ledger | `XDG_STATE_HOME` | `~/.local/state` |
+| Work Registry ledger | `CAO_REGISTRY_DB` (optional, takes precedence), otherwise `XDG_STATE_HOME` | `~/.local/state/cao-work-registry/registry.sqlite3` |
 
 All three roots are honoured at call time, so a sandbox can isolate CAO
-completely by pointing them at a temporary directory.
+completely by pointing them at a temporary directory. A selected
+`CAO_REGISTRY_DB` must be the **single authoritative WRITE claim ledger** for
+all dispatchers that could act on the same repositories. `cao doctor` reports
+the same effective registry path as task execution and never creates a ledger
+while checking readiness. Setting the path alone does not establish policy or
+claim-protocol compatibility with an external dispatcher.
 
 ## The read-only core CLI
 
