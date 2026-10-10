@@ -206,6 +206,61 @@ class DoctorTests(BootstrapCase):
         self.assertEqual(payload["sections"]["credentials"]["status"], "UNVERIFIED")
         self.assertFalse(payload["gates"]["credentials_verified"])
 
+
+class CredentialProbeTests(BootstrapCase):
+    """The provider id is matched against the CLI's own printed identifiers.
+
+    A provider's authenticated-list entry can print a multi-word display name
+    (``OpenCode Go``) while the operator configures the CLI's id
+    (``opencode-go``); only what the CLI printed may ever match.
+    """
+
+    def _doctor(self, provider_id: str, auth_list: str) -> dict:
+        self.write_config(
+            {
+                "schema": product_config.SCHEMA,
+                "runtime_id": "rt",
+                "provider": {"cli": "opencode", "id": provider_id, "model": "m1"},
+                "managed": _spec(b"payload"),
+            }
+        )
+
+        def runner(argv):
+            if tuple(argv[1:]) == ("auth", "list"):
+                return bootstrap.CommandResult(0, auth_list)
+            return bootstrap.CommandResult(0, "opencode 9\n")
+
+        payload, _code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        return payload["sections"]["credentials"]
+
+    def test_multi_word_display_name_matches_the_configured_id(self) -> None:
+        section = self._doctor(
+            "opencode-go", "OpenCode Go  OpenCode Go   stored\nNous Portal  stored\n"
+        )
+        self.assertEqual(section["status"], "VERIFIED")
+
+    def test_case_and_separator_differences_still_match(self) -> None:
+        section = self._doctor("OpenCode-Go", "OpenCode Go  stored\n")
+        self.assertEqual(section["status"], "VERIFIED")
+
+    def test_printed_single_token_matches(self) -> None:
+        section = self._doctor("acct", "acct other\n")
+        self.assertEqual(section["status"], "VERIFIED")
+
+    def test_unprinted_id_is_unverified(self) -> None:
+        section = self._doctor("not-listed", "OpenCode Go  stored\n")
+        self.assertEqual(section["status"], "UNVERIFIED")
+
+    def test_punctuation_only_id_is_unverified(self) -> None:
+        section = self._doctor("---", "OpenCode Go  stored\n")
+        self.assertEqual(section["status"], "UNVERIFIED")
+
+    def test_window_bound_refuses_a_five_token_span(self) -> None:
+        section = self._doctor("abcde", "a b c d e\n")
+        self.assertEqual(section["status"], "UNVERIFIED")
+
     def test_verified_provider_and_runtime_is_ready(self) -> None:
         self.write_config(
             {

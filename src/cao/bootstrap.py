@@ -97,6 +97,12 @@ CREDENTIAL_PROBES: dict[str, tuple[str, ...]] = {
     "opencode": ("auth", "list"),
 }
 
+#: How many consecutive printed tokens may join into one identifier candidate
+#: when matching a configured provider id against an authenticated list. A
+#: multi-word display name ("OpenCode Go") needs two; nothing longer is a
+#: provider name, so the window stays small and bounded.
+_MAX_ID_TOKENS = 4
+
 _READY_RUNTIME_STATES = frozenset({"INSTALLED", "ADOPTED", "ALREADY_INSTALLED"})
 
 EXIT_OK = 0
@@ -810,6 +816,33 @@ def _provider_section(
     }
 
 
+def _normalized_token(value: str) -> str:
+    """Lowercase and keep only alphanumerics, so ``OpenCode-Go`` == ``opencodego``."""
+
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _authenticated_ids(stdout: str) -> set[str]:
+    """Every identifier the probe's own output can honestly name.
+
+    A provider's entry in an authenticated list can print a display name with
+    spaces (``OpenCode Go``) while the operator configures the CLI's own id
+    (``opencode-go``). Each printed token is a candidate, and so are the joins
+    of up to :data:`_MAX_ID_TOKENS` consecutive tokens, because that is how a
+    multi-word display name reads as one identifier. Nothing outside the
+    printed output is ever a candidate, so a configured id that the CLI did not
+    print cannot match.
+    """
+
+    tokens = [_normalized_token(token) for token in stdout.split()]
+    tokens = [token for token in tokens if token]
+    candidates = set(tokens)
+    for size in range(2, _MAX_ID_TOKENS + 1):
+        for start in range(0, max(len(tokens) - size + 1, 0)):
+            candidates.add("".join(tokens[start:start + size]))
+    return candidates
+
+
 def _credentials_section(
     config: product_config.ProductConfig | None,
     *,
@@ -838,7 +871,8 @@ def _credentials_section(
             "status": "UNVERIFIED",
             "reason": "the credential probe did not exit successfully",
         }
-    if provider.provider_id in set(result.stdout.split()):
+    configured = _normalized_token(provider.provider_id)
+    if configured and configured in _authenticated_ids(result.stdout):
         return {
             "status": "VERIFIED",
             "reason": "the configured provider id is present in the authenticated list",
