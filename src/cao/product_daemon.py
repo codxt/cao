@@ -28,12 +28,20 @@ Fail-closed rules this module enforces:
   observation. When occupancy cannot be read the daemon holds ``UNKNOWN``;
 * retries are bounded. Past the bound the daemon holds ``UNKNOWN``; it never
   fabricates completion, never re-prompts and never re-starts an agent;
+* ``stop`` signals only CAO's own verified process instance. The recorded pid
+  must still match the live boot id and start time, and the signal travels
+  through a pidfd; otherwise it fails closed and reports ``UNKNOWN``, never a
+  foreign kill and never a false ``STOPPED``;
+* ``start`` and ``status`` require the same identity: a live but unverifiable
+  pid is ``unknown``, so ``status`` never reports ``RUNNING`` for it and
+  ``start`` refuses rather than forking a duplicate daemon;
 * the daemon never schedules automations and never sends anything outward.
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -153,9 +161,10 @@ def collect_occupancy(driver: Any) -> Occupancy:
                 continue
             worktree = detail.get("cwd")
             if not isinstance(worktree, str) or not worktree:
-                # An agent we cannot place cannot be vouched for. Dropping it
-                # keeps the rest of the reading usable; it is never invented.
-                continue
+                # An agent we cannot place cannot be vouched for, and a partial
+                # occupancy reading is not a healthy one: a WRITE claim must not
+                # proceed while an occupant is unaccounted for.
+                return Occupancy(False, (), "an agent is not bound to a usable worktree")
             state = detail.get("agent_status") or pane.get("agent_status") or ""
             agents.append(
                 {
@@ -206,13 +215,149 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _terminate_pid(pid: int) -> None:
-    import signal
+_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+
+def _read_boot_id() -> str | None:
+    """The kernel boot id, or ``None`` when it cannot be read.
+
+    The boot id is new on every reboot, so an identity recorded before a reboot
+    can never match a recycled pid afterwards.
+    """
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        with open(_BOOT_ID_PATH, "r", encoding="ascii") as handle:
+            value = handle.read().strip()
     except OSError:
-        return
+        return None
+    return value or None
+
+
+def _read_starttime(pid: int) -> str | None:
+    """Field 22 (starttime) of ``/proc/<pid>/stat``, or ``None``.
+
+    The process name (field 2) can contain spaces and parentheses, so the
+    fields are split after the final ``)``. A recycled pid gets a later
+    starttime, which is what makes this value immutable for one instance.
+    """
+
+    try:
+        with open(
+            os.path.join("/proc", str(pid), "stat"), "r", encoding="ascii"
+        ) as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    end = data.rfind(")")
+    if end < 0:
+        return None
+    fields = data[end + 1:].split()
+    # fields[0] is state (field 3), so starttime (field 22) is fields[19].
+    if len(fields) < 20:
+        return None
+    return fields[19]
+
+
+def _process_identity(pid: int) -> dict[str, Any] | None:
+    """A durable, immutable identity for the process instance ``pid`` now.
+
+    Combines the kernel boot id with the instance start time. It is only
+    available from Linux ``/proc``; when any part cannot be read it returns
+    ``None`` so the caller fails closed instead of signaling an unverified pid.
+    """
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    boot = _read_boot_id()
+    start = _read_starttime(pid)
+    if boot is None or start is None:
+        return None
+    return {"pid": pid, "boot_id": boot, "starttime": start}
+
+
+def _identity_matches(stored: Any, current: Any) -> bool:
+    """Whether a live reading identifies the same process instance as stored."""
+
+    if not isinstance(stored, dict) or not isinstance(current, dict):
+        return False
+    pid = stored.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    for key in ("boot_id", "starttime"):
+        value = stored.get(key)
+        if not isinstance(value, str) or not value or current.get(key) != value:
+            return False
+    return current.get("pid") == pid
+
+
+def _instance_state(
+    record: Mapping[str, Any],
+    alive: Callable[[int], bool],
+    identity: Callable[[int], dict[str, Any] | None],
+) -> str:
+    """Classify a persisted pid as CAO's own ``live`` instance, ``stale`` or ``unknown``.
+
+    ``live`` requires the pid to be alive AND its immutable identity to match
+    the stored one. A pid that is not alive is ``stale`` (safe to replace). A
+    pid that is alive but whose identity is missing, unreadable or mismatched is
+    ``unknown``: it may be a recycled foreign process, so nothing may be
+    signaled and no second daemon may be started.
+    """
+
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "stale"
+    if not alive(pid):
+        return "stale"
+    if _identity_matches(record.get("pid_identity"), identity(pid)):
+        return "live"
+    return "unknown"
+
+
+def _pidfd_terminate(pid: int, identity: Any) -> bool:
+    """SIGTERM exactly the verified process instance, or refuse.
+
+    ``pidfd_open`` binds a handle to the instance that exists at open time, so
+    the signal can never reach a recycled pid: if the instance already exited
+    the handle refers to nothing and the send fails with ``ESRCH``. The stored
+    start time is re-checked before sending, so a pid reused between the
+    decision and the open is caught. When the kernel or Python lacks pidfd
+    support this refuses rather than falling back to a racy ``os.kill``.
+    """
+
+    if not isinstance(identity, dict):
+        return False
+    expected_boot = identity.get("boot_id")
+    expected_start = identity.get("starttime")
+    if not isinstance(expected_boot, str) or not isinstance(expected_start, str):
+        return False
+    if _read_boot_id() != expected_boot:
+        return False
+    open_pidfd = getattr(os, "pidfd_open", None)
+    send_signal = getattr(signal, "pidfd_send_signal", None)
+    if open_pidfd is None or send_signal is None:
+        return False
+    try:
+        fd = open_pidfd(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        if _read_starttime(pid) != expected_start:
+            return False
+        try:
+            send_signal(fd, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +441,7 @@ class Daemon:
         spawn: Callable[[], int] | None = None,
         alive: Callable[[int], bool] | None = None,
         terminate: Callable[[int], None] | None = None,
+        identity: Callable[[int], dict[str, Any] | None] | None = None,
         max_ticks: int | None = None,
         relay_state_path: str | None = None,
     ) -> None:
@@ -311,7 +457,12 @@ class Daemon:
         self._sleep = sleep if sleep is not None else time.sleep
         self._spawn = spawn if spawn is not None else self._fork_loop
         self._alive = alive if alive is not None else _pid_alive
-        self._terminate = terminate if terminate is not None else _terminate_pid
+        # ``terminate`` is a test seam: when supplied it signals an already
+        # identity-verified pid. The production default (None) goes through
+        # ``_pidfd_terminate``, which re-verifies the immutable identity and
+        # cannot reach a recycled pid.
+        self._terminate = terminate
+        self._identity = identity if identity is not None else _process_identity
         self._max_ticks = max_ticks
         self._defaults = product_config.daemon_defaults(config, env)
         self._relay_state_path = (
@@ -325,22 +476,37 @@ class Daemon:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _instance_state(self, record: Mapping[str, Any]) -> str:
+        """Classify the persisted pid with this daemon's injectable seams."""
+
+        return _instance_state(record, self._alive, self._identity)
+
     def start(self) -> dict[str, Any]:
-        """Bring the daemon up. Idempotent: a live loop is left untouched."""
+        """Bring the daemon up. Idempotent: a live loop is left untouched.
+
+        A persisted ``running`` record is acknowledged only when its pid is
+        still CAO's own verified process instance (boot id plus start time). A
+        pid that is alive but cannot be verified is ``unknown``: start refuses
+        with :class:`DaemonUnavailable` rather than forking a second daemon or
+        signaling a possibly foreign process. A pid that is provably gone is
+        ``stale`` and is safely replaced.
+        """
 
         record = product_state.read_daemon(self._env)
         service = product_state.read_service(self._env)
         now = evidence.utc_now(self._clock)
-        pid = record.get("pid") if record is not None else None
-        live = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and self._alive(pid)
-        if (
-            record is not None
-            and record.get("desired") == "running"
-            and service is not None
-            and service.get("observed") == "running"
-            and live
-        ):
-            return _payload(record, service, True)
+        if record is not None:
+            state = self._instance_state(record)
+            if state == "live":
+                # A verified live loop is reused, never duplicated.
+                return _payload(record, service, True)
+            if state == "unknown":
+                raise DaemonUnavailable(
+                    "the persisted daemon process cannot be verified as CAO's "
+                    "own; refusing to start a second daemon or signal a "
+                    "foreign process"
+                )
+        # Absent, not-running, or a proven-stale instance: start a new child.
 
         record = dict(record) if record is not None else product_state.default_daemon_record()
         record.update(
@@ -348,6 +514,7 @@ class Daemon:
                 "desired": "running",
                 "observed": "starting",
                 "pid": None,
+                "pid_identity": None,
                 "ticks": 0,
                 "wakes": 0,
                 "errors": 0,
@@ -373,6 +540,11 @@ class Daemon:
 
         child = self._spawn()
         record["pid"] = child
+        # Record the immutable instance identity BEFORE releasing the child:
+        # the child only writes its own durable record once released, so the
+        # parent's identity (and pid) is already on disk and the two writers
+        # never race for it.
+        record["pid_identity"] = self._identity(child)
         record["observed"] = "running"
         record["updated_at"] = evidence.utc_now(self._clock)
         product_state.write_daemon(record, self._env)
@@ -389,7 +561,14 @@ class Daemon:
         return _payload(record, service, False)
 
     def stop(self) -> dict[str, Any]:
-        """Request the loop to exit and confirm it is gone before reporting it."""
+        """Request the loop to exit and confirm it is gone before reporting it.
+
+        The desired state is written first, so a cooperative loop stops itself
+        even when CAO declines to signal. A signal is sent only to CAO's own
+        verified process instance; a recycled pid, an unreadable or corrupt
+        identity, or a missing pidfd path leaves ``observed`` at ``unknown``
+        rather than reporting a false ``STOPPED``.
+        """
 
         record = product_state.read_daemon(self._env)
         if record is None:
@@ -400,31 +579,52 @@ class Daemon:
         product_state.write_daemon(record, self._env)
 
         pid = record.get("pid")
+        identity = record.get("pid_identity")
         confirmed = True
         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-            if self._alive(pid):
-                self._terminate(pid)
-                confirmed = self._await_exit(pid)
+            confirmed = self._stop_instance(pid, identity)
         if confirmed:
             record["observed"] = "stopped"
             record["pid"] = None
-            product_state.write_daemon(record, self._env)
+            record["pid_identity"] = None
             service = {
                 "schema": product_state.SERVICE_SCHEMA,
                 "desired": "stopped",
                 "observed": "stopped",
                 "updated_at": now,
             }
-            product_state.write_service(service, self._env)
         else:
+            # Fail closed: the process instance could not be verified, so it is
+            # neither signaled nor reported as stopped.
+            record["observed"] = "unknown"
             service = {
                 "schema": product_state.SERVICE_SCHEMA,
                 "desired": "stopped",
-                "observed": record.get("observed"),
+                "observed": "unknown",
                 "updated_at": now,
             }
-            product_state.write_service(service, self._env)
+        product_state.write_daemon(record, self._env)
+        product_state.write_service(service, self._env)
         return _payload(record, service, False)
+
+    def _stop_instance(self, pid: int, stored_identity: Any) -> bool:
+        """End CAO's own verified process instance, or fail closed.
+
+        Returns ``True`` only when the instance is confirmed gone. When it is
+        not the recorded instance -- a recycled pid, an unreadable or corrupt
+        identity -- no signal is sent.
+        """
+
+        if not self._alive(pid):
+            return True
+        current = self._identity(pid)
+        if not _identity_matches(stored_identity, current):
+            return False
+        if self._terminate is not None:
+            self._terminate(pid)
+        elif not _pidfd_terminate(pid, stored_identity):
+            return False
+        return self._await_exit(pid)
 
     def _await_exit(self, pid: int) -> bool:
         deadline = self._defaults.stop_timeout
@@ -440,6 +640,7 @@ class Daemon:
         now = evidence.utc_now(self._clock)
         record["observed"] = "stopped"
         record["pid"] = None
+        record["pid_identity"] = None
         record["updated_at"] = now
         product_state.write_daemon(record, self._env)
         if record.get("desired") == "stopped":
@@ -803,8 +1004,18 @@ class Daemon:
         return pid
 
 
-def status(env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Report the durable daemon record, or an honest NOT_STARTED answer."""
+def status(
+    env: Mapping[str, str] | None = None,
+    *,
+    alive: Callable[[int], bool] | None = None,
+    identity: Callable[[int], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    """Report the durable daemon record, or an honest NOT_STARTED answer.
+
+    A record that claims a running daemon is reported ``RUNNING`` only when its
+    pid is still the same, verified process instance. A stale, missing or
+    mismatched identity is ``UNKNOWN``, never rounded up to ``RUNNING``.
+    """
 
     record = product_state.read_daemon(env)
     service = product_state.read_service(env)
@@ -827,4 +1038,16 @@ def status(env: Mapping[str, str] | None = None) -> dict[str, Any]:
             "already_running": None,
             "service": {"desired": None, "observed": None},
         }
-    return _payload(record or product_state.default_daemon_record(), service, None)
+    current = record or product_state.default_daemon_record()
+    payload = _payload(current, service, None)
+    if str(current.get("observed") or "") == "running":
+        state = _instance_state(
+            current,
+            alive if alive is not None else _pid_alive,
+            identity if identity is not None else _process_identity,
+        )
+        if state != "live":
+            payload["status"] = "UNKNOWN"
+            payload["ok"] = False
+            payload["instance"] = state
+    return payload

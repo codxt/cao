@@ -562,6 +562,25 @@ def run_task(
 
     conn = registry.connect(db=registry_db or product_config.registry_db_path(env))
     try:
+        prior_claim = record.get("claim") or {}
+        if prior_claim.get("claim_id"):
+            # Once a task has a recorded claim, retrying must never create a
+            # replacement claim for its existing agent/prompt. Match the same
+            # OPEN row by owner and exact claim id before any runtime action.
+            held = registry.get_open_claim(
+                conn, record["run_id"], record["work_key"], "", OWNER,
+            )
+            if (prior_claim.get("released") or held is None or
+                    held["claim_id"] != prior_claim["claim_id"]):
+                record["status"] = (
+                    "running" if record.get("status") == "running" else "unknown"
+                )
+                record["error"] = {
+                    "code": "TASK_CLAIM_RELEASE_REJECTED",
+                    "message": "the task's original claim is no longer open; refusing to re-claim it",
+                }
+                _save(record, env, clock)
+                return task_payload(record)
         authority = _claim_authority(conn, record, observation)
         if not authority.get("ok"):
             record["status"] = "refused"
@@ -687,13 +706,24 @@ def _finish(
                 outcome="complete",
                 released_head=head,
             )
-            record["claim"] = dict(
-                record.get("claim") or {},
-                outcome="complete",
-                released=bool(released.get("ok")),
-                released_head=head,
-            )
-            record["status"] = "complete"
+            if not released.get("ok"):
+                # A rejected release leaves ownership unresolved. Reporting
+                # completion would make the open claim disappear from the UI.
+                record["status"] = "running"
+                record["error"] = {
+                    "code": "TASK_CLAIM_RELEASE_REJECTED",
+                    "message": "the registry refused claim release; the task is not complete",
+                    "detail": list(released.get("errors") or []),
+                }
+            else:
+                record["claim"] = dict(
+                    record.get("claim") or {},
+                    outcome="complete",
+                    released=True,
+                    released_head=head,
+                )
+                record.pop("error", None)
+                record["status"] = "complete"
         else:
             record["status"] = "running"
             record["error"] = {
@@ -792,43 +822,102 @@ def stop_task(
     if record["status"] in _TERMINAL_STATUSES:
         return task_payload(record)
 
+    # Establish ownership before touching a pane. An old task record alone is
+    # not authority to close an agent or to represent a released claim.
+    claim = record.get("claim") or {}
+    prior_released = claim.get("released") is True and claim.get("outcome") == "abandon"
     conn = registry.connect(db=registry_db or product_config.registry_db_path(env))
     try:
-        released = registry.release(
-            conn,
-            record["run_id"],
-            OWNER,
-            record["work_key"],
-            issue="",
-            outcome="abandon",
-        )
+        if prior_released:
+            row = conn.execute(
+                "SELECT outcome, released_at FROM claims "
+                "WHERE claim_id=? AND run_id=? AND work_key=? AND issue=? AND owner=?",
+                (claim.get("claim_id"), record["run_id"], record["work_key"], "", OWNER),
+            ).fetchone()
+            ownership_ok = bool(
+                row is not None and row["released_at"] and row["outcome"] == "abandon"
+            )
+        else:
+            held = registry.get_open_claim(
+                conn, record["run_id"], record["work_key"], "", OWNER,
+            )
+            ownership_ok = bool(
+                held is not None and held["claim_id"] == claim.get("claim_id")
+            )
     finally:
         conn.close()
+
+    if not ownership_ok:
+        # A missing, released, or replaced claim cannot authorize pane closure.
+        # In particular, never close a pane after an out-of-band release.
+        record["error"] = {
+            "code": "TASK_CLAIM_RELEASE_REJECTED",
+            "message": "the task's original claim cannot be verified; pane left untouched",
+        }
+        _save(record, env, clock)
+        return task_payload(record)
 
     checkpoint = dict(record.get("checkpoint") or {})
     pane_id = checkpoint.get("pane_id")
     closed = None
+    close_error = (
+        "runtime driver unavailable; cannot verify task-owned pane closure"
+        if pane_id and driver is None else None
+    )
     if driver is not None and pane_id:
         try:
             pane = driver.pane_get(pane_id)
-        except product_driver.DriverError:
-            pane = None
-        if isinstance(pane, Mapping) and pane.get("workspace_id") == checkpoint.get(
-            "workspace_id"
-        ):
-            try:
-                driver.pane_close(pane_id)
-                closed = pane_id
-            except product_driver.DriverError:
-                closed = None
+        except product_driver.DriverError as exc:
+            close_error = str(exc)
+        else:
+            if isinstance(pane, Mapping) and pane.get("workspace_id") == checkpoint.get(
+                "workspace_id"
+            ):
+                try:
+                    driver.pane_close(pane_id)
+                    closed = pane_id
+                except product_driver.DriverError as exc:
+                    close_error = str(exc)
+            # Unknown or foreign ownership: never close that pane. Preserve
+            # the existing skip behavior for a pane not owned by this task.
+
+    if close_error is not None:
+        # IMPORTANT: claim release comes AFTER confirmed pane closure.
+        # A still-running writer must retain its Registry ownership.
+        record["error"] = {
+            "code": "TASK_PANE_CLOSE_FAILED",
+            "message": "the task-owned pane could not be closed; claim retained",
+            "detail": close_error,
+        }
+        _save(record, env, clock)
+        return task_payload(record)
+
+    if not prior_released:
+        conn = registry.connect(db=registry_db or product_config.registry_db_path(env))
+        try:
+            released = registry.release(
+                conn, record["run_id"], OWNER, record["work_key"],
+                issue="", outcome="abandon",
+            )
+        finally:
+            conn.close()
+        if not released.get("ok"):
+            # Closing a pane does not establish Registry release. Keep the
+            # nonterminal state and avoid a counterfeit stopped service.
+            record["pane_closed"] = closed
+            record["error"] = {
+                "code": "TASK_CLAIM_RELEASE_REJECTED",
+                "message": "the registry refused claim release; task not marked stopped",
+                "detail": list(released.get("errors") or []),
+            }
+            _save(record, env, clock)
+            return task_payload(record)
 
     record["claim"] = dict(
-        record.get("claim") or {},
-        status="RELEASED",
-        outcome="abandon" if released.get("ok") else None,
-        released=bool(released.get("ok")),
+        claim, status="RELEASED", outcome="abandon", released=True,
     )
     record["pane_closed"] = closed
+    record.pop("error", None)
     record["status"] = "stopped"
     _save(record, env, clock)
     _write_service("stopped", env, clock)

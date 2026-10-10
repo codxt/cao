@@ -189,6 +189,15 @@ def _run(rest: Sequence[str], config: product_config.ProductConfig) -> int:
     if executable is None:
         return _unavailable("run", "MANAGED_RUNTIME_NOT_READY", why or "")
     driver = product_driver.RuntimeDriver(executable=executable)
+    observation = None
+    if args.write:
+        # A WRITE claim is gated by the registry on a live, read-only occupancy
+        # observation. Collect it only for WRITE: READ is ungated and never
+        # probes the runtime. An unreadable or partial reading maps to
+        # unavailable evidence, and the registry then refuses the claim.
+        observation = product_daemon.to_runtime_observation(
+            product_daemon.collect_occupancy(driver)
+        )
     try:
         payload = product_task.run_task(
             driver=driver,
@@ -198,6 +207,7 @@ def _run(rest: Sequence[str], config: product_config.ProductConfig) -> int:
             mode=args.mode,
             write_scope=args.write,
             config=config,
+            observation=observation,
             wait_ms=args.wait_ms,
         )
     except (
@@ -309,7 +319,7 @@ def _stop(rest: Sequence[str], config: product_config.ProductConfig) -> int:
     except StateError as exc:
         return _unavailable("stop", "TASK_STATE_UNREADABLE", f"{type(exc).__name__}: {exc}")
     _emit(payload)
-    return EXIT_OK
+    return EXIT_OK if payload.get("status") in ("stopped", "complete") else EXIT_UNAVAILABLE
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:

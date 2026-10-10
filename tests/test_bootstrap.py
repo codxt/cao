@@ -17,9 +17,42 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cao import bootstrap, product_config, product_state
+from cao import bootstrap, product_config, product_daemon, product_state
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: The runtime's real ``status server`` output: a strict plain-text key/value
+#: block, not JSON (verified against the pinned managed runtime). Only the
+#: envelope shape is asserted here; no live server is contacted.
+SERVER_OK = (
+    "status: running\n"
+    "version: 0.9.3\n"
+    "endpoint_compatible: yes\n"
+    "private_protocol: 22\n"
+    "private_protocol_compatible: yes\n"
+    "socket: /run/user/1000/herdr/herdr.sock\n"
+)
+SERVER_SOCKET = "/run/user/1000/herdr/herdr.sock"
+#: A JSON-envelope affirmative, accepted only for a runtime whose own contract
+#: answers in JSON.
+JSON_OK = '{"id": "s", "result": {"type": "server_status", "status": "running"}}'
+
+
+def _ready_runner(server_result=bootstrap.CommandResult(0, SERVER_OK)):
+    """A runner that satisfies every provider/runtime/server probe."""
+
+    def runner(argv):
+        if argv[0] == "opencode" and tuple(argv[1:]) == ("--version",):
+            return bootstrap.CommandResult(0, "opencode 9\n")
+        if argv[0] == "opencode" and tuple(argv[1:]) == ("auth", "list"):
+            return bootstrap.CommandResult(0, "acct other\n")
+        if tuple(argv[1:]) == ("status", "server"):
+            return server_result
+        if argv[0].endswith("/rt"):
+            return bootstrap.CommandResult(0, "rt 1.2.3\n")
+        return bootstrap.CommandResult(0, "")
+
+    return runner
 
 
 def _sha(payload: bytes) -> str:
@@ -270,22 +303,224 @@ class CredentialProbeTests(BootstrapCase):
                 "managed": _spec(b"payload"),
             }
         )
-
-        def runner(argv):
-            if argv[0] == "opencode" and tuple(argv[1:]) == ("--version",):
-                return bootstrap.CommandResult(0, "opencode 9\n")
-            if argv[0] == "opencode" and tuple(argv[1:]) == ("auth", "list"):
-                return bootstrap.CommandResult(0, "acct other\n")
-            if argv[0].endswith("/rt"):
-                return bootstrap.CommandResult(0, "rt 1.2.3\n")
-            return bootstrap.CommandResult(0, "")
-
         payload, code = bootstrap.doctor(
-            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
         )
         self.assertEqual(code, bootstrap.EXIT_OK)
         self.assertEqual(payload["status"], "READY")
         self.assertEqual(payload["sections"]["runtime"]["status"], "ADOPTED")
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "AVAILABLE")
+        self.assertTrue(payload["gates"]["runtime_server"])
+        # A manual task is ready; the daemon is optional and not gated.
+        self.assertTrue(payload["readiness"]["manual_task"])
+        self.assertFalse(payload["readiness"]["unattended"])
+
+
+class ServerReadinessTests(BootstrapCase):
+    """The live runtime server is observed through the managed binary.
+
+    The probe is bounded and read-only, its affirmative is a compatible JSON
+    envelope, and anything else fails closed. Only a status word and a fixed
+    reason are surfaced, never a path or raw command output.
+    """
+
+    def _ready_config(self) -> None:
+        self.write_config(
+            {
+                "schema": product_config.SCHEMA,
+                "runtime_id": "rt",
+                "provider": {"cli": "opencode", "id": "acct", "model": "m1"},
+                "managed": _spec(b"payload"),
+            }
+        )
+
+    def test_live_server_is_required_for_ready(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(bootstrap.CommandResult(1, "", "boom"))
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "NOT_READY")
+        self.assertFalse(payload["gates"]["runtime_server"])
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+        self.assertIn("runtime server is UNREACHABLE", payload["reasons"])
+        self.assertFalse(payload["readiness"]["manual_task"])
+
+    def test_real_plain_text_server_status_is_affirmative(self) -> None:
+        self._ready_config()
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "AVAILABLE")
+        self.assertTrue(payload["gates"]["runtime_server"])
+
+    def test_server_status_not_running_is_unreachable(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(
+            bootstrap.CommandResult(
+                0,
+                "status: not running\nendpoint_compatible: yes\n"
+                "private_protocol_compatible: yes\n",
+            )
+        )
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+
+    def test_server_endpoint_incompatible_is_unreachable(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(
+            bootstrap.CommandResult(
+                0, "status: running\nendpoint_compatible: no\n"
+            )
+        )
+        payload, _code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+
+    def test_server_private_protocol_incompatible_is_unreachable(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(
+            bootstrap.CommandResult(
+                0,
+                "status: running\nendpoint_compatible: yes\n"
+                "private_protocol_compatible: no\n",
+            )
+        )
+        payload, _code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+
+    def test_server_value_with_trailing_text_is_not_affirmative(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(
+            bootstrap.CommandResult(
+                0, "status: running now\nendpoint_compatible: yes\n"
+            )
+        )
+        payload, _code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+
+    def test_non_affirmative_server_response_is_not_ready(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(bootstrap.CommandResult(0, "not json\n"))
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+
+    def test_error_envelope_is_not_affirmative(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(
+            bootstrap.CommandResult(0, '{"error": {"code": "server_down"}}')
+        )
+        payload, _code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNREACHABLE")
+
+    def test_json_envelope_is_accepted_for_a_json_contract(self) -> None:
+        self._ready_config()
+        runner = _ready_runner(bootstrap.CommandResult(0, JSON_OK))
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "AVAILABLE")
+
+    def test_missing_runtime_makes_the_server_unavailable(self) -> None:
+        self._ready_config()
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: None, runner=_ready_runner()
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNAVAILABLE")
+
+    def test_server_section_does_not_leak_path_or_output(self) -> None:
+        self._ready_config()
+        payload, _code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        section = payload["sections"]["runtime_server"]
+        self.assertEqual(set(section), {"status", "reason"})
+        blob = json.dumps({"section": section, "reasons": payload["reasons"]})
+        self.assertNotIn(SERVER_OK, blob)
+        self.assertNotIn(SERVER_SOCKET, blob)
+        self.assertNotIn("status: running", blob)
+        self.assertNotIn("/fake/rt", blob)
+
+    def test_unattended_readiness_also_requires_a_running_daemon(self) -> None:
+        self._ready_config()
+        # A manual task is ready with the daemon not started.
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertTrue(payload["readiness"]["manual_task"])
+        self.assertFalse(payload["readiness"]["unattended"])
+        self.assertEqual(payload["sections"]["daemon"]["status"], "NOT_STARTED")
+
+        product_state.write_daemon(
+            {
+                "schema": product_state.DAEMON_SCHEMA,
+                "desired": "running",
+                "observed": "running",
+                "pid": os.getpid(),
+                "pid_identity": product_daemon._process_identity(os.getpid()),
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+            self.env,
+        )
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["sections"]["daemon"]["status"], "RUNNING")
+        self.assertTrue(payload["readiness"]["unattended"])
+
+    def test_unattended_readiness_is_false_for_a_recycled_daemon_pid(self) -> None:
+        self._ready_config()
+        own = os.getpid()
+        product_state.write_daemon(
+            {
+                "schema": product_state.DAEMON_SCHEMA,
+                "desired": "running",
+                "observed": "running",
+                "pid": own,
+                "pid_identity": {"pid": own, "boot_id": "wrong", "starttime": "1"},
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+            self.env,
+        )
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        # Manual readiness is unaffected; unattended is not certified for a pid
+        # that is not CAO's own verified process.
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["sections"]["daemon"]["status"], "UNKNOWN")
+        self.assertFalse(payload["readiness"]["unattended"])
+
+    def test_corrupt_daemon_record_is_unknown_and_does_not_block_manual_ready(self) -> None:
+        self._ready_config()
+        path = product_state.daemon_record_path(self.env)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Path(path).write_text("{ not json", encoding="utf-8")
+        payload, code = bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=_ready_runner()
+        )
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["sections"]["daemon"]["status"], "UNKNOWN")
+        self.assertFalse(payload["readiness"]["unattended"])
 
 
 class SetupScriptTests(BootstrapCase):

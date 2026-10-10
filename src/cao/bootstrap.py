@@ -49,7 +49,7 @@ from typing import Any, Callable
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from . import product_config, product_state, registry
+from . import product_config, product_daemon, product_state, registry
 from .state import StateError
 
 __all__ = [
@@ -85,6 +85,16 @@ DOCTOR_SCHEMA = "cao.product.doctor.v0"
 
 MANAGED_SPEC_ENV = "CAO_MANAGED_SPEC"
 RUNTIME_ID_ENV = "CAO_RUNTIME_ID"
+
+#: The read-only subcommand that asks the managed runtime's own server to
+#: report its live status. It names no runtime: the executable is data, and the
+#: two bare tokens are the runtime-neutral status surface the CLI shares.
+SERVER_PROBE_ARGV = ("status", "server")
+
+#: One ``key: value`` line of the runtime's plain-text status block, matched
+#: exactly. The value may contain spaces (a socket path), but it is never
+#: surfaced.
+_SERVER_STATUS_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*):[ \t]+(\S.*)$")
 
 #: Agent CLIs CAO recognises by executable name. Detection never reads a secret.
 KNOWN_PROVIDER_CLIS = ("opencode", "claude")
@@ -933,6 +943,135 @@ def _registry_section(env: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
+def _server_text_affirmative(stdout: str) -> bool:
+    """Parse the runtime's plain-text ``status server`` block, strictly.
+
+    The default status surface is a key/value block::
+
+        status: running
+        endpoint_compatible: yes
+        private_protocol_compatible: yes
+
+    Each key and value is matched exactly (a value with trailing text is not a
+    match). Other fields, such as a socket path, are read but never surfaced.
+    """
+
+    fields: dict[str, str] = {}
+    for line in stdout.splitlines():
+        match = _SERVER_STATUS_LINE.match(line.strip())
+        if match is not None:
+            fields[match.group(1)] = match.group(2).strip()
+    if fields.get("status") != "running":
+        return False
+    if fields.get("endpoint_compatible") != "yes":
+        return False
+    # ``private_protocol_compatible`` is a stronger signal when the runtime
+    # reports it; a runtime that reports it as anything but ``yes`` is refused.
+    if (
+        "private_protocol_compatible" in fields
+        and fields["private_protocol_compatible"] != "yes"
+    ):
+        return False
+    return True
+
+
+def _server_json_affirmative(stdout: str) -> bool:
+    """Accept a JSON envelope only for a runtime whose contract answers in JSON."""
+
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return False
+    if not isinstance(parsed, Mapping) or "error" in parsed:
+        return False
+    inner = parsed.get("result")
+    if not isinstance(inner, Mapping):
+        return False
+    result_type = inner.get("type")
+    return isinstance(result_type, str) and bool(result_type)
+
+
+def _server_affirmative(result: Any) -> bool:
+    """Whether a status probe is a compatible, affirmative server response.
+
+    The runtime's default status surface is the strict plain-text key/value
+    block; a JSON envelope is accepted only when the runtime's own contract
+    answers in JSON. A server that is down answers with a nonzero exit or a
+    transport error, and anything that is not an exact affirmative -- including
+    a top-level ``error`` envelope -- is never rounded up.
+    """
+
+    returncode = getattr(result, "returncode", 1)
+    stdout = getattr(result, "stdout", "")
+    if returncode != 0 or not isinstance(stdout, str):
+        return False
+    text = stdout.strip()
+    if not text:
+        return False
+    if text.startswith("{"):
+        return _server_json_affirmative(text)
+    return _server_text_affirmative(text)
+
+
+def _runtime_server_section(runtime: Mapping[str, Any], *, runner: Any) -> dict[str, Any]:
+    """Observe the runtime's live server through the managed executable.
+
+    No path or raw command output is surfaced: only a status word and a fixed
+    reason. A probe that cannot run, exits nonzero, or returns a non-affirmative
+    response is ``UNREACHABLE``, never assumed healthy.
+    """
+
+    if runtime.get("status") not in _READY_RUNTIME_STATES:
+        return {
+            "status": "UNAVAILABLE",
+            "reason": "no verified managed runtime is available to observe the server",
+        }
+    executable = runtime.get("path")
+    if not isinstance(executable, str) or not executable:
+        return {
+            "status": "UNAVAILABLE",
+            "reason": "the managed runtime record has no executable path",
+        }
+    if _server_affirmative(runner((executable, *SERVER_PROBE_ARGV))):
+        return {
+            "status": "AVAILABLE",
+            "reason": "the runtime server answered a live status probe",
+        }
+    return {
+        "status": "UNREACHABLE",
+        "reason": "the runtime server did not answer a live status probe",
+    }
+
+
+def _daemon_section(env: Mapping[str, str]) -> dict[str, Any]:
+    """Report CAO's own durable daemon status, or fail closed.
+
+    The daemon is optional for a manual task (``cao run`` drives the runtime
+    directly) and required only for unattended supervision, so its status is
+    reported but never gates manual readiness. An unreadable or corrupt record
+    is ``UNKNOWN``.
+    """
+
+    try:
+        payload = product_daemon.status(env)
+    except StateError:
+        return {
+            "status": "UNKNOWN",
+            "reason": "the daemon record could not be read",
+        }
+    status = payload.get("status")
+    if not isinstance(status, str) or not status:
+        status = "UNKNOWN"
+    return {
+        "status": status,
+        "observed": payload.get("observed"),
+        "reason": (
+            "the CAO daemon is optional for a manual task and required only "
+            "for unattended supervision"
+        ),
+    }
+
+
 def doctor(
     *,
     path: str | os.PathLike[str] | None = None,
@@ -967,11 +1106,15 @@ def doctor(
         return payload, EXIT_UNAVAILABLE
 
     runtime = _runtime_section(config, env=source, runner=runner, which=which)
+    server = _runtime_server_section(runtime, runner=runner)
     provider = _provider_section(config, which=which, runner=runner)
     credentials = _credentials_section(config, which=which, runner=runner)
+    daemon = _daemon_section(source)
+    daemon_running = daemon.get("status") == "RUNNING"
 
     gates = {
         "managed_runtime": runtime["status"] in _READY_RUNTIME_STATES,
+        "runtime_server": server["status"] == "AVAILABLE",
         "provider_found": provider["status"] == "FOUND",
         "model_configured": bool(
             config is not None
@@ -983,6 +1126,8 @@ def doctor(
     reasons: list[str] = []
     if not gates["managed_runtime"]:
         reasons.append(f"managed runtime is {runtime['status']}")
+    if not gates["runtime_server"]:
+        reasons.append(f"runtime server is {server['status']}")
     if not gates["provider_found"]:
         reasons.append(f"provider is {provider['status']}")
     if not gates["model_configured"]:
@@ -990,25 +1135,26 @@ def doctor(
     if not gates["credentials_verified"]:
         reasons.append(f"credentials are {credentials['status']}")
 
+    # ``READY`` is manual-task readiness: a live runtime server, a configured
+    # and authenticated provider, and an explicit model. The CAO daemon is
+    # optional here (a manual ``cao run`` drives the runtime directly) and is
+    # required only for unattended supervision, reported separately so neither
+    # is confused for the other.
     ready = all(gates.values())
     payload = {
         "schema": DOCTOR_SCHEMA,
         "status": "READY" if ready else "NOT_READY",
         "runtime_id": config.runtime_id if config else None,
+        "readiness": {
+            "manual_task": ready,
+            "unattended": ready and daemon_running,
+        },
         "sections": {
             "runtime": runtime,
-            "runtime_server": {
-                "status": "UNAVAILABLE",
-                "reason": "live server observation is owned by the runtime plugin "
-                "and is not part of the source bootstrap",
-            },
+            "runtime_server": server,
             "provider": provider,
             "credentials": credentials,
-            "daemon": {
-                "status": "UNAVAILABLE",
-                "reason": "the service lifecycle is owned by the orchestration "
-                "lane and is not part of the source bootstrap",
-            },
+            "daemon": daemon,
             "registry": _registry_section(source),
         },
         "gates": gates,

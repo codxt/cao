@@ -216,7 +216,8 @@ class DaemonCase(unittest.TestCase):
         for key in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
             self.addCleanup(os.environ.pop, key, None)
 
-    def build(self, driver, *, spawn=None, alive=None, config=None, max_ticks=None):
+    def build(self, driver, *, spawn=None, alive=None, config=None, max_ticks=None,
+              terminate=None, identity=None):
         return product_daemon.Daemon(
             driver=driver,
             config=config or self.config,
@@ -226,7 +227,8 @@ class DaemonCase(unittest.TestCase):
             sleep=lambda _seconds: None,
             spawn=spawn or (lambda: 0),
             alive=alive or (lambda _pid: False),
-            terminate=lambda _pid: None,
+            terminate=terminate if terminate is not None else (lambda _pid: None),
+            identity=identity,
             max_ticks=max_ticks,
         )
 
@@ -284,7 +286,12 @@ class LifecycleTests(DaemonCase):
             spawns.append(1)
             return 4321
 
-        daemon = self.build(driver, spawn=spawn, alive=lambda pid: pid == 4321)
+        daemon = self.build(
+            driver,
+            spawn=spawn,
+            alive=lambda pid: pid == 4321,
+            identity=lambda pid: {"pid": pid, "boot_id": "boot", "starttime": "100"},
+        )
 
         started = daemon.start()
         self.assertEqual(started["desired"], "running")
@@ -307,10 +314,18 @@ class LifecycleTests(DaemonCase):
 
     def test_status_reports_the_durable_record(self) -> None:
         driver = FakeDriver()
-        daemon = self.build(driver, spawn=lambda: 4321, alive=lambda pid: pid == 4321)
+        identity = lambda pid: {"pid": pid, "boot_id": "boot", "starttime": "100"}
+        daemon = self.build(
+            driver,
+            spawn=lambda: 4321,
+            alive=lambda pid: pid == 4321,
+            identity=identity,
+        )
         daemon.start()
         daemon.tick()
-        payload = product_daemon.status(self.env)
+        payload = product_daemon.status(
+            self.env, alive=lambda pid: pid == 4321, identity=identity
+        )
         self.assertEqual(payload["schema"], product_daemon.DAEMON_STATUS_SCHEMA)
         self.assertEqual(payload["status"], "RUNNING")
         self.assertEqual(payload["ticks"], 1)
@@ -340,6 +355,264 @@ class LifecycleTests(DaemonCase):
             daemon.tick()
         with self.assertRaises(StateError):
             product_daemon.status(self.env)
+
+
+class StopIdentityTests(DaemonCase):
+    """``stop`` signals only CAO's own verified process instance.
+
+    A pid alone is not identity: after a restart the OS can recycle it onto an
+    unrelated process. The daemon records an immutable instance identity (boot
+    id plus start time) and refuses to signal unless the live reading matches.
+    """
+
+    @staticmethod
+    def _identity(pid):
+        return {"pid": pid, "boot_id": "boot", "starttime": "100"}
+
+    def test_stop_signals_only_the_verified_own_process(self) -> None:
+        signals: list[int] = []
+        live = {"alive": True}
+
+        def alive(_pid):
+            return live["alive"]
+
+        def terminate(pid):
+            signals.append(pid)
+            live["alive"] = False
+
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: 4321,
+            alive=alive,
+            terminate=terminate,
+            identity=self._identity,
+        )
+        daemon.start()
+        stopped = daemon.stop()
+        self.assertEqual(signals, [4321])
+        self.assertEqual(stopped["observed"], "stopped")
+        self.assertEqual(stopped["status"], "STOPPED")
+
+    def test_stop_refuses_a_recycled_pid_without_signaling(self) -> None:
+        signals: list[int] = []
+        reads = {"n": 0}
+
+        def identity(pid):
+            reads["n"] += 1
+            # start() records starttime 100; the live reading is a different
+            # instance (999), i.e. the pid was recycled onto another process.
+            return {
+                "pid": pid,
+                "boot_id": "boot",
+                "starttime": "100" if reads["n"] == 1 else "999",
+            }
+
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: 4321,
+            alive=lambda _pid: True,
+            terminate=signals.append,
+            identity=identity,
+        )
+        daemon.start()
+        stopped = daemon.stop()
+        self.assertEqual(signals, [])
+        self.assertEqual(stopped["observed"], "unknown")
+        self.assertNotEqual(stopped["status"], "STOPPED")
+
+    def test_stop_refuses_an_unreadable_identity(self) -> None:
+        signals: list[int] = []
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: 4321,
+            alive=lambda _pid: True,
+            terminate=signals.append,
+            identity=lambda _pid: None,
+        )
+        daemon.start()
+        stopped = daemon.stop()
+        self.assertEqual(signals, [])
+        self.assertEqual(stopped["observed"], "unknown")
+
+    def test_stop_refuses_a_corrupt_recorded_identity(self) -> None:
+        signals: list[int] = []
+        record = product_state.default_daemon_record()
+        record.update(
+            {
+                "desired": "running",
+                "observed": "running",
+                "pid": 4321,
+                "pid_identity": "not-a-dict",
+            }
+        )
+        product_state.write_daemon(record, self.env)
+        daemon = self.build(
+            FakeDriver(),
+            alive=lambda _pid: True,
+            terminate=signals.append,
+            identity=self._identity,
+        )
+        stopped = daemon.stop()
+        self.assertEqual(signals, [])
+        self.assertEqual(stopped["observed"], "unknown")
+
+    def test_stop_with_a_stale_identity_never_signals(self) -> None:
+        # A recorded identity from before a reboot can never match: the boot id
+        # changed, so the pid is not CAO's process.
+        signals: list[int] = []
+        record = product_state.default_daemon_record()
+        record.update(
+            {
+                "desired": "running",
+                "observed": "running",
+                "pid": 4321,
+                "pid_identity": {
+                    "pid": 4321,
+                    "boot_id": "before-reboot",
+                    "starttime": "1",
+                },
+            }
+        )
+        product_state.write_daemon(record, self.env)
+        daemon = self.build(
+            FakeDriver(),
+            alive=lambda _pid: True,
+            terminate=signals.append,
+            identity=self._identity,
+        )
+        stopped = daemon.stop()
+        self.assertEqual(signals, [])
+        self.assertNotEqual(stopped["status"], "STOPPED")
+
+    def test_pidfd_stop_ends_a_real_own_process(self) -> None:
+        if not (
+            hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+        ):
+            self.skipTest("pidfd is unavailable on this platform")
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        identity = product_daemon._process_identity(proc.pid)
+        if identity is None:
+            self.skipTest("no /proc process identity is available")
+        record = product_state.default_daemon_record()
+        record.update(
+            {
+                "desired": "running",
+                "observed": "running",
+                "pid": proc.pid,
+                "pid_identity": identity,
+            }
+        )
+        product_state.write_daemon(record, self.env)
+        daemon = product_daemon.Daemon(
+            config=self.config,
+            env=self.env,
+            clock=self.clock,
+            sleep=time.sleep,
+            # Popen.poll reaps the child, so a terminated process is observed
+            # gone instead of lingering as a zombie.
+            alive=lambda _pid: proc.poll() is None,
+        )
+        stopped = daemon.stop()
+        self.assertEqual(stopped["observed"], "stopped")
+        proc.wait(timeout=5)
+        self.assertIsNotNone(proc.returncode)
+
+
+class StartIdentityTests(DaemonCase):
+    """``start`` and ``status`` require a verified process instance, not a pid."""
+
+    def _write_running(self, pid, pid_identity) -> None:
+        record = product_state.default_daemon_record()
+        record.update(
+            {
+                "desired": "running",
+                "observed": "running",
+                "pid": pid,
+                "pid_identity": pid_identity,
+            }
+        )
+        product_state.write_daemon(record, self.env)
+
+    def test_start_reuses_a_verified_live_own_process(self) -> None:
+        spawns: list[int] = []
+        own = os.getpid()
+        self._write_running(own, product_daemon._process_identity(own))
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: (spawns.append(1), 4321)[1],
+            alive=lambda pid: pid == own,
+        )
+        payload = daemon.start()
+        self.assertTrue(payload["already_running"])
+        self.assertEqual(spawns, [])
+
+    def test_start_refuses_a_live_recycled_pid(self) -> None:
+        spawns: list[int] = []
+        signals: list[int] = []
+        own = os.getpid()
+        self._write_running(
+            own, {"pid": own, "boot_id": "wrong-boot", "starttime": "1"}
+        )
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: (spawns.append(1), 4321)[1],
+            alive=lambda pid: pid == own,
+            terminate=signals.append,
+        )
+        with self.assertRaises(product_daemon.DaemonUnavailable):
+            daemon.start()
+        # No duplicate child, no signal to the foreign process.
+        self.assertEqual(spawns, [])
+        self.assertEqual(signals, [])
+
+    def test_start_refuses_a_legacy_record_without_identity(self) -> None:
+        spawns: list[int] = []
+        own = os.getpid()
+        self._write_running(own, None)
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: (spawns.append(1), 4321)[1],
+            alive=lambda pid: pid == own,
+        )
+        with self.assertRaises(product_daemon.DaemonUnavailable):
+            daemon.start()
+        self.assertEqual(spawns, [])
+
+    def test_start_replaces_a_proven_stale_instance(self) -> None:
+        spawns: list[int] = []
+        self._write_running(4321, {"pid": 4321, "boot_id": "b", "starttime": "1"})
+        daemon = self.build(
+            FakeDriver(),
+            spawn=lambda: (spawns.append(1), 9999)[1],
+            alive=lambda _pid: False,
+        )
+        payload = daemon.start()
+        self.assertFalse(payload["already_running"])
+        self.assertEqual(len(spawns), 1)
+
+    def test_status_reports_unknown_for_a_recycled_pid(self) -> None:
+        own = os.getpid()
+        self._write_running(own, {"pid": own, "boot_id": "wrong", "starttime": "1"})
+        payload = product_daemon.status(self.env)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertFalse(payload["ok"])
+
+    def test_status_reports_unknown_for_a_legacy_record(self) -> None:
+        self._write_running(os.getpid(), None)
+        payload = product_daemon.status(self.env)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertFalse(payload["ok"])
+
+    def test_status_reports_unknown_for_a_stale_pid(self) -> None:
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        self._write_running(
+            dead.pid, {"pid": dead.pid, "boot_id": "b", "starttime": "1"}
+        )
+        payload = product_daemon.status(self.env)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertNotEqual(payload["status"], "RUNNING")
 
 
 class ReconciliationTests(DaemonCase):
@@ -503,6 +776,25 @@ class ProbeTests(DaemonCase):
         self.assertFalse(occupancy.available)
         observation = product_daemon.to_runtime_observation(occupancy)
         self.assertFalse(observation.available)
+
+    def test_occupant_without_a_usable_worktree_fails_closed(self) -> None:
+        driver = FakeDriver()
+        driver._workspaces["w9"] = {
+            "workspace_id": "w9",
+            "label": "other",
+            "active_tab_id": "w9:t1",
+        }
+        driver._panes["w9:p1"] = {
+            "pane_id": "w9:p1",
+            "workspace_id": "w9",
+            "cwd": None,
+            "agent": "somebody",
+            "agent_status": "working",
+        }
+        occupancy = product_daemon.collect_occupancy(driver)
+        # An occupant that cannot be placed is not a healthy reading; the claim
+        # path must fail closed rather than treat the repository as unoccupied.
+        self.assertFalse(occupancy.available)
 
     def test_empty_occupancy_is_a_real_answer(self) -> None:
         driver = FakeDriver()

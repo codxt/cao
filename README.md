@@ -52,13 +52,15 @@ cd cao
 directory and installs or adopts the pinned runtime release through a
 stdlib-only installer that verifies the SHA-256 before anything is put in
 place — no `curl`-to-shell, no unverified binary. `./cao doctor` prints exact
-per-subsystem readiness evidence and fails closed: when a provider is missing
-or its credentials cannot be verified without reading a secret, the verdict is
-`NOT_READY`. Once a provider is configured explicitly, `./cao run` submits one
-real task through the managed runtime (a code-writing task must declare its
-write scope), `./cao status` and `./cao logs` report durable state, and
+per-subsystem readiness evidence and fails closed: when the runtime's live
+server is unreachable, a provider is missing, or its credentials cannot be
+verified without reading a secret, the verdict is `NOT_READY`. Once a provider
+is configured explicitly, `./cao run` submits one real task through the managed
+runtime (a code-writing task must declare its write scope and is gated on live
+occupancy), `./cao status` and `./cao logs` report durable state, and
 `./cao stop` ends the run; `./cao daemon start` adds the CAO-owned supervision
-loop. See [`docs/installation.md`](docs/installation.md),
+loop, which is optional for manual tasks. See
+[`docs/installation.md`](docs/installation.md),
 [`docs/quickstart.md`](docs/quickstart.md) and
 [`docs/product-pilot.md`](docs/product-pilot.md).
 

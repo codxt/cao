@@ -63,9 +63,16 @@ Installation does not itself authenticate anything. To be considered `READY`,
 `cao doctor` requires:
 
 - the managed runtime dependency to be installed or adopted;
+- the runtime's **live server** to answer a bounded, read-only `status server`
+  probe (a missing or unhealthy server is `NOT_READY`);
 - a provider CLI that is present on `PATH`;
 - an explicit model recorded in the configuration; and
 - credentials that can be positively verified **without reading a secret**.
+
+The CAO daemon is **not** part of `READY`: a manual `cao run` drives the runtime
+directly. The daemon is required only for unattended supervision, and its real
+status is reported separately (`sections.daemon` and `readiness.unattended`),
+never fabricated.
 
 CAO reads only non-secret existence signals (for example, which provider ids a
 CLI reports as configured). It never reads, stores or prints a credential

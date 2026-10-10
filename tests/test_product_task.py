@@ -13,6 +13,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from cao import product_config, product_driver, product_state, product_task, registry
@@ -400,6 +401,171 @@ class CompletionAndStopTests(TaskCase):
         ).fetchone()
         self.assertEqual(row["outcome"], "abandon")
         self.assertIsNotNone(row["released_at"])
+
+    def _release_out_of_band(self, payload):
+        conn = registry.connect(db=self.db)
+        try:
+            released = registry.release(
+                conn, product_config.DEFAULT_RUN_ID, product_task.OWNER,
+                payload["task_id"], issue="", outcome="abandon",
+            )
+            self.assertTrue(released["ok"])
+        finally:
+            conn.close()
+
+    def _resume_for_finish(self, repo, payload, driver):
+        return product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Review this repository",
+            task_id=payload["task_id"], config=self.config, env=self.env,
+            registry_db=self.db, wait_ms=1000,
+        )
+
+    def test_finish_with_rejected_release_is_not_complete(self) -> None:
+        repo = git_repo(self.root, name="finish-refusal")
+        driver = FakeDriver()
+        started = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Review this repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=0,
+        )
+        self.assertEqual(started["status"], "running")
+        self._release_out_of_band(started)
+        finished = self._resume_for_finish(repo, started, driver)
+        self.assertEqual(finished["status"], "running")
+        self.assertEqual(finished["error"]["code"], "TASK_CLAIM_RELEASE_REJECTED")
+        self.assertFalse(finished["claim"].get("released"))
+        conn = registry.connect(db=self.db)
+        try:
+            row = conn.execute("SELECT outcome FROM claims WHERE work_key=?", (started["task_id"],)).fetchone()
+            self.assertEqual(row["outcome"], "abandon")
+        finally:
+            conn.close()
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_finish_rejected_release_during_wait_is_not_complete(self) -> None:
+        repo = git_repo(self.root, name="finish-race")
+        driver = FakeDriver()
+        with patch.object(registry, "release", return_value={
+            "ok": False, "errors": ["claim already released elsewhere"],
+        }):
+            finished = product_task.run_task(
+                driver=driver, repo=str(repo), prompt="Review this repository",
+                config=self.config, env=self.env, registry_db=self.db,
+                wait_ms=1000,
+            )
+        self.assertEqual(finished["status"], "running")
+        self.assertEqual(finished["error"]["code"], "TASK_CLAIM_RELEASE_REJECTED")
+        self.assertFalse(finished["claim"].get("released"))
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        conn = registry.connect(db=self.db)
+        try:
+            row = conn.execute(
+                "SELECT released_at FROM claims WHERE work_key=?", (finished["task_id"],)
+            ).fetchone()
+            self.assertIsNone(row["released_at"])
+        finally:
+            conn.close()
+
+    def test_stop_with_rejected_release_stays_running_and_keeps_pane(self) -> None:
+        driver = FakeDriver()
+        started = self.run_read(driver)
+        self._release_out_of_band(started)
+        stopped = product_task.stop_task(
+            driver=driver, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(stopped["status"], "running")
+        self.assertEqual(stopped["error"]["code"], "TASK_CLAIM_RELEASE_REJECTED")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertNotEqual(stopped["claim"].get("status"), "RELEASED")
+
+    def test_stop_with_failed_pane_close_stays_running(self) -> None:
+        class FailingClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                raise product_driver.DriverError("close unavailable")
+
+        driver = FailingClose()
+        started = self.run_read(driver)
+        first = product_task.stop_task(
+            driver=driver, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(first["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertFalse(first["claim"].get("released"))
+        self.assertIsNone(first.get("pane_closed"))
+        conn = registry.connect(db=self.db)
+        try:
+            row = conn.execute("SELECT outcome, released_at FROM claims WHERE work_key=?", (started["task_id"],)).fetchone()
+            self.assertIsNone(row["outcome"])
+            self.assertIsNone(row["released_at"])
+        finally:
+            conn.close()
+        fixed = product_task.stop_task(
+            driver=FakeDriver(), task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(fixed["status"], "stopped")
+        self.assertEqual(fixed.get("pane_closed"), "w1:p1")
+
+    def test_retry_after_rejected_finish_issues_no_second_prompt(self) -> None:
+        repo = git_repo(self.root, name="retry-refusal")
+        driver = FakeDriver()
+        started = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Review this repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=0,
+        )
+        self._release_out_of_band(started)
+        first = self._resume_for_finish(repo, started, driver)
+        second = self._resume_for_finish(repo, started, driver)
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "running")
+        self.assertEqual(second["error"]["code"], "TASK_CLAIM_RELEASE_REJECTED")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_failed_close_retains_write_exclusivity(self) -> None:
+        class FailingClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                raise product_driver.DriverError("close failed")
+
+        repo = git_repo(self.root, name="write-stop-race")
+        driver = FailingClose()
+        first = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Edit first",
+            mode="write", write_scope=("a.txt",),
+            observation=RuntimeObservation.empty(),
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=0,
+        )
+        self.assertEqual(first["status"], "running")
+        incomplete = product_task.stop_task(
+            driver=driver, task_id=first["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(incomplete["status"], "running")
+        self.assertFalse(incomplete["claim"].get("released"))
+        other = FakeDriver()
+        second = product_task.run_task(
+            driver=other, repo=str(repo), prompt="Edit second",
+            mode="write", write_scope=("a.txt",),
+            observation=RuntimeObservation.empty(),
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=0,
+        )
+        self.assertEqual(second["status"], "refused")
+        self.assertEqual(second["refusal"]["status"], "CONFLICT")
+        self.assertNotIn("agent_start", other.names())
+        self.assertNotIn("agent_prompt", other.names())
+
+    def test_stop_without_runtime_does_not_fake_pane_close(self) -> None:
+        driver = FakeDriver()
+        started = self.run_read(driver)
+        first = product_task.stop_task(
+            driver=None, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(first["status"], "running")
+        self.assertFalse(first["claim"].get("released"))
+        self.assertEqual(first["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        retry = product_task.stop_task(
+            driver=driver, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(retry["status"], "stopped")
+        self.assertEqual(retry["pane_closed"], "w1:p1")
 
     def test_stop_without_a_task_is_unavailable(self) -> None:
         with self.assertRaises(product_task.TaskUnavailable):

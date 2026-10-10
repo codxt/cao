@@ -158,13 +158,21 @@ Expected: exit `0` and `"status": "READY"`, with every gate true:
   "status": "READY",
   "gates": {
     "managed_runtime": true,
+    "runtime_server": true,
     "provider_found": true,
     "model_configured": true,
     "credentials_verified": true
   },
+  "readiness": {"manual_task": true, "unattended": false},
   "reasons": []
 }
 ```
+
+`runtime_server` is the managed runtime's own live `status server` probe. If the
+server is down the gate is false and `doctor` is `NOT_READY`, even when the
+other gates pass. The daemon is optional for a manual task: `readiness.manual_task`
+does not require it, while `readiness.unattended` is true only with a running
+daemon.
 
 If any gate is false the exit code is `3` and `status` is `NOT_READY`. Stop; the
 reason names the gate that did not pass. Under the isolated roots of step 1 the
@@ -383,8 +391,8 @@ between cases.
   Expected: exit `3`, `"code": "PRODUCT_TASK_USAGE"`, naming the mismatched
   field. No second task is started.
 
-- **Unauthorized write scope.** A write task without a declared scope, and a
-  write through the CLI without a live occupancy observation:
+- **Write authority.** A write task without a declared scope is a usage error,
+  and a scoped write is gated on live occupancy:
 
   ```sh
   ./cao run --repo "$REPO" --mode write "edit the code"
@@ -392,10 +400,12 @@ between cases.
   ```
 
   Expected: the first exits `3` with `PRODUCT_TASK_USAGE` and starts nothing.
-  The second records `mode: WRITE` with the declared scope, and the write gate
-  fails closed (`"status": "refused"`, exit `3`) because no live occupancy was
-  observed. Two WRITE tasks sharing a path are refused by the ledger with a
-  `CONFLICT`.
+  The second records `mode: WRITE` with the declared scope, reads the runtime's
+  live occupancy, and claims `WRITE` (`"status": "running"`, `claim.mode:
+  "WRITE"`, exit `0`) when the occupancy is healthy and no writer conflicts.
+  Two WRITE tasks sharing a path are refused by the ledger with a `CONFLICT`;
+  an unreadable occupancy is refused as `NEEDS_RECONCILIATION`, never assumed
+  safe.
 
 ## 11. Close only CAO's surfaces
 

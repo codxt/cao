@@ -20,7 +20,8 @@ Pinned here:
 * idempotent resume with no second prompt or start;
 * an ambiguous prompt acknowledgement stays ``unknown`` (exit 3) and is never
   re-prompted;
-* a WRITE task is refused without a scope, and a declared scope is recorded;
+* a WRITE task is refused without a scope; a declared scope claims WRITE from
+  the runtime's live occupancy, and an unreadable occupancy fails closed;
 * a corrupt task record fails closed and is never treated as absent;
 * the daemon reconciles idempotently (no duplicate effects on a double start)
   and re-drives a stale task without a second prompt or start;
@@ -70,6 +71,7 @@ import sys
 STATE = os.environ.get("FAKE_RUNTIME_STATE")
 LOG = os.environ.get("FAKE_RUNTIME_LOG")
 FAIL_PROMPT = os.environ.get("FAKE_RUNTIME_FAIL_PROMPT") == "1"
+FAIL_OCCUPANCY = os.environ.get("FAKE_RUNTIME_FAIL_OCCUPANCY") == "1"
 
 
 def _load():
@@ -119,6 +121,8 @@ def _main(argv):
     if argv[:1] == ["workspace"]:
         action = argv[1] if len(argv) > 1 else ""
         if action == "list":
+            if FAIL_OCCUPANCY:
+                return _fail("runtime_unavailable")
             workspaces = [
                 {"workspace_id": w["workspace_id"], "label": w.get("label"),
                  "active_tab_id": w.get("active_tab_id")}
@@ -294,6 +298,7 @@ class E2ECase(unittest.TestCase):
             "FAKE_RUNTIME_STATE",
             "FAKE_RUNTIME_LOG",
             "FAKE_RUNTIME_FAIL_PROMPT",
+            "FAKE_RUNTIME_FAIL_OCCUPANCY",
         ):
             self.addCleanup(os.environ.pop, key, None)
 
@@ -357,6 +362,7 @@ class E2ECase(unittest.TestCase):
             spawn=lambda: (spawns.append(1), 4321)[1],
             alive=lambda pid: pid == 4321,
             terminate=lambda _pid: None,
+            identity=lambda pid: {"pid": pid, "boot_id": "fake", "starttime": "1"},
             max_ticks=None,
         )
 
@@ -461,11 +467,35 @@ class WriteScopeTests(E2ECase):
         self.assertIsNotNone(record)
         self.assertEqual(record["mode"], "WRITE")
         self.assertIn("a.txt", record["scope"])
-        # Through the CLI no live occupancy observation is available, so the
-        # write gate fails closed; the scope is nonetheless recorded.
+        # The CLI reads the fake runtime's live occupancy, so the scoped WRITE
+        # claim is admissible and the task runs. The scope is recorded and the
+        # registry issued a WRITE claim.
+        payload = self._json(run)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["claim"]["mode"], "WRITE")
+
+    def test_write_with_unreadable_occupancy_is_refused(self) -> None:
+        env = self._cli_env()
+        env["FAKE_RUNTIME_FAIL_OCCUPANCY"] = "1"
+        run = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--id",
+            "twrite02",
+            "--write",
+            "a.txt",
+            "edit the code",
+            env=env,
+        )
+        self.assertEqual(run.returncode, 3, run.stderr)
         payload = self._json(run)
         self.assertEqual(payload["status"], "refused")
-        self.assertEqual(run.returncode, 3, run.stderr)
+        self.assertEqual(payload["refusal"]["stage"], "preflight")
+        self.assertEqual(payload["refusal"]["status"], "NEEDS_RECONCILIATION")
+        # Nothing was started against an unverified occupancy.
+        self.assertNotIn("agent start", self._log_lines())
 
 
 class FailClosedTests(E2ECase):
