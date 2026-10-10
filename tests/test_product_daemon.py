@@ -720,11 +720,13 @@ class ReconciliationTests(DaemonCase):
         daemon.start()
         daemon.tick()
         record = product_state.read_task(task_id, self.env)
-        # The WRITE claim went through with the real occupancy observation and
-        # the re-drive waited, so the task reached its handback.
-        self.assertEqual(record["status"], "complete")
+        # Real occupancy permits the WRITE claim and the agent runs. The fake
+        # agent performs no Git commit, so completion must remain blocked and
+        # retain the writer claim until a clean scoped result is demonstrated.
+        self.assertEqual(record["status"], "blocked")
         self.assertEqual(record["claim"]["mode"], "WRITE")
-        self.assertEqual(record["claim"]["outcome"], "complete")
+        self.assertFalse(record["claim"].get("released"))
+        self.assertEqual(record["error"]["code"], "TASK_WRITE_RESULT_UNVERIFIED")
         self.assertIn("agent_prompt", driver.names())
 
     def test_write_task_holds_unknown_when_occupancy_unreadable(self) -> None:

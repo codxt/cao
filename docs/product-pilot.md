@@ -27,7 +27,10 @@ steps 5-11 are the pilot; "Evidence" says what to keep.
 - Verify the actual agent process, repository diff, affected paths and final
   commit before accepting a WRITE pilot. A model status of `idle`/`done`, a
   prompt acknowledgement, or a CAO claim release alone is insufficient proof
-  that the requested write occurred.
+  that the requested write occurred. A WRITE completion now requires the same
+  branch and an in-scope, clean committed diff relative to the task's captured
+  starting HEAD. A missing commit, uncommitted work, unexpected file, or
+  unverifiable Git state retains the WRITE claim for correction or governed stop.
 - Fail closed: if a step's expected output is not seen, stop and record the
   actual output rather than continuing.
 

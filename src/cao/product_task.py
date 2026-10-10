@@ -302,6 +302,19 @@ def _claim_authority(
     repo = record["repo"]
     scope = list(record.get("scope") or [])
     if record["mode"] == registry.WRITE:
+        # Bind the terminal result to the exact original source state. A
+        # resumed claim must never treat another commit as its new baseline.
+        base_head, base_branch = _repo_head_and_branch(repo)
+        if not base_head or not base_branch:
+            return {
+                "ok": False,
+                "stage": "preflight",
+                "result": {
+                    "status": registry.NEEDS_RECONCILIATION,
+                    "errors": ["WRITE checkout HEAD or branch could not be verified"],
+                    "conflicts": [],
+                },
+            }
         proposed = registry.propose(
             conn,
             record["run_id"],
@@ -310,14 +323,13 @@ def _claim_authority(
             paths=scope,
             objective=str(record.get("prompt") or "")[:200],
         )
-        head, branch = _repo_head_and_branch(repo)
         spec = registry.ClaimSpec(
             run_id=record["run_id"],
             work_key=record["work_key"],
             owner=OWNER,
             mode=registry.WRITE,
             issue="",
-            branch=branch or "",
+            branch=base_branch,
             worktree=repo,
         )
     else:
@@ -344,11 +356,25 @@ def _claim_authority(
     claimed = registry.claim(conn, spec, observation)
     if not claimed.get("ok"):
         return {"ok": False, "stage": "claim", "result": claimed}
+    if record["mode"] == registry.WRITE and claimed.get("status") != registry.CLAIMED:
+        # A preexisting ledger claim without this task's saved base cannot
+        # establish which commits belong to it. Preserve that claim and stop.
+        return {
+            "ok": False,
+            "stage": "claim",
+            "result": {
+                "status": registry.NEEDS_RECONCILIATION,
+                "errors": ["preexisting WRITE claim lacks a saved task baseline"],
+                "conflicts": [],
+            },
+        }
     return {
         "ok": True,
         "claim_id": claimed.get("claim_id"),
         "status": claimed.get("status"),
         "claim_mode": record["mode"],
+        "base_head": base_head if record["mode"] == registry.WRITE else None,
+        "base_branch": base_branch if record["mode"] == registry.WRITE else None,
     }
 
 
@@ -609,6 +635,19 @@ def run_task(
             "claim_id": authority.get("claim_id"),
             "status": authority.get("status"),
             "mode": authority.get("claim_mode"),
+            **(
+                {
+                    "base_head": (
+                        prior_claim.get("base_head") if prior_claim
+                        else authority.get("base_head")
+                    ),
+                    "base_branch": (
+                        prior_claim.get("base_branch") if prior_claim
+                        else authority.get("base_branch")
+                    ),
+                }
+                if record["mode"] == registry.WRITE else {}
+            ),
         }
         record["status"] = "claimed"
         record["refusal"] = None
@@ -674,6 +713,61 @@ def _validate_resume(
         )
 
 
+def _write_completion_error(
+    conn: Any, record: Mapping[str, Any], head: str, branch: str | None
+) -> tuple[str, str] | None:
+    """Verify an accepted WRITE uses exactly its original claim and Git scope.
+
+    This is a completion predicate, not a new authority. Live observations are
+    read-only, and any unreadable source retains the existing WRITE claim.
+    """
+    claim = record.get("claim") or {}
+    base = claim.get("base_head")
+    base_branch = claim.get("base_branch")
+    if (not isinstance(base, str) or not git.HEAD_RE.fullmatch(base)
+            or not isinstance(base_branch, str) or not base_branch):
+        return ("TASK_WRITE_RESULT_UNVERIFIED", "WRITE claim baseline missing")
+
+    held = registry.get_open_claim(
+        conn, record["run_id"], record["work_key"], "", OWNER,
+    )
+    work = registry.get_work(conn, record["run_id"], record["work_key"], "")
+    scope = record.get("scope")
+    if (held is None or work is None or held["claim_id"] != claim.get("claim_id")
+            or held["mode"] != registry.WRITE
+            or held["worktree"] != record["repo"]
+            or held["branch"] != base_branch
+            or not isinstance(scope, list)
+            or not scope
+            or sorted(scope) != sorted(work["paths"].split("\n"))):
+        return ("TASK_WRITE_SCOPE_VIOLATION", "WRITE claim identity or scope changed")
+    if branch != base_branch:
+        return ("TASK_WRITE_SCOPE_VIOLATION", "WRITE checkout branch changed")
+
+    committed = git.probe_committed_diff(record["repo"], base)
+    status = git.probe_status(record["repo"])
+    if (not committed.get("ok") or committed.get("base") != base
+            or not status.get("ok")
+            or not isinstance(committed.get("items"), list)
+            or not isinstance(status.get("items"), list)):
+        return ("TASK_WRITE_RESULT_UNVERIFIED", "WRITE Git evidence unavailable")
+    changed = committed["items"]
+    dirty = git.touched_paths(status["items"])
+    if any(
+        not any(path == prefix or path.startswith(prefix + "/") for prefix in scope)
+        for path in changed + dirty
+    ):
+        return ("TASK_WRITE_SCOPE_VIOLATION", "WRITE modified an undeclared Git path")
+    if dirty or not changed or head == base:
+        return ("TASK_WRITE_RESULT_UNVERIFIED", "WRITE has no clean committed result")
+    # A changing HEAD between probes cannot be accepted as proof of the head
+    # that will be recorded in the Registry release receipt.
+    final_head, final_branch = _repo_head_and_branch(record["repo"])
+    if final_head != head or final_branch != branch:
+        return ("TASK_WRITE_RESULT_UNVERIFIED", "WRITE Git evidence changed during review")
+    return None
+
+
 def _finish(
     conn: Any,
     driver: product_driver.RuntimeDriver,
@@ -708,8 +802,18 @@ def _finish(
             state = None
 
     if state in ("idle", "done"):
-        head, _branch = _repo_head_and_branch(record["repo"])
+        head, branch = _repo_head_and_branch(record["repo"])
         if head:
+            if record["mode"] == registry.WRITE:
+                failure = _write_completion_error(conn, record, head, branch)
+                if failure is not None:
+                    record["status"] = "blocked"
+                    record["error"] = {
+                        "code": failure[0],
+                        "message": failure[1],
+                    }
+                    _save(record, env, clock)
+                    return task_payload(record)
             _observe(driver, record, env, clock, defaults)
             released = registry.release(
                 conn,

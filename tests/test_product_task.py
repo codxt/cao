@@ -440,6 +440,145 @@ class WriteAuthorityTests(TaskCase):
         self.assertEqual(driver.calls, [])
 
 
+class WriteCompletionScopeTests(TaskCase):
+    """Actual Git side effects must be proven inside the held WRITE scope."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_repo = git_repo(self.root, name="write-scope", files=("a.txt", "other.txt"))
+        remote = self.root / "upstream.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                       capture_output=True, env={**os.environ, **GIT_ENV})
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "--set-upstream", "origin", "main")
+        self.driver = FakeDriver()
+        self.kwargs = dict(
+            driver=self.driver, repo=str(self.write_repo), prompt="Edit a.txt",
+            task_id="scope-case", mode="write", write_scope=("a.txt",),
+            observation=RuntimeObservation.empty(), config=self.config,
+            env=self.env, registry_db=self.db,
+        )
+
+    def git(self, *arguments: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(self.write_repo), "-c", "commit.gpgsign=false", *arguments],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, **GIT_ENV},
+        )
+        return proc.stdout.strip()
+
+    def begin(self):
+        result = product_task.run_task(**self.kwargs, wait_ms=0)
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["claim"]["mode"], "WRITE")
+        return result
+
+    def finish(self):
+        return product_task.run_task(**self.kwargs, wait_ms=1000)
+
+    def assert_claim_open(self):
+        conn = registry.connect(db=self.db)
+        try:
+            row = conn.execute("SELECT released_at FROM claims WHERE work_key='scope-case'").fetchone()
+            self.assertIsNone(row["released_at"])
+        finally:
+            conn.close()
+        self.assertEqual(self.driver.names().count("agent_prompt"), 1)
+        self.assertEqual(self.driver.names().count("agent_start"), 1)
+
+    def test_out_of_scope_commit_cannot_complete_and_retains_claim(self):
+        self.begin()
+        (self.write_repo / "unscoped.txt").write_text("escaped\n")
+        self.git("add", "unscoped.txt")
+        self.git("commit", "-m", "out of scope")
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_WRITE_SCOPE_VIOLATION")
+        self.assert_claim_open()
+        again = self.finish()
+        self.assertEqual(again["status"], "blocked")
+        self.assert_claim_open()
+
+    def test_no_write_commit_cannot_claim_success(self):
+        before = self.git("rev-parse", "HEAD")
+        self.begin()
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_WRITE_RESULT_UNVERIFIED")
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assert_claim_open()
+
+    def test_dirty_write_must_be_committed_before_release(self):
+        self.begin()
+        (self.write_repo / "a.txt").write_text("one\ntwo\n")
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_WRITE_RESULT_UNVERIFIED")
+        self.assert_claim_open()
+
+    def test_in_scope_commit_reuses_claim_and_finishes(self):
+        original = self.git("rev-parse", "HEAD")
+        self.begin()
+        record = product_state.read_task("scope-case", self.env)
+        self.assertEqual(record["claim"]["base_head"], original)
+        self.assertEqual(record["claim"]["base_branch"], "main")
+        (self.write_repo / "a.txt").write_text("one\ntwo\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "within scope")
+        head = self.git("rev-parse", "HEAD")
+        result = self.finish()
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["claim"]["released"])
+        self.assertEqual(result["claim"]["released_head"], head)
+        self.assert_claim_released()
+        self.assertEqual(self.driver.names().count("agent_prompt"), 1)
+
+    def assert_claim_released(self):
+        conn = registry.connect(db=self.db)
+        try:
+            row = conn.execute("SELECT released_at FROM claims WHERE work_key='scope-case'").fetchone()
+            self.assertIsNotNone(row["released_at"])
+        finally:
+            conn.close()
+
+    def test_preexisting_history_outside_scope_not_counted_as_task_effect(self):
+        (self.write_repo / "other.txt").write_text("prior history\n")
+        self.git("add", "other.txt")
+        self.git("commit", "-m", "before task")
+        self.git("push", "origin", "main")  # prior work is already accepted baseline
+        base = self.git("rev-parse", "HEAD")
+        self.begin()
+        (self.write_repo / "a.txt").write_text("in scope\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task effect")
+        result = self.finish()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(product_state.read_task("scope-case", self.env)["claim"]["base_head"], base)
+
+    def test_branch_drift_cannot_complete(self):
+        self.begin()
+        self.git("checkout", "-b", "other-branch")
+        (self.write_repo / "a.txt").write_text("new content\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "wrong branch")
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_WRITE_SCOPE_VIOLATION")
+        self.assert_claim_open()
+
+    def test_original_claim_worktree_cannot_be_rebound_to_other_repo(self):
+        self.begin()
+        conn = registry.connect(db=self.db)
+        try:
+            conn.execute("UPDATE claims SET worktree=? WHERE work_key=?", ("/tmp/other-repo", "scope-case"))
+        finally:
+            conn.close()
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_WRITE_SCOPE_VIOLATION")
+        self.assert_claim_open()
+
+
 class CompletionAndStopTests(TaskCase):
     def test_done_wait_hands_back_complete_with_head(self) -> None:
         repo = git_repo(self.root, name="gitrepo2")
