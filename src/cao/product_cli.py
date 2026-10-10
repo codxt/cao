@@ -413,6 +413,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     daemon.set_defaults(handler=_cmd_daemon)
 
+    team_command = subcommands.add_parser(
+        "team", help="specialist Team Execution"
+    )
+    team_command.add_argument("args", nargs=argparse.REMAINDER)
+    team_command.set_defaults(handler=_cmd_start)  # main dispatches separately
+
     for name, help_text, handler in (
         ("run", "submit a task", _cmd_run),
         ("start", "start the service (unavailable in this build)", _cmd_start),
@@ -441,6 +447,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _dispatch_task_command(args_list)
     if args_list and args_list[0] == "daemon":
         return _daemon(args_list[1:])
+    if args_list and args_list[0] == "team":
+        from . import team_cli
+        return team_cli.main(args_list[1:])
 
     parser = build_parser()
     args = parser.parse_args(args_list)

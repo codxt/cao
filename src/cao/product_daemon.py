@@ -51,6 +51,7 @@ from . import (
     coordinator,
     evidence,
     product_config,
+    product_driver,
     product_state,
     product_task,
     registry,
@@ -724,6 +725,26 @@ class Daemon:
                 )
 
         wakes = self._relay_tasks(tasks)
+        # Teams reuse this daemon and the existing Registry/task runner. No
+        # second wake daemon, queue or WRITE authority is introduced.
+        if self._config is not None and self._driver is not None:
+            from . import team
+            try:
+                for update in team.tick_all(
+                    config=self._config, driver=self._driver, env=self._env,
+                    registry_db=self._registry_db,
+                ):
+                    effects.append({
+                        "team_id": update["team_id"], "action": "team_reconcile",
+                        "status": update["status"],
+                    })
+            except (team.TeamError, StateError, product_driver.DriverError,
+                    registry.RegistryError, product_config.ProductConfigError) as exc:
+                record["errors"] = int(record.get("errors") or 0) + 1
+                effects.append({
+                    "action": "team_hold", "status": "UNKNOWN",
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                })
         now = evidence.utc_now(self._clock)
         record.update(
             {

@@ -83,6 +83,22 @@ installing:
 PYTHONPATH=src python3 -m cao --help
 ```
 
+## Team Execution
+
+The product launcher supports specialist team roles, declared dependencies,
+model-per-role routing, parallel governed workers, handoff artifacts and
+bounded independent review/correction loops.
+
+    cao team validate --file /path/to/team.json
+    cao team init --file /path/to/team.json
+    cao team start --id sample-project
+    cao team tick --id sample-project
+    cao team status --id sample-project
+
+Initialization is PAUSED and launches no agent. Team review is advisory;
+publication, deployment and sensitive provider routing keep separate gates.
+See docs/team-execution.md for the manifest and recovery contract.
+
 ## CLI
 
 ```sh
