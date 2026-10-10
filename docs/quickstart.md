@@ -33,24 +33,45 @@ reports whether the install is actually usable.
 yet. A fresh clone with no provider configured is `NOT_READY`. Verification
 never reads a credential value.
 
-## Checking the service
+## Checking the service and running a task
 
-```sh
-./cao status
-```
-
-On a fresh clone this reports `NOT_STARTED` — CAO never invents a running
-service. The task-running lifecycle is owned by later lanes; in this build:
+After `./setup.sh` and an explicit provider configuration (see
+[`installation.md`](installation.md)), the product commands work:
 
 ```sh
 ./cao run --repo /path/to/project "Review this repository"
-# { "status": "UNAVAILABLE", "error": { "code": "NOT_IMPLEMENTED" } }
+./cao status
+./cao logs
+./cao stop
 ```
 
-`run`, `start`, `stop` and `logs` return an explicit `UNAVAILABLE` and a
-nonzero exit. They never fabricate progress, handback or a process.
+A review task claims `READ` authority in the Work Registry; a code-writing task
+must declare its scope explicitly (`--mode write --write <path>...`) and is
+refused without one. A prompt is submitted exactly once: re-running the same
+task id resumes from the durable checkpoint and never duplicates the prompt,
+and an ambiguous acknowledgement holds the task `UNKNOWN` rather than
+re-sending it. Completion hands back with the observed repository HEAD.
+
+`./cao status` merges the durable service record with the latest task record;
+on a fresh clone it reports `NOT_STARTED` — CAO never invents a running
+service. Without a product configuration these commands report explicit
+`UNAVAILABLE` and a nonzero exit; they never fabricate progress, handback or
+a process.
+
+## The orchestration daemon
+
+```sh
+./cao daemon start
+./cao daemon status
+./cao daemon stop
+```
+
+A CAO-owned, user-level loop: durable desired/observed state, one idempotent
+reconciliation tick per interval, a deduplicated manager wake, and bounded
+retries that hold `UNKNOWN` instead of fabricating completion.
 
 ## Next steps
 
 - [`installation.md`](installation.md) — flags, paths and the security model.
 - [`operators.md`](operators.md) — the read-only control-plane CLI.
+- [`product-pilot.md`](product-pilot.md) — the real disposable-workspace pilot.
