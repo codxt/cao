@@ -38,11 +38,40 @@ __all__ = [
     "load_config",
     "write_config",
     "initialize_config",
+    "TASK_SECTION",
+    "DEFAULT_WORKSPACE_LABEL_PREFIX",
+    "DEFAULT_RUNNER_TIMEOUT",
+    "DEFAULT_START_TIMEOUT_MS",
+    "DEFAULT_PROMPT_TIMEOUT_MS",
+    "DEFAULT_WAIT_TIMEOUT_MS",
+    "DEFAULT_READ_LINES",
+    "DEFAULT_MAX_OUTPUT_CHARS",
+    "DEFAULT_RUN_ID",
+    "REGISTRY_ATTACH_GOVERNED",
+    "TaskDefaults",
+    "task_defaults",
+    "registry_db_path",
 ]
 
 SCHEMA = "cao.product.config.v0"
 APP_DIR = "cao"
 CONFIG_FILENAME = "config.json"
+
+#: The optional ``task`` section of the product configuration. It carries the
+#: operator's explicit task defaults; every field has a safe fallback.
+TASK_SECTION = "task"
+DEFAULT_WORKSPACE_LABEL_PREFIX = "cao-review-"
+DEFAULT_RUNNER_TIMEOUT = 30.0
+DEFAULT_START_TIMEOUT_MS = 120_000
+DEFAULT_PROMPT_TIMEOUT_MS = 300_000
+DEFAULT_WAIT_TIMEOUT_MS = 300_000
+DEFAULT_READ_LINES = 200
+DEFAULT_MAX_OUTPUT_CHARS = 20_000
+DEFAULT_RUN_ID = "cao-product"
+#: The only registry attach policy: every product task attaches to the single
+#: governed ledger (whose path ``registry_db_path`` resolves). A configuration
+#: naming any other policy is refused rather than silently ignored.
+REGISTRY_ATTACH_GOVERNED = "governed"
 
 
 class ProductConfigError(Exception):
@@ -209,3 +238,155 @@ def initialize_config(
     loaded = load_config(resolved)
     assert loaded is not None  # just written or already present
     return loaded, existing is None
+
+
+# ---------------------------------------------------------------------------
+# Task defaults (task-orchestration lane)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TaskDefaults:
+    """Validated task defaults for the product flow.
+
+    ``agent_kind`` is the runtime's canonical agent kind to start; it falls
+    back to the configured provider CLI. It is ``None`` when neither is set,
+    and the task layer then reports the task layer unavailable rather than
+    guessing a kind.
+    """
+
+    agent_kind: str | None
+    agent_args: tuple[str, ...]
+    workspace_label_prefix: str
+    runner_timeout: float
+    start_timeout_ms: int
+    prompt_timeout_ms: int
+    wait_timeout_ms: int
+    read_lines: int
+    max_output_chars: int
+    run_id: str
+    registry_attach: str
+
+
+def _positive_number(value: Any, what: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ProductConfigError(f"{what} must be a positive number")
+    return float(value)
+
+
+def _positive_int(value: Any, what: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProductConfigError(f"{what} must be a positive integer")
+    return value
+
+
+def _string_tuple(value: Any, what: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ProductConfigError(f"{what} must be an array of strings")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ProductConfigError(f"{what} must contain non-empty strings")
+        out.append(item)
+    return tuple(out)
+
+
+def task_defaults(
+    config: ProductConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> TaskDefaults:
+    """Read and validate the optional task defaults, failing closed on defect."""
+
+    raw: dict[str, Any] = {}
+    if config is not None:
+        section = config.raw.get(TASK_SECTION)
+        if section is not None:
+            if not isinstance(section, Mapping):
+                raise ProductConfigError("task must be an object")
+            raw = dict(section)
+
+    provider_cli = None
+    if config is not None and config.provider is not None:
+        provider_cli = config.provider.cli
+    agent_kind = raw.get("agent_kind") if raw.get("agent_kind") is not None else provider_cli
+    agent_kind = _optional_nonempty_str(agent_kind, "task.agent_kind")
+
+    prefix = (
+        _optional_nonempty_str(
+            raw.get("workspace_label_prefix"), "task.workspace_label_prefix"
+        )
+        or DEFAULT_WORKSPACE_LABEL_PREFIX
+    )
+    if prefix.startswith("-"):
+        raise ProductConfigError(
+            "task.workspace_label_prefix must not start with '-'"
+        )
+
+    attach = (
+        _optional_nonempty_str(raw.get("registry_attach"), "task.registry_attach")
+        or REGISTRY_ATTACH_GOVERNED
+    )
+    if attach != REGISTRY_ATTACH_GOVERNED:
+        raise ProductConfigError(
+            f"task.registry_attach must be {REGISTRY_ATTACH_GOVERNED!r}; no other "
+            f"ledger policy is supported"
+        )
+
+    return TaskDefaults(
+        agent_kind=agent_kind,
+        agent_args=_string_tuple(raw.get("agent_args"), "task.agent_args"),
+        workspace_label_prefix=prefix,
+        runner_timeout=_positive_number(
+            raw.get("runner_timeout"), "task.runner_timeout", DEFAULT_RUNNER_TIMEOUT
+        ),
+        start_timeout_ms=_positive_int(
+            raw.get("start_timeout_ms"),
+            "task.start_timeout_ms",
+            DEFAULT_START_TIMEOUT_MS,
+        ),
+        prompt_timeout_ms=_positive_int(
+            raw.get("prompt_timeout_ms"),
+            "task.prompt_timeout_ms",
+            DEFAULT_PROMPT_TIMEOUT_MS,
+        ),
+        wait_timeout_ms=_positive_int(
+            raw.get("wait_timeout_ms"), "task.wait_timeout_ms", DEFAULT_WAIT_TIMEOUT_MS
+        ),
+        read_lines=_positive_int(
+            raw.get("read_lines"), "task.read_lines", DEFAULT_READ_LINES
+        ),
+        max_output_chars=_positive_int(
+            raw.get("max_output_chars"),
+            "task.max_output_chars",
+            DEFAULT_MAX_OUTPUT_CHARS,
+        ),
+        run_id=_optional_nonempty_str(raw.get("run_id"), "task.run_id")
+        or DEFAULT_RUN_ID,
+        registry_attach=attach,
+    )
+
+
+def registry_db_path(env: Mapping[str, str] | None = None) -> str:
+    """The Work Registry ledger the product task layer attaches to.
+
+    ``CAO_REGISTRY_DB`` overrides the path; otherwise the shared default
+    (itself honouring ``XDG_STATE_HOME``) is used, so the governed ledger is
+    the single claim book and no second ledger is ever created.
+    """
+
+    source = os.environ if env is None else env
+    override = source.get("CAO_REGISTRY_DB")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    from . import registry as _registry
+
+    base = source.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(os.path.abspath(base), _registry.APP_DIR, _registry.DB_NAME)
