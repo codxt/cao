@@ -129,7 +129,8 @@ PY
   model, and a prompt acknowledgement would not prove a running task.
   `task.agent_args` is an advanced explicit override; if you set it, ensure
   it selects the intended model and suitable non-interactive harness.
-- `cli` must be on `PATH`; `id` must appear in the CLI's authenticated list.
+- `cli` must be on `PATH`; `id` must name an authenticated account as printed
+  by the CLI (for example `OpenCode-Go`), not the CLI executable's own name.
 - CAO never reads or stores the credential itself. If authentication cannot be
   positively verified, `doctor` stays `NOT_READY`.
 

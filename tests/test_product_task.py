@@ -516,6 +516,34 @@ class WriteCompletionScopeTests(TaskCase):
         self.assertEqual(result["error"]["code"], "TASK_WRITE_RESULT_UNVERIFIED")
         self.assert_claim_open()
 
+    def test_write_finish_closes_own_pane_before_release(self):
+        self.begin()
+        (self.write_repo / "a.txt").write_text("committed\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task output")
+        result = self.finish()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["pane_closed"], "w1:p1")
+        self.assertEqual(self.driver.names().count("pane_close"), 1)
+        self.assert_claim_released()
+
+    def test_write_finish_with_unclosed_pane_keeps_claim(self):
+        class RefusingClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                raise product_driver.DriverError("runtime refused close")
+
+        self.driver = RefusingClose()
+        self.kwargs["driver"] = self.driver
+        self.begin()
+        (self.write_repo / "a.txt").write_text("committed\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task output")
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assert_claim_open()
+
     def test_in_scope_commit_reuses_claim_and_finishes(self):
         original = self.git("rev-parse", "HEAD")
         self.begin()
@@ -771,6 +799,41 @@ class CompletionAndStopTests(TaskCase):
         self.assertEqual(second["refusal"]["status"], "CONFLICT")
         self.assertNotIn("agent_start", other.names())
         self.assertNotIn("agent_prompt", other.names())
+
+    def test_stop_wrong_workspace_must_keep_claim(self) -> None:
+        class ForeignPane(FakeDriver):
+            def pane_get(self, pane_id):
+                self._note("pane_get", pane_id)
+                return {"pane_id": pane_id, "workspace_id": "another-workspace"}
+
+        driver = ForeignPane()
+        started = self.run_read(driver)
+        result = product_task.stop_task(
+            driver=driver, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(result["claim"].get("released"))
+
+    def test_stop_missing_workspace_identity_must_keep_claim(self) -> None:
+        class UnprovenPane(FakeDriver):
+            def pane_get(self, pane_id):
+                self._note("pane_get", pane_id)
+                return {"pane_id": pane_id, "workspace_id": None}
+
+        driver = UnprovenPane()
+        started = self.run_read(driver)
+        record = product_state.read_task(started["task_id"], self.env)
+        record["checkpoint"]["workspace_id"] = None
+        product_state.write_task(record, self.env)
+        result = product_task.stop_task(
+            driver=driver, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(result["claim"].get("released"))
 
     def test_stop_without_runtime_does_not_fake_pane_close(self) -> None:
         driver = FakeDriver()

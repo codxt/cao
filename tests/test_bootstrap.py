@@ -294,6 +294,15 @@ class CredentialProbeTests(BootstrapCase):
         section = self._doctor("abcde", "a b c d e\n")
         self.assertEqual(section["status"], "UNVERIFIED")
 
+    def test_cli_name_is_never_an_authenticated_account(self) -> None:
+        section = self._doctor("opencode", "opencode auth list\nno accounts are authenticated\n")
+        self.assertEqual(section["status"], "UNVERIFIED")
+
+    def test_cli_name_does_not_match_other_authenticated_accounts(self) -> None:
+        section = self._doctor("opencode", "OpenCode Go  OpenCode Go    stored\nAgentRouter  AgentRouter stored\n")
+        self.assertEqual(section["status"], "UNVERIFIED")
+        self.assertEqual(self._doctor("OpenCode-Go", "OpenCode Go OpenCode Go stored\n")["status"], "VERIFIED")
+
     def test_verified_provider_and_runtime_is_ready(self) -> None:
         self.write_config(
             {

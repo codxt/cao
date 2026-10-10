@@ -832,7 +832,7 @@ def _normalized_token(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
 
-def _authenticated_ids(stdout: str) -> set[str]:
+def _authenticated_ids(stdout: str, cli: str) -> set[str]:
     """Every identifier the probe's own output can honestly name.
 
     A provider's entry in an authenticated list can print a display name with
@@ -850,6 +850,10 @@ def _authenticated_ids(stdout: str) -> set[str]:
     for size in range(2, _MAX_ID_TOKENS + 1):
         for start in range(0, max(len(tokens) - size + 1, 0)):
             candidates.add("".join(tokens[start:start + size]))
+    # The CLI spelling can appear in a banner or as one token inside a
+    # different account name (e.g. OpenCode in OpenCode Go). Neither proves
+    # authentication to an account named after the CLI itself.
+    candidates.discard(_normalized_token(cli))
     return candidates
 
 
@@ -882,7 +886,7 @@ def _credentials_section(
             "reason": "the credential probe did not exit successfully",
         }
     configured = _normalized_token(provider.provider_id)
-    if configured and configured in _authenticated_ids(result.stdout):
+    if configured and configured in _authenticated_ids(result.stdout, provider.cli):
         return {
             "status": "VERIFIED",
             "reason": "the configured provider id is present in the authenticated list",

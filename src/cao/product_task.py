@@ -768,6 +768,35 @@ def _write_completion_error(
     return None
 
 
+def _close_owned_pane(driver, record):
+    """Confirm exact task-owned pane closure before releasing WRITE ownership."""
+    checkpoint = record.get("checkpoint") or {}
+    pane_id = checkpoint.get("pane_id")
+    workspace_id = checkpoint.get("workspace_id")
+    if not isinstance(pane_id, str) or not pane_id:
+        if checkpoint.get("agent_started") or checkpoint.get("prompt_issued"):
+            return None, "started agent has no verified pane identity"
+        return None, None
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return None, "task workspace identity is unavailable"
+    if driver is None:
+        return None, "runtime driver unavailable; pane closure not verified"
+    try:
+        pane = driver.pane_get(pane_id)
+    except product_driver.DriverNotFound:
+        return pane_id, None
+    except product_driver.DriverError as exc:
+        return None, str(exc)
+    if (not isinstance(pane, Mapping) or pane.get("pane_id") != pane_id
+            or pane.get("workspace_id") != workspace_id):
+        return None, "pane identity or workspace identity mismatch"
+    try:
+        driver.pane_close(pane_id)
+    except product_driver.DriverError as exc:
+        return None, str(exc)
+    return pane_id, None
+
+
 def _finish(
     conn: Any,
     driver: product_driver.RuntimeDriver,
@@ -815,6 +844,26 @@ def _finish(
                     _save(record, env, clock)
                     return task_payload(record)
             _observe(driver, record, env, clock, defaults)
+            if record["mode"] == registry.WRITE:
+                closed, error = _close_owned_pane(driver, record)
+                if error is not None:
+                    record["status"] = "blocked"
+                    record["error"] = {
+                        "code": "TASK_PANE_CLOSE_FAILED",
+                        "message": "WRITE agent was not proven stopped; claim retained",
+                        "detail": error,
+                    }
+                    _save(record, env, clock)
+                    return task_payload(record)
+                record["pane_closed"] = closed
+                # Closing a worker is a boundary. Check source state again
+                # because the previous Git probe ran while it was alive.
+                failure = _write_completion_error(conn, record, head, branch)
+                if failure is not None:
+                    record["status"] = "blocked"
+                    record["error"] = {"code": failure[0], "message": failure[1]}
+                    _save(record, env, clock)
+                    return task_payload(record)
             released = registry.release(
                 conn,
                 record["run_id"],
@@ -975,29 +1024,7 @@ def stop_task(
         _save(record, env, clock)
         return task_payload(record)
 
-    checkpoint = dict(record.get("checkpoint") or {})
-    pane_id = checkpoint.get("pane_id")
-    closed = None
-    close_error = (
-        "runtime driver unavailable; cannot verify task-owned pane closure"
-        if pane_id and driver is None else None
-    )
-    if driver is not None and pane_id:
-        try:
-            pane = driver.pane_get(pane_id)
-        except product_driver.DriverError as exc:
-            close_error = str(exc)
-        else:
-            if isinstance(pane, Mapping) and pane.get("workspace_id") == checkpoint.get(
-                "workspace_id"
-            ):
-                try:
-                    driver.pane_close(pane_id)
-                    closed = pane_id
-                except product_driver.DriverError as exc:
-                    close_error = str(exc)
-            # Unknown or foreign ownership: never close that pane. Preserve
-            # the existing skip behavior for a pane not owned by this task.
+    closed, close_error = _close_owned_pane(driver, record)
 
     if close_error is not None:
         # IMPORTANT: claim release comes AFTER confirmed pane closure.
