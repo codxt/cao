@@ -87,6 +87,29 @@ State is stored privately under the XDG CAO state root in teams/team_id.json
 releases that lock but preserves exact task execution IDs and prompts, so
 resumption does not blindly resubmit an already issued prompt.
 
+## Verified terminal results
+
+A prompt being accepted and the model being IDLE does not mean the work
+is complete. Team Execution's product adapter keeps the original task and
+claim RUNNING until the runtime reports post-prompt DONE and the specialist's
+actual output contains a task-specific receipt. The prompt contains a
+16-character challenge but not the completed receipt; the specialist must
+reverse the challenge and emit the required standalone CAO_TEAM_RESULT: line
+only after successful work. An unreadable or missing receipt holds UNKNOWN
+instead of unblocking dependents. The single-task core also no longer
+accepts a pre-response IDLE state as completion.
+
+The receipt proves that a post-prompt response was observed; it is not a
+security signature, approval, guarantee of correctness, or proof that tests
+passed. Repository, Registry, scope, commit, review, human approval, and
+release gates remain independently required. A provider credit denial,
+transport failure or model output without the receipt must be investigated
+rather than retried under a new task identity.
+
+Team task agent names use a readable prefix and digest of their full ID.
+This prevents longer team/task names from colliding after terminal name-length
+truncation. The original task record remains the idempotency authority.
+
 ## Handoffs, review and correction
 
 A task starts only after every declared dependency completes. Its prompt

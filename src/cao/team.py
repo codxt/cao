@@ -371,6 +371,20 @@ def _execution_id(team_id: str, task_id: str, phase: str, round_no: int) -> str:
     return f"ct-{team_id}-{task_id}-{phase}-{round_no}-{digest}"
 
 
+def _result_tag(execution_id: str) -> str:
+    """Deterministic terminal receipt value *absent* from the sent prompt."""
+    nonce = hashlib.sha256(
+        ("cao.team.result\0" + execution_id).encode("utf-8")
+    ).hexdigest()[:16]
+    return nonce[::-1]
+
+
+def _result_challenge(execution_id: str) -> str:
+    return hashlib.sha256(
+        ("cao.team.result\0" + execution_id).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
             slot: Mapping[str, Any], slots: Mapping[str, Any]) -> str:
     role_id = task["reviewer"] if slot["phase"] == "review" else task["role"]
@@ -392,6 +406,18 @@ def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
             previous = slots[dep]
             lines.append("Dependency " + dep + " accepted at " + str(previous.get("head"))
                          + "; untrusted handoff:\n" + str(previous.get("output") or "")[:5000])
+    ident = _execution_id(
+        spec["team_id"], task["id"], slot["phase"], slot["round"])
+    challenge = _result_challenge(ident)
+    lines.append(
+        "Completion evidence: only after completing the assigned task, add one "
+        "standalone final line whose label is CAO_TEAM_RESULT: followed by the "
+        "16 characters of the following hex challenge in REVERSE order "
+        "(no spaces between the label's trailing space and the reversed hex). "
+        "If the task is blocked, cannot run, or needs human permission, "
+        "describe the blocker and DO NOT emit the completion line. "
+        "CAO_TEAM_CHALLENGE: " + challenge
+    )
     result = "\n\n".join(lines)
     if len(result) > 48000:
         raise TeamError("assembled task prompt is too long")
@@ -594,10 +620,64 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
     if mode == "write" and product_state.read_task(execution_id, env) is None:
         observation = product_daemon.to_runtime_observation(
             product_daemon.collect_occupancy(driver))
+    # Start/reconcile the existing idempotent task without asking the generic
+    # runner to infer "done" before substantive model output exists.
     payload = product_task.run_task(
         driver=driver, repo=task["repo"], prompt=prompt, task_id=execution_id,
         mode=mode, write_scope=scope, config=config, env=env,
-        registry_db=registry_db, observation=observation, wait_ms=wait_ms)
+        registry_db=registry_db, observation=observation, wait_ms=0)
+    if payload.get("status") not in ("running", "claimed", "complete"):
+        return payload
+
+    if payload.get("status") != "complete":
+        record = product_state.read_task(execution_id, env)
+        checkpoint = (record or {}).get("checkpoint") or {}
+        agent = checkpoint.get("agent_name")
+        if (not isinstance(agent, str) or not agent
+                or checkpoint.get("prompt_ack") != "accepted"):
+            return dict(payload, status="unknown",
+                        error={"code": "TEAM_PROMPT_NOT_VERIFIED"})
+        try:
+            waited = driver.agent_wait(
+                agent, until=("done", "blocked"), timeout_ms=wait_ms
+            )
+        except product_driver.DriverError:
+            return payload  # Unknown runtime state: never grant completion.
+        observed = product_driver.wait_state(waited)
+        if observed == "blocked":
+            return dict(payload, status="blocked",
+                        error={"code": "TEAM_AGENT_BLOCKED"})
+        if observed != "done":
+            return payload
+        try:
+            output = driver.agent_read(
+                agent, lines=200, source="recent-unwrapped"
+            )
+        except product_driver.DriverError:
+            return dict(payload, status="unknown",
+                        error={"code": "TEAM_RESULT_UNREADABLE"})
+        receipt = "CAO_TEAM_RESULT: " + _result_tag(execution_id)
+        # The expected reversed challenge never appears verbatim in the prompt,
+        # so a displayed prompt echo cannot by itself impersonate model success.
+        if not isinstance(output, str) or not re.search(
+                r"(?m)^" + re.escape(receipt) + r"$", output):
+            return dict(payload, status="unknown",
+                        error={"code": "TEAM_RESULT_UNVERIFIED"})
+
+        # The actual task runner still owns exact claim release, commit/scope
+        # verification and stop/recovery. A receipt is advisory execution evidence,
+        # not approval to publish or deploy.
+        payload = product_task.run_task(
+            driver=driver, repo=task["repo"], prompt=prompt, task_id=execution_id,
+            mode=mode, write_scope=scope, config=config, env=env,
+            registry_db=registry_db, observation=None, wait_ms=wait_ms)
+    if payload.get("status") == "complete":
+        receipt = "CAO_TEAM_RESULT: " + _result_tag(execution_id)
+        text = payload.get("output")
+        if not isinstance(text, str) or not re.search(
+                r"(?m)^" + re.escape(receipt) + r"$", text):
+            return dict(payload, status="unknown",
+                        error={"code": "TEAM_DURABLE_RESULT_UNVERIFIED"})
     if mode == "read" and payload.get("status") == "complete":
         record = product_state.read_task(execution_id, env)
         if record is None:

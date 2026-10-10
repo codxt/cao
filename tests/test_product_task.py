@@ -158,6 +158,17 @@ class IdentityTests(TaskCase):
         three = product_task.task_id_for(str(self.repo), "p", ["src/a.py"])
         self.assertNotEqual(one, three)
 
+    def test_long_team_agent_names_bind_full_task_identity(self) -> None:
+        left = "ct-client-readiness-recon-20261011-factory-read-work-0-abc00000"
+        right = "ct-client-readiness-recon-20261011-brainux-read-work-0-def00000"
+        first = product_task._agent_name(left)
+        second = product_task._agent_name(right)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, product_task._agent_name(left))
+        self.assertLessEqual(len(first), 32)
+        self.assertTrue(first.startswith("cao"))
+        self.assertTrue(second.startswith("cao"))
+
     def test_default_agent_kind_falls_back_to_provider_cli(self) -> None:
         defaults = product_config.task_defaults(self.config)
         self.assertEqual(defaults.agent_kind, "opencode")
@@ -230,6 +241,28 @@ class ReadFlowTests(TaskCase):
         self.addCleanup(conn.close)
         rows = conn.execute("SELECT mode FROM claims").fetchall()
         self.assertEqual([row["mode"] for row in rows], ["READ"])
+
+    def test_idle_after_prompt_is_not_completion_and_does_not_release_read(self) -> None:
+        # The live runtime can acknowledge prompt while still reporting idle.
+        # A caller must not advance task dependencies before a real DONE.
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        repo = git_repo(self.root, name="tracked-read")
+        args = dict(driver=driver, repo=str(repo), prompt="Read tracked repo",
+                    config=self.config, env=self.env,
+                    registry_db=self.db, wait_ms=1000)
+        first = product_task.run_task(**args)
+        self.assertEqual(first["status"], "running")
+        self.assertFalse(first["claim"].get("released", False))
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        driver.wait_state = "done"
+        second = product_task.run_task(**args)
+        self.assertEqual(second["status"], "complete")
+        self.assertTrue(second["claim"]["released"])
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        calls = [call for call in driver.calls if call[0] == "agent_wait"]
+        self.assertTrue(calls)
+        self.assertEqual(len(calls), 2)
 
     def test_rerun_same_id_resumes_without_duplicating(self) -> None:
         driver = FakeDriver()

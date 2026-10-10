@@ -364,31 +364,126 @@ class TeamTests(unittest.TestCase):
                             x.get("status") == "UNKNOWN"
                             for x in result["effects"]))
 
-    def test_team_read_agent_pane_must_be_closed_before_handback(self):
+    def test_team_missing_real_result_receipt_never_marks_read_complete(self):
+        # A runtime can return DONE without actually producing a useful model
+        # answer (quota denied, boot splash, malformed prompt).
+        ident = "ct-test-team-actor-work-0"
+        driver = FakeDriver()
+        driver.read_text = "Model credits exhausted. Agent done."
+        record = {"checkpoint": {"agent_name": "actor", "prompt_ack": "accepted"}}
+        with mock.patch("cao.product_task.run_task", return_value={
+                    "status": "running", "claim": {"released": False}}) as launched, \
+                mock.patch("cao.product_state.read_task", return_value=record):
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt="read task", phase="work", config=self.config,
+                driver=driver, env=self.env, wait_ms=1000, registry_db="unused")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"], "TEAM_RESULT_UNVERIFIED")
+        launched.assert_called_once()
+        self.assertEqual(launched.call_args.kwargs["wait_ms"], 0)
+
+    def test_recovered_complete_with_receipt_rechecks_read_pane_close(self):
+        ident = "ct-test-team-actor-work-0"
+        answer = "CAO_TEAM_RESULT: " + team._result_tag(ident)
         payload = {"status": "complete", "claim": {
-            "released": True, "released_head": A}, "output": "analysis"}
+            "released": True, "released_head": A}, "output": answer}
+        record = {"checkpoint": {"agent_name": "reader",
+                                 "workspace_id": "w9", "pane_id": "w9:p1"}}
+        with mock.patch("cao.product_task.run_task", return_value=payload) as run, \
+                mock.patch("cao.product_state.read_task", return_value=record), \
+                mock.patch("cao.product_task._close_owned_pane",
+                           return_value=("w9:p1", None)) as close, \
+                mock.patch("cao.product_state.update_task") as saved:
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt="read task", phase="work", config=self.config,
+                driver=FakeDriver(), env=self.env, wait_ms=1000,
+                registry_db="unused")
+        self.assertEqual(result["status"], "complete")
+        run.assert_called_once()
+        close.assert_called_once()
+        saved.assert_called_once()
+
+    def test_already_terminal_task_without_durable_receipt_cannot_advance_team(self):
+        ident = "ct-test-team-actor-work-0"
+        payload = {"status": "complete", "claim": {
+            "released": True, "released_head": A}, "output": "only terminal splash"}
+        with mock.patch("cao.product_task.run_task", return_value=payload) as runner:
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt="read task", phase="work", config=self.config,
+                driver=FakeDriver(), env=self.env, wait_ms=1000,
+                registry_db="unused")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"], "TEAM_DURABLE_RESULT_UNVERIFIED")
+        runner.assert_called_once()
+
+    def test_team_idle_before_answer_remains_running_and_reuses_prompt(self):
+        ident = "ct-test-team-actor-work-0"
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        record = {"checkpoint": {"agent_name": "actor", "prompt_ack": "accepted"}}
+        with mock.patch("cao.product_task.run_task", return_value={
+                    "status": "running", "claim": {"released": False}}) as launched, \
+                mock.patch("cao.product_state.read_task", return_value=record):
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt="read task", phase="work", config=self.config,
+                driver=driver, env=self.env, wait_ms=1000, registry_db="unused")
+        self.assertEqual(result["status"], "running")
+        launched.assert_called_once()
+        self.assertNotIn("pane_close", driver.names())
+
+    def test_receipt_token_not_present_in_submitted_prompt(self):
+        spec = self.spec([task("a", self.paths[0], mode="read")])
+        normalized = team.validate_spec(spec)
+        slot = {"phase": "work", "round": 0, "output": None}
+        prompt = team._prompt(normalized["tasks"][0], normalized, slot, {})
+        ident = team._execution_id("squad", "a", "work", 0)
+        import re
+        challenge = re.search(r"CAO_TEAM_CHALLENGE: ([0-9a-f]{16})", prompt)
+        self.assertIsNotNone(challenge)
+        self.assertEqual(challenge.group(1)[::-1], team._result_tag(ident))
+        self.assertNotIn("CAO_TEAM_RESULT: " + team._result_tag(ident), prompt)
+
+    def test_team_read_agent_pane_must_be_closed_before_handback(self):
+        ident = "ct-squad-read-work-0"
+        payload = {"status": "complete", "claim": {
+            "released": True, "released_head": A},
+            "output": "analysis\nCAO_TEAM_RESULT: " + team._result_tag("ct-squad-read-work-0")}
         checkpoint = {"checkpoint": {"workspace_id": "ws1",
-                                      "pane_id": "ws1:p1"}}
-        with mock.patch("cao.product_task.run_task", return_value=payload), \
+                                      "pane_id": "ws1:p1",
+                                      "agent_name": "test-reader",
+                                      "prompt_ack": "accepted"}}
+        driver = FakeDriver()
+        driver.read_text = "CAO_TEAM_RESULT: " + team._result_tag(ident)
+        with mock.patch("cao.product_task.run_task", side_effect=[
+                {"status": "running"}, payload]), \
                 mock.patch("cao.product_state.read_task", return_value=checkpoint), \
                 mock.patch("cao.product_task._close_owned_pane", return_value=("ws1:p1", None)), \
                 mock.patch("cao.product_state.update_task") as updated:
             result = team._execute(
-                execution_id="ct-squad-read-work-0",
+                execution_id=ident,
                 task={"repo": self.paths[0], "mode": "read", "write_scope": []},
                 prompt="read", phase="work", config=self.config,
-                driver=None, env=self.env, wait_ms=1000, registry_db="ignored")
+                driver=driver, env=self.env, wait_ms=1000, registry_db="ignored")
         self.assertEqual(result["status"], "complete")
         updated.assert_called_once()
 
-        with mock.patch("cao.product_task.run_task", return_value=payload), \
+        with mock.patch("cao.product_task.run_task", side_effect=[
+                {"status": "running"}, payload]), \
                 mock.patch("cao.product_state.read_task", return_value=checkpoint), \
                 mock.patch("cao.product_task._close_owned_pane", return_value=(None, "still alive")):
             result = team._execute(
-                execution_id="ct-squad-read-work-0",
+                execution_id=ident,
                 task={"repo": self.paths[0], "mode": "read", "write_scope": []},
                 prompt="read", phase="work", config=self.config,
-                driver=None, env=self.env, wait_ms=1000, registry_db="ignored")
+                driver=driver, env=self.env, wait_ms=1000, registry_db="ignored")
         self.assertEqual(result["status"], "unknown")
 
     def test_manual_resume_unknown_reuses_exact_execution_identity(self):
@@ -447,6 +542,82 @@ class TeamTests(unittest.TestCase):
         result = self.tick(lambda **kw: ["not-a-task"])
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(result["tasks"]["a"]["error"], "TASK_PAYLOAD_INVALID")
+
+    def test_real_read_quota_denial_keeps_exact_open_claim_and_single_prompt(self):
+        # Real product_task + Git + SQLite Registry, with deterministic fake
+        # runtime returning DONE but no verified model answer receipt.
+        repo = git_repo(self.root, name="no-credit")
+        db = str(self.root / "no-credit-ledger.sqlite3")
+        driver = FakeDriver()
+        driver.read_text = "Model requires credits. No generation occurred."
+        ident = "ct-no-credit-real-work-0"
+        opts = dict(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source and emit a computed challenge receipt",
+            phase="work", config=self.config, driver=driver, env=self.env,
+            registry_db=db, wait_ms=1000,
+        )
+        first = team._execute(**opts)
+        self.assertEqual(first["status"], "unknown", first)
+        self.assertEqual(first["error"]["code"], "TEAM_RESULT_UNVERIFIED")
+        second = team._execute(**opts)
+        self.assertEqual(second["status"], "unknown", second)
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertIsNone(record.get("pane_closed"))
+        c = registry.connect_readonly(db)
+        try:
+            claims = c.execute(
+                "SELECT mode,released_at FROM claims ORDER BY claim_id"
+            ).fetchall()
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0]["mode"], "READ")
+            self.assertIsNone(claims[0]["released_at"])
+        finally:
+            c.close()
+
+    def test_blocked_runtime_does_not_release_team_claim(self):
+        driver = FakeDriver()
+        driver.wait_state = "blocked"
+        ident = "ct-blocked-runtime-work-0"
+        record = {"checkpoint": {"agent_name": "agent",
+                                 "prompt_ack": "accepted"}}
+        with mock.patch("cao.product_task.run_task",
+                        return_value={"status": "running",
+                                      "claim": {"released": False}}) as run, \
+                mock.patch("cao.product_state.read_task", return_value=record):
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt="read", phase="work", config=self.config,
+                driver=driver, env=self.env, wait_ms=1000, registry_db="unused")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TEAM_AGENT_BLOCKED")
+        run.assert_called_once()
+
+    def test_unreadable_runtime_result_cannot_advance_or_release(self):
+        driver = FakeDriver()
+        def unreadable(*args, **kwargs):
+            from cao.product_driver import DriverTransportError
+            raise DriverTransportError("transient")
+        driver.agent_read = unreadable
+        record = {"checkpoint": {"agent_name": "agent",
+                                 "prompt_ack": "accepted"}}
+        with mock.patch("cao.product_task.run_task",
+                        return_value={"status": "running",
+                                      "claim": {"released": False}}) as run, \
+                mock.patch("cao.product_state.read_task", return_value=record):
+            result = team._execute(
+                execution_id="ct-read-error-work-0",
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt="read", phase="work", config=self.config,
+                driver=driver, env=self.env, wait_ms=1000, registry_db="unused")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"], "TEAM_RESULT_UNREADABLE")
+        run.assert_called_once()
 
     def test_real_git_registry_and_runtime_adapter_team_write_then_review(self):
         # This is the actual product_task/Registry integration with real
@@ -512,6 +683,12 @@ class TeamTests(unittest.TestCase):
                         "CAO_REVIEW_VERDICT: APPROVED\nCAO_REVIEWED_HEAD: "
                         + git("rev-parse", "HEAD")
                     )
+                challenge = team._result_challenge(
+                    team._execution_id("squad", "feature",
+                                       "review" if "Role: Independently review commits" in text
+                                       else "work", 0)
+                )
+                self.read_text += "\nCAO_TEAM_RESULT: " + challenge[::-1]
                 return super().agent_prompt(
                     target, text, timeout_ms=timeout_ms, wait=wait)
 
@@ -761,6 +938,12 @@ class TeamTests(unittest.TestCase):
                         "CAO_REVIEW_VERDICT: " + verdict
                         + "\nCAO_REVIEWED_HEAD: " + git("rev-parse", "HEAD")
                     )
+                # Derive the requested receipt from the *prompt challenge*,
+                # never paste an already completed receipt into the prompt.
+                import re
+                shown = re.search(r"CAO_TEAM_CHALLENGE: ([0-9a-f]{16})", prompt)
+                assert shown is not None
+                self.read_text += "\nCAO_TEAM_RESULT: " + shown.group(1)[::-1]
                 return super().agent_prompt(
                     target, prompt, timeout_ms=timeout_ms, wait=wait)
 

@@ -28,6 +28,7 @@ Fail-closed rules this module enforces:
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Mapping
 from typing import Any, Callable
@@ -126,7 +127,14 @@ def _agent_name(task_id: str) -> str:
     base = "".join(ch for ch in task_id.lower() if ch.isalnum() or ch in "-_")
     if not base or not base[0].isalpha():
         base = "t" + base
-    return ("cao" + base)[:32]
+    name = "cao" + base
+    if len(name) <= 32:
+        return name
+    # The team task ID contains its unambiguous digest at the *end*. Pure
+    # truncation collapses many sibling tasks to the same agent identity.
+    # Preserve a readable prefix and a task-ID-bound suffix instead.
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:12]
+    return name[:19] + "-" + digest
 
 
 def _repo_head_and_branch(repo: str) -> tuple[str | None, str | None]:
@@ -828,7 +836,7 @@ def _finish(
         try:
             result = driver.agent_wait(
                 checkpoint["agent_name"],
-                until=("idle", "done", "blocked"),
+                until=("done", "blocked"),
                 timeout_ms=effective_wait,
             )
             state = product_driver.wait_state(result)
@@ -857,7 +865,10 @@ def _finish(
     # If the pane closed and the Registry refused release, agent_wait can no
     # longer find that agent. Retain its original claim and recover by proving
     # the same closed pane plus committed Git result, without restarting it.
-    if state in ("idle", "done") or closed_checkpoint:
+    # Prompt acknowledgement does not mean prompt completion. Some runtimes
+    # report IDLE immediately after accepting a prompt, before the model
+    # starts working. Only post-prompt DONE proves a terminal observation.
+    if state == "done" or closed_checkpoint:
         head, branch = _repo_head_and_branch(record["repo"])
         if head:
             if record["mode"] == registry.WRITE:
