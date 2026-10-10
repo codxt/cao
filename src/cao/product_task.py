@@ -822,6 +822,7 @@ def _finish(
         raise TaskUsageError("wait_ms must be a non-negative integer")
 
     state: str | None = None
+    wait_not_found = False
     if effective_wait > 0:
         checkpoint = record.get("checkpoint") or {}
         try:
@@ -831,6 +832,14 @@ def _finish(
                 timeout_ms=effective_wait,
             )
             state = product_driver.wait_state(result)
+        except product_driver.DriverNotFound as exc:
+            # An asynchronous pane close may have completed after a previous
+            # post-close probe failed. The exact claim, Git result and owned
+            # pane absence still have to pass verification below.
+            wait_not_found = True
+            record["observation"] = {
+                "status": "UNKNOWN", "reason": getattr(exc, "code", None),
+            }
         except product_driver.DriverError as exc:
             record["observation"] = {
                 "status": "UNKNOWN",
@@ -844,7 +853,7 @@ def _finish(
         and isinstance(record.get("pane_closed"), str)
         and bool(record.get("pane_closed"))
         and record.get("pane_closed") == checkpoint.get("pane_id")
-    )
+    ) or (record["mode"] == registry.WRITE and wait_not_found)
     # If the pane closed and the Registry refused release, agent_wait can no
     # longer find that agent. Retain its original claim and recover by proving
     # the same closed pane plus committed Git result, without restarting it.

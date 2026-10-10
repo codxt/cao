@@ -570,6 +570,47 @@ class WriteCompletionScopeTests(TaskCase):
         self.assertEqual(self.driver.names().count("pane_close"), 1)
         self.assert_claim_released()
 
+    def test_async_close_then_not_found_recovers_same_write_claim(self):
+        class DelayedClose(FakeDriver):
+            def __init__(self):
+                super().__init__()
+                self.close_requested = False
+                self.gone = False
+
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                self.close_requested = True
+                return "{}"  # Ack before actual teardown
+
+            def pane_get(self, pane_id):
+                if self.gone:
+                    self._note("pane_get", pane_id)
+                    raise product_driver.DriverNotFound("pane gone")
+                return super().pane_get(pane_id)
+
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                if self.close_requested:
+                    self.gone = True
+                    raise product_driver.DriverNotFound("agent has exited")
+                return super().agent_wait(target, until=until, timeout_ms=timeout_ms)
+
+        self.driver = DelayedClose()
+        self.kwargs["driver"] = self.driver
+        self.begin()
+        (self.write_repo / "a.txt").write_text("committed\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task output")
+        first = self.finish()
+        self.assertEqual(first["status"], "blocked")
+        self.assertEqual(first["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assert_claim_open()
+        second = self.finish()
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(self.driver.names().count("agent_start"), 1)
+        self.assertEqual(self.driver.names().count("agent_prompt"), 1)
+        self.assertEqual(self.driver.names().count("pane_close"), 1)
+        self.assert_claim_released()
+
     def test_noop_pane_close_never_releases_write(self):
         class NoopClose(FakeDriver):
             def pane_close(self, pane_id):
