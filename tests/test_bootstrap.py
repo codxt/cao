@@ -303,6 +303,18 @@ class CredentialProbeTests(BootstrapCase):
         self.assertEqual(section["status"], "UNVERIFIED")
         self.assertEqual(self._doctor("OpenCode-Go", "OpenCode Go OpenCode Go stored\n")["status"], "VERIFIED")
 
+    def test_failure_message_does_not_verify_account(self) -> None:
+        self.assertEqual(
+            self._doctor("opencode-go", "No credentials found for opencode-go\n")["status"],
+            "UNVERIFIED",
+        )
+
+    def test_id_in_middle_of_unrelated_line_is_not_authenticated(self) -> None:
+        self.assertEqual(
+            self._doctor("my-account", "authentication status: no account my-account found\n")["status"],
+            "UNVERIFIED",
+        )
+
     def test_verified_provider_and_runtime_is_ready(self) -> None:
         self.write_config(
             {

@@ -794,7 +794,15 @@ def _close_owned_pane(driver, record):
         driver.pane_close(pane_id)
     except product_driver.DriverError as exc:
         return None, str(exc)
-    return pane_id, None
+    # A successful close request is an acknowledgement, not proof that the
+    # runtime-owned worker process has stopped. Verify the pane is absent.
+    try:
+        driver.pane_get(pane_id)
+    except product_driver.DriverNotFound:
+        return pane_id, None
+    except product_driver.DriverError as exc:
+        return None, "pane closure verification unavailable: " + str(exc)
+    return None, "pane still exists after close acknowledged"
 
 
 def _finish(
@@ -830,7 +838,17 @@ def _finish(
             }
             state = None
 
-    if state in ("idle", "done"):
+    checkpoint = record.get("checkpoint") or {}
+    closed_checkpoint = (
+        record["mode"] == registry.WRITE
+        and isinstance(record.get("pane_closed"), str)
+        and bool(record.get("pane_closed"))
+        and record.get("pane_closed") == checkpoint.get("pane_id")
+    )
+    # If the pane closed and the Registry refused release, agent_wait can no
+    # longer find that agent. Retain its original claim and recover by proving
+    # the same closed pane plus committed Git result, without restarting it.
+    if state in ("idle", "done") or closed_checkpoint:
         head, branch = _repo_head_and_branch(record["repo"])
         if head:
             if record["mode"] == registry.WRITE:

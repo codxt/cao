@@ -40,6 +40,7 @@ class FakeDriver:
         self.wait_state = "done"
         self.read_text = "agent output"
         self.agent_present = False
+        self.closed_panes: set[str] = set()
 
     def _note(self, name, *args, **kwargs):
         self.calls.append((name, args, kwargs))
@@ -64,10 +65,13 @@ class FakeDriver:
 
     def pane_get(self, pane_id):
         self._note("pane_get", pane_id)
+        if pane_id in self.closed_panes:
+            raise product_driver.DriverNotFound("closed pane")
         return {"pane_id": pane_id, "workspace_id": "w1"}
 
     def pane_close(self, pane_id):
         self._note("pane_close", pane_id)
+        self.closed_panes.add(pane_id)
         return "{}"
 
     def agent_start(self, name, kind, pane_id, *, argv=(), timeout_ms=None):
@@ -527,6 +531,51 @@ class WriteCompletionScopeTests(TaskCase):
         self.assertEqual(self.driver.names().count("pane_close"), 1)
         self.assert_claim_released()
 
+    def test_write_retries_release_after_verified_closed_pane(self):
+        class ClosedWait(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                if "w1:p1" in self.closed_panes:
+                    raise product_driver.DriverNotFound("closed worker")
+                return super().agent_wait(target, until=until, timeout_ms=timeout_ms)
+
+        self.driver = ClosedWait()
+        self.kwargs["driver"] = self.driver
+        self.begin()
+        (self.write_repo / "a.txt").write_text("committed\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task output")
+        with patch.object(registry, "release", return_value={
+            "ok": False, "errors": ["temporary ledger refusal"],
+        }):
+            first = self.finish()
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(first["error"]["code"], "TASK_CLAIM_RELEASE_REJECTED")
+        self.assertEqual(first["pane_closed"], "w1:p1")
+        self.assert_claim_open()
+        second = self.finish()
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(self.driver.names().count("agent_start"), 1)
+        self.assertEqual(self.driver.names().count("agent_prompt"), 1)
+        self.assertEqual(self.driver.names().count("pane_close"), 1)
+        self.assert_claim_released()
+
+    def test_noop_pane_close_never_releases_write(self):
+        class NoopClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                return "{}"
+
+        self.driver = NoopClose()
+        self.kwargs["driver"] = self.driver
+        self.begin()
+        (self.write_repo / "a.txt").write_text("committed\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task output")
+        result = self.finish()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assert_claim_open()
+
     def test_write_finish_with_unclosed_pane_keeps_claim(self):
         class RefusingClose(FakeDriver):
             def pane_close(self, pane_id):
@@ -799,6 +848,21 @@ class CompletionAndStopTests(TaskCase):
         self.assertEqual(second["refusal"]["status"], "CONFLICT")
         self.assertNotIn("agent_start", other.names())
         self.assertNotIn("agent_prompt", other.names())
+
+    def test_stop_with_noop_pane_close_retains_claim(self) -> None:
+        class NoopClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                return "{}"
+
+        driver = NoopClose()
+        started = self.run_read(driver)
+        stopped = product_task.stop_task(
+            driver=driver, task_id=started["task_id"], env=self.env, registry_db=self.db,
+        )
+        self.assertEqual(stopped["status"], "running")
+        self.assertEqual(stopped["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertFalse(stopped["claim"].get("released"))
 
     def test_stop_wrong_workspace_must_keep_claim(self) -> None:
         class ForeignPane(FakeDriver):

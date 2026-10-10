@@ -837,19 +837,19 @@ def _authenticated_ids(stdout: str, cli: str) -> set[str]:
 
     A provider's entry in an authenticated list can print a display name with
     spaces (``OpenCode Go``) while the operator configures the CLI's own id
-    (``opencode-go``). Each printed token is a candidate, and so are the joins
-    of up to :data:`_MAX_ID_TOKENS` consecutive tokens, because that is how a
-    multi-word display name reads as one identifier. Nothing outside the
-    printed output is ever a candidate, so a configured id that the CLI did not
-    print cannot match.
+    (``opencode-go``). Accept only a leading identifier on an individual
+    account-list line: its first one to :data:`_MAX_ID_TOKENS` tokens may form
+    a multi-word account name. Banner prose, error messages and joins across
+    lines cannot create an authenticated identity; the executable name alone
+    is also excluded.
     """
 
-    tokens = [_normalized_token(token) for token in stdout.split()]
-    tokens = [token for token in tokens if token]
-    candidates = set(tokens)
-    for size in range(2, _MAX_ID_TOKENS + 1):
-        for start in range(0, max(len(tokens) - size + 1, 0)):
-            candidates.add("".join(tokens[start:start + size]))
+    candidates: set[str] = set()
+    for line in stdout.splitlines():
+        tokens = [_normalized_token(token) for token in line.split()]
+        tokens = [token for token in tokens if token]
+        for size in range(1, min(len(tokens), _MAX_ID_TOKENS) + 1):
+            candidates.add("".join(tokens[:size]))
     # The CLI spelling can appear in a banner or as one token inside a
     # different account name (e.g. OpenCode in OpenCode Go). Neither proves
     # authentication to an account named after the CLI itself.
