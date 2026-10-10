@@ -24,6 +24,10 @@ steps 5-11 are the pilot; "Evidence" says what to keep.
   echoed by CAO; only the CLI, provider id and model are recorded.
 - Close **only** the surfaces this pilot created. Leave every other workspace,
   session and the runtime server untouched.
+- Verify the actual agent process, repository diff, affected paths and final
+  commit before accepting a WRITE pilot. A model status of `idle`/`done`, a
+  prompt acknowledgement, or a CAO claim release alone is insufficient proof
+  that the requested write occurred.
 - Fail closed: if a step's expected output is not seen, stop and record the
   actual output rather than continuing.
 
@@ -116,6 +120,12 @@ json.dump(doc, open(path, "w"), indent=2, sort_keys=True)
 PY
 ```
 
+- For the `opencode` provider, CAO passes the chosen `provider.model` to
+  `opencode mini --standalone --model <provider.model>` automatically. Without
+  this, Herdr may launch the interactive OpenCode TUI at an unrelated default
+  model, and a prompt acknowledgement would not prove a running task.
+  `task.agent_args` is an advanced explicit override; if you set it, ensure
+  it selects the intended model and suitable non-interactive harness.
 - `cli` must be on `PATH`; `id` must appear in the CLI's authenticated list.
 - CAO never reads or stores the credential itself. If authentication cannot be
   positively verified, `doctor` stays `NOT_READY`.

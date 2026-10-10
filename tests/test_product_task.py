@@ -158,6 +158,35 @@ class IdentityTests(TaskCase):
         defaults = product_config.task_defaults(self.config)
         self.assertEqual(defaults.agent_kind, "opencode")
 
+    def test_opencode_provider_model_selects_mini_by_default(self) -> None:
+        defaults = product_config.task_defaults(self.config)
+        self.assertEqual(
+            defaults.agent_args,
+            ("mini", "--standalone", "--model", "m"),
+        )
+        driver = FakeDriver()
+        self.run_read(driver)
+        start = next(call for call in driver.calls if call[0] == "agent_start")
+        self.assertEqual(start[1][3], defaults.agent_args)
+
+    def test_explicit_agent_args_override_opencode_default(self) -> None:
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "pinned"},
+            "task": {"agent_args": ["mini", "--model", "explicit"]},
+        })
+        self.assertEqual(
+            product_config.task_defaults(config).agent_args,
+            ("mini", "--model", "explicit"),
+        )
+
+    def test_non_opencode_provider_args_remain_explicit(self) -> None:
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "another-agent", "model": "pinned"},
+        })
+        self.assertEqual(product_config.task_defaults(config).agent_args, ())
+
     def test_task_defaults_fail_closed_on_a_bad_section(self) -> None:
         config = product_config.validate_config(
             {"schema": product_config.SCHEMA, "task": {"read_lines": -1}}
@@ -214,6 +243,58 @@ class ReadFlowTests(TaskCase):
         self.assertEqual(driver.names().count("agent_prompt"), 1)
         self.assertEqual(driver.names().count("agent_start"), 1)
         self.assertEqual(driver.names().count("workspace_create"), 1)
+
+    def test_write_resume_after_committed_work_reuses_exact_claim(self) -> None:
+        repo = git_repo(self.root, name="resume-committed")
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                       capture_output=True, env={**os.environ, **GIT_ENV})
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
+                check=True, capture_output=True, text=True,
+                env={**os.environ, **GIT_ENV},
+            )
+        git("remote", "add", "origin", str(remote))
+        git("push", "--set-upstream", "origin", "main")
+        driver = FakeDriver()
+        args = dict(
+            driver=driver, repo=str(repo), prompt="Edit this file",
+            task_id="resume-write", mode="write", write_scope=("a.txt",),
+            observation=RuntimeObservation.empty(), config=self.config,
+            env=self.env, registry_db=self.db,
+        )
+        first = product_task.run_task(**args, wait_ms=0)
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(first["claim"]["mode"], "WRITE")
+        (repo / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+        git("add", "a.txt")
+        git("commit", "-m", "Accepted local change")
+        head = git("rev-parse", "HEAD").stdout.strip()
+        # A previous preflight on its own already-owned commit could persist a
+        # false refused state. Recovery must re-use the same live claim.
+        record = product_state.read_task("resume-write", self.env)
+        record["status"] = "refused"
+        record["refusal"] = {"stage": "preflight", "status": "CONFLICT"}
+        product_state.write_task(record, self.env)
+        after = product_task.run_task(**args, wait_ms=1000)
+        self.assertIsNone(after["refusal"])
+        self.assertEqual(after["status"], "complete")
+        self.assertTrue(after["claim"]["released"])
+        self.assertEqual(after["claim"]["released_head"], head)
+        self.assertEqual(driver.names().count("agent_start"), 1)
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        conn = registry.connect(db=self.db)
+        try:
+            rows = conn.execute(
+                "SELECT claim_id, outcome, released_head FROM claims "
+                "WHERE work_key=?", ("resume-write",),
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["outcome"], "complete")
+            self.assertEqual(rows[0]["released_head"], head)
+        finally:
+            conn.close()
 
     def test_ambiguous_ack_is_unknown_and_never_reprompts(self) -> None:
         driver = FakeDriver()

@@ -571,7 +571,8 @@ def run_task(
                 conn, record["run_id"], record["work_key"], "", OWNER,
             )
             if (prior_claim.get("released") or held is None or
-                    held["claim_id"] != prior_claim["claim_id"]):
+                    held["claim_id"] != prior_claim["claim_id"] or
+                    held["mode"] != record["mode"]):
                 record["status"] = (
                     "running" if record.get("status") == "running" else "unknown"
                 )
@@ -581,7 +582,18 @@ def run_task(
                 }
                 _save(record, env, clock)
                 return task_payload(record)
-        authority = _claim_authority(conn, record, observation)
+            # Exact owner and claim id have already been verified against the
+            # live OPEN ledger row. There is nothing to acquire again on a
+            # resume: a second preflight against newly committed work would
+            # mistake the original writer for an overlapping unregistered one.
+            authority = {
+                "ok": True,
+                "claim_id": held["claim_id"],
+                "claim_mode": held["mode"],
+                "status": registry.RESUMED,
+            }
+        else:
+            authority = _claim_authority(conn, record, observation)
         if not authority.get("ok"):
             record["status"] = "refused"
             record["refusal"] = {
@@ -599,6 +611,8 @@ def run_task(
             "mode": authority.get("claim_mode"),
         }
         record["status"] = "claimed"
+        record["refusal"] = None
+        record.pop("error", None)
         _save(record, env, clock)
         _write_service("running", env, clock)
 

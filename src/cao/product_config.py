@@ -347,9 +347,23 @@ def task_defaults(
             f"ledger policy is supported"
         )
 
+    agent_args = _string_tuple(raw.get("agent_args"), "task.agent_args")
+    if (
+        raw.get("agent_args") is None
+        and agent_kind == "opencode"
+        and provider_cli == "opencode"
+        and config is not None
+        and config.provider is not None
+        and config.provider.model is not None
+    ):
+        # The selected model must reach the actual execution process. Starting
+        # bare OpenCode launches an interactive TUI with its own default model,
+        # which can be reported idle before any governed task is performed.
+        agent_args = ("mini", "--standalone", "--model", config.provider.model)
+
     return TaskDefaults(
         agent_kind=agent_kind,
-        agent_args=_string_tuple(raw.get("agent_args"), "task.agent_args"),
+        agent_args=agent_args,
         workspace_label_prefix=prefix,
         runner_timeout=_positive_number(
             raw.get("runner_timeout"), "task.runner_timeout", DEFAULT_RUNNER_TIMEOUT
