@@ -653,7 +653,12 @@ class Daemon:
                 registry_db=self._registry_db,
                 observation=observation,
                 clock=self._clock,
-                wait_ms=0,
+                # The re-drive must wait for the agent to settle: a task whose
+                # prompt was already issued and whose agent has finished can
+                # only reach its handback through a wait, and skipping it would
+                # re-drive the same unfinished task every tick until the retry
+                # bound holds it UNKNOWN.
+                wait_ms=None,
             )
         except (product_task.TaskError, StateError) as exc:
             record["errors"] = int(record.get("errors") or 0) + 1

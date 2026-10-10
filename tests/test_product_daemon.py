@@ -60,6 +60,7 @@ class FakeDriver:
         self.calls: list[tuple] = []
         self.readable = True
         self.wait_state = "done"
+        self.wait_error = False
         self.read_text = "agent output"
         self._workspaces: dict[str, dict] = {}
         self._panes: dict[str, dict] = {}
@@ -158,6 +159,8 @@ class FakeDriver:
 
     def agent_wait(self, target, *, until=(), timeout_ms=None):
         self._note("agent_wait", target)
+        if self.wait_error:
+            raise product_driver.DriverTransportError("wait unavailable")
         return {"agent": {"agent_status": self.wait_state}}
 
     # -- test controls -----------------------------------------------------
@@ -369,10 +372,43 @@ class ReconciliationTests(DaemonCase):
         supervision = product_state.read_daemon(self.env)["supervision"]
         self.assertEqual(supervision[task["task_id"]]["action"], "redrive")
 
+    def test_finished_agent_reaches_handback_through_one_redrive(self) -> None:
+        # The live pilot found this: a task whose prompt was issued and whose
+        # agent then finished must reach completion through supervision, not
+        # re-drive forever. The re-drive waits for the finished agent, so the
+        # handback (claim released with the observed HEAD) happens on the first
+        # tick after the agent goes, with no second prompt or start.
+        driver = FakeDriver()
+        task = self.run_read(driver, wait_ms=0)
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+        driver.drop_agents()
+        daemon = self.build(driver)
+        daemon.start()
+        summary = daemon.tick()
+
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(driver.names().count("agent_start"), 1)
+        record = product_state.read_task(task["task_id"], self.env)
+        self.assertEqual(record["status"], "complete")
+        self.assertEqual(record["claim"]["outcome"], "complete")
+        self.assertTrue(record["claim"]["released"])
+        self.assertTrue(record["claim"]["released_head"])
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        self.assertEqual(supervision[task["task_id"]]["action"], "redrive")
+        self.assertTrue(summary["ticked"])
+        record_daemon = product_state.read_daemon(self.env)
+        self.assertEqual(record_daemon["retries"].get(task["task_id"]), None)
+
     def test_bounded_retries_then_hold_unknown(self) -> None:
         driver = FakeDriver()
-        task = self.run_read(driver)
+        task = self.run_read(driver, wait_ms=0)
         driver.drop_agents()
+        # The agent is gone but its terminal state cannot be read: every
+        # re-drive fails to wait, so the bound must eventually hold UNKNOWN
+        # rather than re-drive forever.
+        driver.wait_error = True
         config = product_config.validate_config(
             {
                 "schema": product_config.SCHEMA,
@@ -387,6 +423,8 @@ class ReconciliationTests(DaemonCase):
         record = product_state.read_daemon(self.env)
         self.assertEqual(record["supervision"][task["task_id"]]["status"], "HELD_UNKNOWN")
         self.assertGreaterEqual(record["errors"], 1)
+        # A held task never re-prompts.
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
 
     def test_occupancy_unreadable_holds_unknown(self) -> None:
         driver = FakeDriver()
@@ -409,8 +447,11 @@ class ReconciliationTests(DaemonCase):
         daemon.start()
         daemon.tick()
         record = product_state.read_task(task_id, self.env)
-        self.assertEqual(record["status"], "running")
+        # The WRITE claim went through with the real occupancy observation and
+        # the re-drive waited, so the task reached its handback.
+        self.assertEqual(record["status"], "complete")
         self.assertEqual(record["claim"]["mode"], "WRITE")
+        self.assertEqual(record["claim"]["outcome"], "complete")
         self.assertIn("agent_prompt", driver.names())
 
     def test_write_task_holds_unknown_when_occupancy_unreadable(self) -> None:
