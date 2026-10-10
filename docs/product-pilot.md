@@ -120,6 +120,30 @@ PY
 - CAO never reads or stores the credential itself. If authentication cannot be
   positively verified, `doctor` stays `NOT_READY`.
 
+### Credential verification needs the provider's own environment
+
+`doctor` verifies credentials by running the provider CLI's own non-secret
+authenticated-list probe (`opencode auth list`) as a subprocess. That CLI reads
+its configuration and authentication from the same `XDG_CONFIG_HOME` and
+`XDG_STATE_HOME` this pilot isolates, and an isolated `XDG_STATE_HOME` in
+particular makes it start a per-root managed service and exit `127` (observed on
+the qualification host). Under full isolation the probe therefore fails and
+`doctor` truthfully reports `credentials: UNVERIFIED`, `status: NOT_READY`,
+exit `3` — a fail-closed answer, not a defect.
+
+To reach a verified `READY` gate, run `doctor` with the provider CLI's own
+environment visible, for example on the operator's own roots:
+
+```sh
+env -u XDG_STATE_HOME -u XDG_CONFIG_HOME ./cao doctor
+```
+
+The pilot's task steps (6 onward) are unaffected either way: the managed
+runtime launches the agent from its own server process, which carries the
+operator's environment, so the agent authenticates while CAO's records stay
+isolated. The credential gate is a readiness report for the operator, not a
+precondition the runtime enforces.
+
 ## 4. Readiness gate
 
 ```sh
@@ -143,6 +167,9 @@ Expected: exit `0` and `"status": "READY"`, with every gate true:
 ```
 
 If any gate is false the exit code is `3` and `status` is `NOT_READY`. Stop; the
+reason names the gate that did not pass. Under the isolated roots of step 1 the
+credentials gate fails closed by design (see step 3); verify readiness once with
+the provider's own environment visible, then continue with the isolated roots.
 pilot is not ready. Record the `sections` and `reasons` verbatim.
 
 ## 5. Prepare the one disposable working tree
