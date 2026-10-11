@@ -419,6 +419,12 @@ def build_parser() -> argparse.ArgumentParser:
     team_command.add_argument("args", nargs=argparse.REMAINDER)
     team_command.set_defaults(handler=_cmd_start)  # main dispatches separately
 
+    improvement_command = subcommands.add_parser(
+        "improve", help="source-bound operating evidence assessment (read-only)"
+    )
+    improvement_command.add_argument("args", nargs=argparse.REMAINDER)
+    improvement_command.set_defaults(handler=_cmd_start)  # main dispatches separately
+
     for name, help_text, handler in (
         ("run", "submit a task", _cmd_run),
         ("start", "start the service (unavailable in this build)", _cmd_start),
@@ -450,6 +456,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args_list and args_list[0] == "team":
         from . import team_cli
         return team_cli.main(args_list[1:])
+    if args_list and args_list[0] == "improve":
+        from . import improvement_cli
+        return improvement_cli.main(args_list[1:])
 
     parser = build_parser()
     args = parser.parse_args(args_list)

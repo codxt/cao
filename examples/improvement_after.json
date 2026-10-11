@@ -1,0 +1,76 @@
+{
+  "case_fingerprint": "sha256:689de8ee69963a7e1debe0c05db578dbc93b057c92081378b77ecc3486466cf2",
+  "case_id": "synthetic-incident-one",
+  "intervention": {
+    "ci": {
+      "completed_at": "2026-01-01T09:32:00Z",
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "proof": {
+        "fingerprint": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "observed_at": "2026-01-01T09:32:00Z",
+        "ref": "urn:ci:observation:ci",
+        "source": "ci",
+        "verdict": "SUPPORTED"
+      },
+      "status": "passed"
+    },
+    "commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "deployment": {
+      "completed_at": "2026-01-01T09:45:00Z",
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "proof": {
+        "fingerprint": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "observed_at": "2026-01-01T09:45:00Z",
+        "ref": "urn:runtime:observation:deployment",
+        "source": "runtime",
+        "verdict": "SUPPORTED"
+      },
+      "status": "verified"
+    },
+    "proposed_at": "2026-01-01T09:12:00Z",
+    "repo": "example/platform",
+    "review": {
+      "completed_at": "2026-01-01T09:30:00Z",
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "proof": {
+        "fingerprint": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "observed_at": "2026-01-01T09:30:00Z",
+        "ref": "urn:operator:observation:review",
+        "source": "operator",
+        "verdict": "SUPPORTED"
+      },
+      "status": "approved"
+    }
+  },
+  "measurements": [
+    {
+      "measurement": {
+        "proof": {
+          "fingerprint": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+          "observed_at": "2026-01-01T10:00:00Z",
+          "ref": "urn:telemetry:observation:after-errors",
+          "source": "telemetry",
+          "verdict": "SUPPORTED"
+        },
+        "release_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "value": 0.005
+      },
+      "objective_id": "errors"
+    },
+    {
+      "measurement": {
+        "proof": {
+          "fingerprint": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+          "observed_at": "2026-01-01T10:00:00Z",
+          "ref": "urn:telemetry:observation:after-latency",
+          "source": "telemetry",
+          "verdict": "SUPPORTED"
+        },
+        "release_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "value": 225
+      },
+      "objective_id": "latency"
+    }
+  ],
+  "schema": "cao.improvement.after.v1"
+}

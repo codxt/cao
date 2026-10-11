@@ -99,6 +99,26 @@ Initialization is PAUSED and launches no agent. Team review is advisory;
 publication, deployment and sensitive provider routing keep separate gates.
 See docs/team-execution.md for the manifest and recovery contract.
 
+## Evidence-to-Investigation
+
+The read-only CAO improve commands assess source-attested operating signals,
+project explicit resource-to-source relationships, draft bounded investigation
+proposals, compare release-bound before/after fitness and guardrail evidence,
+and suggest detection-check improvements after repeated results:
+
+    cao improve assess --file examples/improvement_case.json
+    cao improve verify --file examples/improvement_case.json --after examples/improvement_after.json
+    cao improve context --file examples/improvement_case.json --resource api
+
+The check-proof command hashes a selected original evidence artifact and
+compares its bytes to the source-attested reference without displaying it.
+
+These commands require no model or background service. They never claim work,
+start agents, change detection rules or deploy. Real provider observations
+require source-specific adapters; input fingerprints are source assertions,
+not independently authenticated proof. See
+[Evidence-to-Investigation](docs/evidence-to-investigation.md).
+
 ## CLI
 
 ```sh

@@ -1,0 +1,122 @@
+{
+  "case_id": "synthetic-incident-one",
+  "context": {
+    "edges": [
+      {
+        "from": "api",
+        "relation": "connects_to",
+        "to": "db"
+      },
+      {
+        "from": "checkout",
+        "relation": "calls",
+        "to": "api"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "api",
+        "kind": "service",
+        "owner_repo": "example/platform",
+        "release_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "scope": "demo-one",
+        "source_path": "src/api.py"
+      },
+      {
+        "id": "db",
+        "kind": "database",
+        "owner_repo": "example/platform",
+        "release_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "scope": "demo-one",
+        "source_path": "src/database.py"
+      },
+      {
+        "id": "checkout",
+        "kind": "client",
+        "scope": "demo-one"
+      }
+    ]
+  },
+  "data_class": "synthetic",
+  "detected_at": "2026-01-01T09:00:00Z",
+  "objectives": [
+    {
+      "before": {
+        "proof": {
+          "fingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "observed_at": "2026-01-01T09:00:00Z",
+          "ref": "urn:telemetry:observation:baseline-errors",
+          "source": "telemetry",
+          "verdict": "SUPPORTED"
+        },
+        "release_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "value": 0.2
+      },
+      "direction": "min",
+      "guardrail": false,
+      "id": "errors",
+      "issue": "deployment-failure",
+      "metric": "error_rate",
+      "resource": "api",
+      "target": 0.01
+    },
+    {
+      "before": {
+        "proof": {
+          "fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "observed_at": "2026-01-01T09:00:00Z",
+          "ref": "urn:telemetry:observation:baseline-latency",
+          "source": "telemetry",
+          "verdict": "SUPPORTED"
+        },
+        "release_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "value": 240
+      },
+      "direction": "min",
+      "guardrail": true,
+      "id": "latency",
+      "issue": "deployment-failure",
+      "metric": "p99_ms",
+      "resource": "api",
+      "target": 300
+    }
+  ],
+  "schema": "cao.improvement.case.v1",
+  "signals": [
+    {
+      "finding": "adverse",
+      "id": "factory-observation",
+      "issue": "deployment-failure",
+      "metric": "error_rate",
+      "proof": {
+        "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "observed_at": "2026-01-01T09:00:00Z",
+        "ref": "urn:factory:observation:factory-error",
+        "source": "factory",
+        "verdict": "SUPPORTED"
+      },
+      "resource": "api",
+      "severity": "high",
+      "threshold": {
+        "limit": 0.01,
+        "op": "above",
+        "value": 0.2
+      }
+    },
+    {
+      "finding": "adverse",
+      "id": "ci-observation",
+      "issue": "deployment-failure",
+      "proof": {
+        "fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "observed_at": "2026-01-01T09:02:00Z",
+        "ref": "urn:ci:observation:ci-error",
+        "source": "ci",
+        "verdict": "SUPPORTED"
+      },
+      "resource": "api",
+      "severity": "medium"
+    }
+  ],
+  "subject": "api"
+}
