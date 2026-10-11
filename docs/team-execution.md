@@ -291,3 +291,19 @@ review receipts, and independent repository/release authorization remain
 unchanged. The public repository ships no authentication tokens or
 hardcoded personal models. An operator may keep local credential policies
 for subscriptions, API providers or enterprise access entirely outside CAO.
+
+## Operator-approved teams
+
+Public CAO optionally requires an operator-signed proposal before team
+initialization. The proposal commits to the complete manifest and effective
+model/agent configuration. `cao team plan` shows the proposed composition;
+`cao team proposal` generates the statement to sign outside the agent host.
+`cao team init --signature` verifies the signature and still starts PAUSED.
+
+Signed mode requires one stable initiative per approved team. Changing
+composition, model, writer limits or identity requires a new proposal
+and signature. Successor teams name their predecessor and a substantive
+reason; earlier checkpoints are preserved.
+
+See [operator-team-approval.md](operator-team-approval.md) for configuration,
+key separation, verification, legacy migration and recovery requirements.
