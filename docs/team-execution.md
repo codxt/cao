@@ -234,3 +234,60 @@ Team v1 uses declared, finite DAGs and artifact-based coordination; it does not
 implement unrestricted agent-to-agent conversation or agent-generated new
 permissions/scopes. Use the current task record, shared Registry and durable
 team checkpoint to recover an interrupted run without replaying work.
+
+## Portable agent profiles (opt-in)
+
+CAO Teams supports runtime-neutral, per-role `agent_profile` references.
+Operators configure profiles in their own private CAO product configuration
+(`~/.config/cao/config.json` or `XDG_CONFIG_HOME/cao/config.json`). A
+profile chooses an agent kind supported by the installed runtime plugin and
+explicit read/write argument vectors. CAO does not own subscription login,
+credential storage, or hardcoded model catalogs.
+
+Example local configuration fragment (merge into the existing config rather
+than replacing its registry, provider or managed fields):
+
+```json
+{
+  "agent_profiles": {
+    "claude_review": {
+      "agent_kind": "claude",
+      "read_args": ["--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]
+    },
+    "codex_dev": {
+      "agent_kind": "codex",
+      "read_args": ["--model", "gpt-example", "--sandbox", "read-only"],
+      "write_args": ["--model", "gpt-example", "--sandbox", "workspace-write"]
+    },
+    "gemini_read": {"agent_kind": "gemini", "read_args": []}
+  }
+}
+```
+
+Reference a profile in an immutable team role:
+
+```json
+{"roles": {"reviewer": {"instruction": "Review the exact commit", "agent_profile": "claude_review"}}}
+```
+
+The examples illustrate CLI syntax, not qualification of a particular
+model, account, runtime integration, permission setting or data class.
+Operators must validate exact argument support against their installed
+agent versions, provider terms, and permitted data scope before execution.
+Supported agent kinds and arguments belong to the installed runtime plugin.
+CAO passes argument arrays directly to the existing runtime; it never uses
+a shell to expand or interpret them.
+
+A profile must declare the selected task mode. Missing profiles, unknown
+fields, unsafe argument strings, unsupported modes, or collisions between a
+role's inline OpenCode model and a profile fail closed. Reviewer tasks always
+resolve `read_args`; a read profile never inherits `write_args`.
+Current inline OpenCode model routing and no-profile team behavior remain
+unchanged. Profile names, launch arguments and backend choices are operator
+configuration, not tenant state or operator identity proofs.
+
+The existing CAO daemon, Herdr adapter, Work Registry, task identities,
+review receipts, and independent repository/release authorization remain
+unchanged. The public repository ships no authentication tokens or
+hardcoded personal models. An operator may keep local credential policies
+for subscriptions, API providers or enterprise access entirely outside CAO.

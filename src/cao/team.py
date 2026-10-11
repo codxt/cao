@@ -17,7 +17,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from . import product_config, product_driver, product_state, product_task, registry, state
+from . import agent_profiles, product_config, product_driver, product_state, product_task, registry, state
 
 SPEC_SCHEMA = "cao.team.v1"
 STATE_SCHEMA = "cao.team.state.v1"
@@ -70,7 +70,11 @@ def validate_spec(value: Any) -> dict[str, Any]:
         raise TeamError("roles must be a bounded object")
     for name, role in roles.items():
         _ident(name)
-        _fields(role, {"instruction", "model"}, {"instruction"}, "role")
+        _fields(role, {"instruction", "model", "agent_profile"}, {"instruction"}, "role")
+        if "agent_profile" in role:
+            _ident(role["agent_profile"])
+            if "model" in role:
+                raise TeamError("agent_profile and inline model cannot be combined")
         _string(role["instruction"], 2000)
         if "model" in role:
             model = _string(role["model"], 200)
@@ -516,7 +520,21 @@ def _role_config(base: product_config.ProductConfig, spec: Mapping[str, Any],
     if raw.get("task") is not None and type(raw["task"]) is not dict:
         raise TeamError("product task configuration is not a mapping")
     raw["task"] = dict(raw.get("task") or {})
-    if "model" in role:
+    if "agent_profile" in role:
+        try:
+            mode = "read" if phase == "review" or task["mode"] == "read" else "write"
+            kind, argv, provider_id = agent_profiles.resolve_profile(
+                raw.get("agent_profiles"), role["agent_profile"], mode)
+        except agent_profiles.AgentProfileError as exc:
+            raise TeamError(str(exc)) from exc
+        if raw["task"].get("agent_args") is not None:
+            raise TeamError("agent profile conflicts with default custom agent_args")
+        raw["task"]["agent_kind"] = kind
+        raw["task"]["agent_args"] = list(argv)
+        raw["provider"] = {"cli": kind}
+        if provider_id is not None:
+            raw["provider"]["id"] = provider_id
+    elif "model" in role:
         provider = dict(raw.get("provider") or {})
         if provider.get("cli") != "opencode":
             raise TeamError("per-role model requires configured OpenCode provider")
