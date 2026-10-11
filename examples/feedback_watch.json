@@ -1,0 +1,11 @@
+{
+  "schema": "cao.feedback.watch.v1",
+  "watch_id": "sample-loop",
+  "inbox_dir": "/srv/app/observations",
+  "repo": "/srv/app/checkouts/platform-snapshot",
+  "owner_repo": "example/platform",
+  "model": "provider/qualified-private-model",
+  "max_cases_per_tick": 4,
+  "outcomes_dir": "/srv/app/verified-outcomes",
+  "history_file": "/srv/app/operator-accepted-history.json"
+}

@@ -446,10 +446,15 @@ class TeamTests(unittest.TestCase):
         prompt = team._prompt(normalized["tasks"][0], normalized, slot, {})
         ident = team._execution_id("squad", "a", "work", 0)
         import re
-        challenge = re.search(r"CAO_TEAM_CHALLENGE: ([0-9a-f]{16})", prompt)
+        challenge = re.search(r"CAO_TEAM_NONCE_V2: ([0-9a-f]{16})", prompt)
         self.assertIsNotNone(challenge)
-        self.assertEqual(challenge.group(1)[::-1], team._result_tag(ident))
-        self.assertNotIn("CAO_TEAM_RESULT: " + team._result_tag(ident), prompt)
+        self.assertEqual(challenge.group(1), team._result_challenge(ident))
+        self.assertEqual(team._receipt_for(ident, prompt),
+                         "CAO_TEAM_RESULT: " + challenge.group(1))
+        self.assertNotIn(team._receipt_for(ident, prompt), prompt)
+        # A pre-upgrade durable task prompt keeps its exact old requirement.
+        self.assertEqual(team._receipt_for(ident, "legacy prompt"),
+                         "CAO_TEAM_RESULT: " + team._result_tag(ident))
 
     def test_team_read_agent_pane_must_be_closed_before_handback(self):
         ident = "ct-squad-read-work-0"
@@ -504,6 +509,84 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
         with self.assertRaises(team.TeamError):
             team.resume("squad", "a", env=self.env)
+
+    def test_invalid_read_receipt_allows_one_explicit_fresh_retry_after_stop(self):
+        spec = self.spec([task("a", self.paths[0], mode="read"),
+                          task("dependent", self.paths[1], mode="read",
+                               deps=["a"])])
+        self.init(spec)
+        self.tick(lambda **kwargs: {
+            "status": "unknown",
+            "error": {"code": "TEAM_RESULT_UNVERIFIED"}})
+        snapshot = team.status("squad", env=self.env)["tasks"]
+        old_id = snapshot["a"]["execution_id"]
+        self.assertEqual(snapshot["dependent"]["status"], "pending")
+        team.set_desired("squad", "paused", env=self.env)
+        old_record = {
+            "task_id": old_id, "run_id": "cao-team-squad",
+            "work_key": old_id, "repo": self.paths[0], "mode": "READ",
+            "scope": [], "status": "stopped",
+            "checkpoint": {"pane_id": "w1:p1"}, "pane_closed": "w1:p1",
+            "claim": {"claim_id": 42, "status": "RELEASED", "released": True,
+                      "outcome": "abandon"}}
+        ledger_row = {"run_id": "cao-team-squad", "work_key": old_id,
+                      "owner": "cao-product", "mode": "READ",
+                      "released_at": "2026-01-01T01:00:00Z",
+                      "outcome": "abandon"}
+        database = mock.Mock()
+        database.execute.return_value.fetchone.return_value = ledger_row
+        with mock.patch("cao.product_state.read_task", return_value=old_record), \
+                mock.patch("cao.registry.connect_readonly", return_value=database):
+            retried = team.retry_read("squad", "a", env=self.env)
+        self.assertEqual(retried["tasks"]["a"]["status"], "pending")
+        self.assertEqual(retried["tasks"]["a"]["retry_no"], 1)
+        self.assertEqual(retried["tasks"]["dependent"]["status"], "pending")
+        self.assertEqual(retried["desired"], "paused")
+        with self.assertRaises(team.TeamError):
+            team.retry_read("squad", "a", env=self.env)
+        dispatched = []
+        team.set_desired("squad", "running", env=self.env)
+        self.tick(lambda **kw: (dispatched.append((kw["execution_id"],
+                  kw["prompt"])) or self.done()))
+        self.assertEqual(len(dispatched), 2)
+        self.assertNotEqual(dispatched[0][0], old_id)
+        self.assertEqual(dispatched[0][0], team._execution_id(
+            "squad", "a", "work", 0, 1))
+        self.assertIn("CAO_TEAM_NONCE_V2:", dispatched[0][1])
+        self.tick(lambda **kw: self.done())
+        self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
+
+    def test_retry_refuses_unverified_stop_or_wrong_ledger(self):
+        self.init(self.spec([task("a", self.paths[0], mode="read")]))
+        self.tick(lambda **kw: {
+            "status": "unknown",
+            "error": {"code": "TEAM_RESULT_UNVERIFIED"}})
+        old_id = team.status("squad", env=self.env)["tasks"]["a"]["execution_id"]
+        with self.assertRaises(team.TeamError):
+            team.retry_read("squad", "a", env=self.env)
+        team.set_desired("squad", "paused", env=self.env)
+        stale = {"task_id": old_id, "run_id": "cao-team-squad",
+                 "work_key": old_id, "repo": self.paths[0], "mode": "READ",
+                 "scope": [], "status": "running",
+                 "checkpoint": {"pane_id": "w1:p1"}, "pane_closed": None,
+                 "claim": {"claim_id": 42, "status": "RESUMED",
+                           "released": False}}
+        with mock.patch("cao.product_state.read_task", return_value=stale):
+            with self.assertRaises(team.TeamError):
+                team.retry_read("squad", "a", env=self.env)
+        stale.update(status="stopped", pane_closed="w1:p1")
+        stale["claim"].update(status="RELEASED", released=True, outcome="abandon")
+        db = mock.Mock()
+        db.execute.return_value.fetchone.return_value = {
+            "run_id": "cao-team-squad", "work_key": old_id,
+            "owner": "another-owner", "mode": "READ",
+            "released_at": "2026-01-01T01:00:00Z", "outcome": "abandon"}
+        with mock.patch("cao.product_state.read_task", return_value=stale), \
+                mock.patch("cao.registry.connect_readonly", return_value=db):
+            with self.assertRaises(team.TeamError):
+                team.retry_read("squad", "a", env=self.env)
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
+                         "unknown")
 
     def test_review_and_writer_same_checkout_cannot_overlap(self):
         initial = task("reviewed", self.paths[0], reviewer="reviewer")
@@ -688,7 +771,7 @@ class TeamTests(unittest.TestCase):
                                        "review" if "Role: Independently review commits" in text
                                        else "work", 0)
                 )
-                self.read_text += "\nCAO_TEAM_RESULT: " + challenge[::-1]
+                self.read_text += "\nCAO_TEAM_RESULT: " + challenge
                 return super().agent_prompt(
                     target, text, timeout_ms=timeout_ms, wait=wait)
 
@@ -941,9 +1024,9 @@ class TeamTests(unittest.TestCase):
                 # Derive the requested receipt from the *prompt challenge*,
                 # never paste an already completed receipt into the prompt.
                 import re
-                shown = re.search(r"CAO_TEAM_CHALLENGE: ([0-9a-f]{16})", prompt)
+                shown = re.search(r"CAO_TEAM_NONCE_V2: ([0-9a-f]{16})", prompt)
                 assert shown is not None
-                self.read_text += "\nCAO_TEAM_RESULT: " + shown.group(1)[::-1]
+                self.read_text += "\nCAO_TEAM_RESULT: " + shown.group(1)
                 return super().agent_prompt(
                     target, prompt, timeout_ms=timeout_ms, wait=wait)
 

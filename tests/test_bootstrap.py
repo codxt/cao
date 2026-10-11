@@ -211,6 +211,31 @@ class DoctorTests(BootstrapCase):
         self.assertEqual(after["sections"]["registry"]["status"], "PRESENT")
         self.assertFalse(default.exists())
 
+    def test_persistent_configured_shared_ledger_and_env_precedence(self) -> None:
+        shared = self.root / "shared" / "registry.sqlite3"
+        other = self.root / "override" / "registry.sqlite3"
+        self.write_config({"schema": product_config.SCHEMA,
+                           "registry_db": str(shared)})
+        self.assertEqual(product_config.registry_db_path(self.env), str(shared))
+        selected, _ = bootstrap.doctor(env=self.env)
+        self.assertEqual(selected["sections"]["registry"]["path"], str(shared))
+        self.assertEqual(selected["sections"]["registry"]["status"], "ABSENT")
+        self.assertFalse(shared.exists())
+        self.assertEqual(product_config.registry_db_path(
+            dict(self.env, CAO_REGISTRY_DB=str(other))), str(other))
+        override, _ = bootstrap.doctor(
+            env=dict(self.env, CAO_REGISTRY_DB=str(other)))
+        self.assertEqual(override["sections"]["registry"]["path"], str(other))
+        self.assertFalse(other.exists())
+
+    def test_configured_shared_ledger_requires_normalized_absolute_path(self) -> None:
+        for path in ("relative.sqlite3", "../registry.sqlite3", "",
+                     str(self.root / ".." / "registry.sqlite3"), 42):
+            with self.subTest(path=path), self.assertRaises(
+                    product_config.ProductConfigError):
+                product_config.validate_config({
+                    "schema": product_config.SCHEMA, "registry_db": path})
+
     def test_registry_xdg_root_matches_task_ledger_without_creating_it(self) -> None:
         expected = Path(product_config.registry_db_path(self.env))
         first, _ = bootstrap.doctor(env=self.env)

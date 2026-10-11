@@ -159,6 +159,12 @@ def validate_config(payload: Mapping[str, Any]) -> ProductConfig:
             f"unsupported configuration schema {schema!r}; expected {SCHEMA!r}"
         )
     runtime_id = _optional_nonempty_str(payload.get("runtime_id"), "runtime_id")
+    ledger = payload.get("registry_db")
+    if ledger is not None and (
+        type(ledger) is not str or not ledger or len(ledger) > 2048
+        or not os.path.isabs(ledger) or os.path.normpath(ledger) != ledger
+    ):
+        raise ProductConfigError("registry_db must be a normalized absolute path")
 
     provider: ProviderConfig | None = None
     raw_provider = payload.get("provider")
@@ -412,15 +418,22 @@ def task_defaults(
 def registry_db_path(env: Mapping[str, str] | None = None) -> str:
     """The Work Registry ledger the product task layer attaches to.
 
-    ``CAO_REGISTRY_DB`` overrides the path; otherwise the shared default
-    (itself honouring ``XDG_STATE_HOME``) is used, so the governed ledger is
-    the single claim book and no second ledger is ever created.
+    ``CAO_REGISTRY_DB`` overrides the path. Otherwise an explicit
+    ``registry_db`` in the CAO product config wins over the isolated
+    XDG default. An existing shared dispatcher must be configured explicitly;
+    merely using CAO on the same host does not discover the shared ledger.
     """
 
     source = os.environ if env is None else env
     override = source.get("CAO_REGISTRY_DB")
     if override:
         return os.path.abspath(os.path.expanduser(override))
+    configured = read_config(config_path(source))
+    if configured is not None:
+        validated = validate_config(configured)
+        selected = validated.raw.get("registry_db")
+        if selected is not None:
+            return selected
     from . import registry as _registry
 
     base = source.get("XDG_STATE_HOME") or os.path.join(
@@ -455,6 +468,7 @@ class DaemonDefaults:
     wake_budget: int
     retry_bound: int
     stop_timeout: float
+    feedback_watch_file: str | None = None
 
 
 def daemon_defaults(
@@ -496,7 +510,14 @@ def daemon_defaults(
         raise ProductConfigError(
             f"daemon.retry_bound must be at most {MAX_RETRY_BOUND}"
         )
+    watch = raw.get("feedback_watch_file")
+    if watch is not None and (
+        type(watch) is not str or not watch or len(watch) > 2048
+        or not os.path.isabs(watch) or os.path.normpath(watch) != watch
+    ):
+        raise ProductConfigError("daemon.feedback_watch_file must be a normalized absolute path")
     return DaemonDefaults(
+        feedback_watch_file=watch,
         tick_interval=interval,
         min_tick_interval=min_interval,
         max_tick_interval=max_interval,

@@ -75,6 +75,18 @@ separate read-only operator CLI (python -m cao) does not start agents.
     cao team list
     cao team pause --id sample-project
 
+When a READ specialist's final result receipt is wrong, do not accept a
+near-miss marker or repeatedly resume the unchanged response. Inspect the
+original task output and Registry claim, pause the team, then stop only the
+original CAO-owned READ task via `cao stop --id <execution-id>`. Once CAO
+confirms pane closure and Registry abandon-release, an operator can request
+`cao team retry-read --id sample-project --task requirements` (replace with
+the affected READ task). This admits **one** new execution identity and
+challenge, preserving the original task record. It does not start an agent;
+review role/provider privacy and restart the team separately. WRITE work and
+other UNKNOWN failure classes are ineligible. The old result is never
+silently accepted, and an invalid second receipt remains blocked.
+
 Init stores the manifest and defaults PAUSED; it launches nothing. Start sets
 the durable desired state RUNNING, without itself starting a worker. Tick
 dispatches ready tasks and observes running ones. For continuing unattended
@@ -105,9 +117,11 @@ A prompt being accepted and the model being IDLE does not mean the work
 is complete. Team Execution's product adapter keeps the original task and
 claim RUNNING until the runtime reports post-prompt DONE and the specialist's
 actual output contains a task-specific receipt. The prompt contains a
-16-character challenge but not the completed receipt; the specialist must
-reverse the challenge and emit the required standalone CAO_TEAM_RESULT: line
-only after successful work. An unreadable or missing receipt holds UNKNOWN
+16-character nonce on a separate line but not the completed receipt; the
+specialist copies the nonce (no calculation) after CAO_TEAM_RESULT: on a
+standalone line only after successful work. Legacy checkpointed prompts that
+explicitly required reversal continue to be checked against their original
+contract. An unreadable or missing receipt holds UNKNOWN
 instead of unblocking dependents. The single-task core also no longer
 accepts a pre-response IDLE state as completion.
 

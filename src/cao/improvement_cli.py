@@ -6,12 +6,14 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import improvement
+from . import improvement, feedback_loop, team
+from .state import StateError
 
 MAX_INPUT_BYTES = 512 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -125,6 +127,16 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "verify":
             cmd.add_argument("--after", required=True,
                              help="attested post-change measurements JSON")
+    watch = subs.add_parser("watch", help="scan a sanitized watch and admit only READ investigations")
+    watch.add_argument("--file", required=True, help="private watch manifest")
+    watch.add_argument("--dry-run", action="store_true", help="read-only planning without team admission")
+    authorize = subs.add_parser("authorize", help="explicitly admit one Registry-gated WRITE/review team")
+    authorize.add_argument("--file", required=True, help="private watch manifest")
+    authorize.add_argument("--case-file", required=True, help="original inbox case")
+    authorize.add_argument("--cause", required=True, help="source-bound operator cause proposal")
+    authorize.add_argument("--checkout", required=True, help="dedicated clean Git worktree")
+    authorize.add_argument("--model", required=True, help="investigation-to-correction specialist")
+    authorize.add_argument("--review-model", required=True, help="independent review model")
     cmd = subs.add_parser("learn")
     cmd.add_argument("--history", required=True,
                      help="list of source-attested case and outcome pairs")
@@ -145,6 +157,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "learn":
             result = improvement.learn(_load(args.history))
+        elif args.command == "watch":
+            result = feedback_loop.tick(args.file, admit=not args.dry_run)
+        elif args.command == "authorize":
+            result = feedback_loop.authorize_correction(
+                args.file, args.case_file, args.cause, args.checkout,
+                args.model, args.review_model)
         else:
             case = _load(args.file)
             if args.command == "assess":
@@ -158,7 +176,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = improvement.propose(case, _load(args.cause))
             else:
                 result = improvement.verify(case, _load(args.after))
-    except (improvement.ImprovementError, OSError, UnicodeError, ValueError,
+    except (improvement.ImprovementError, feedback_loop.FeedbackError,
+            team.TeamError, StateError, subprocess.TimeoutExpired,
+            OSError, UnicodeError, ValueError,
             RecursionError, TypeError, KeyError, StopIteration) as exc:
         _emit({"schema": "cao.improvement.error.v1", "status": "UNAVAILABLE",
                "code": getattr(exc, "code", type(exc).__name__)})

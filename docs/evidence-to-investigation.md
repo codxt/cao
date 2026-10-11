@@ -6,13 +6,14 @@ original observation references and resource-to-repo mapping, evaluates
 post-change goals and guardrails, and proposes new detection checks after
 repeated source-attested improvements.
 
-It **does not** automatically collect production logs, schedule runs, query
-cloud providers, create agents, obtain Work Registry claims, modify rules,
-merge, publish, deploy, or accept client-operating proof. Source collection
-belongs to the accountable observer and its permissions. This component is
-read-only and deterministic, and the existing CAO daemon/Team Execution and
-Registry remain responsible for execution and ownership. No new ledger or
-runtime service is introduced.
+The core assessment/proposal/verification/learning functions remain
+read-only and deterministic. An **opt-in feedback watch** can now submit bounded
+READ investigations through existing Team Execution and an operator can
+explicitly admit a separate scoped correction team (see below). CAO does not
+collect raw production logs, query cloud providers, grant its own WRITE
+authority, merge, publish, deploy, change detection policy, or accept
+client-operating proof. The existing daemon and shared Work Registry continue
+to own execution and writer claims. No new scheduler, ledger or service exists.
 
 ## Public command surface
 
@@ -202,3 +203,115 @@ analysis alone is not deployment acceptance.
 - Python standard library only; works without site packages.
 - Sample case/after evidence is synthetic. Its illustrative fingerprints
   are not production proof.
+
+
+## Opt-in feedback watch and governed correction
+
+This implements a bounded operational loop based on Boris Tane's
+[self-improving software thesis](https://boristane.com/blog/self-improving-software-is-inevitable/)
+and Polylane's [context graph](https://polylane.com/blog/turn-your-app-into-a-context-graph/)
+and [single-owner investigation](https://polylane.com/blog/sub-agents-are-just-wrong/)
+ideas. The observed data, reported improvement and actual operating acceptance
+remain separate facts.
+
+1. **OBSERVE / CORRELATE.** An accountable external source adapter writes a
+   sanitized `cao.improvement.case.v1` JSON to a private directory. The
+   optional configured CAO daemon scans a bounded directory each normal tick.
+   Case sources are asserted; a computed hash is evidence-byte integrity only,
+   not provider authentication. Cross-source and graph-scope corroboration,
+   Git origin ownership, exact source SHA, and a clean detached read-only
+   snapshot at that SHA must match.
+   Missing or conflicting data holds without dispatch.
+2. **INVESTIGATE.** For a source-attested corroborated issue, the daemon creates
+   one immutable READ team per watch/case/issue and starts it using the
+   existing Team Execution reconciler. The same investigator sees original
+   evidence refs, SHA, typed resource dependencies, two-hop potential impact,
+   and precomputed metric questions. Its task reports diagnosis and a bounded
+   proposed next action. No model hypothesis is adopted as fact or authority.
+   A changed case under the same incident identity refuses a second team
+   rather than silently losing/replacing the original trace.
+3. **AUTHORIZE / DEVELOP / REVIEW.** An accountable operator inspects the
+   original artifacts, verifies the root-cause hypothesis, current Git
+   ownership and provider privacy, then invokes the effectful command below.
+   It requires the completed source READ team, exact same case fingerprint,
+   a `cao.improvement.cause.v1` proposal matching declared owner/source paths,
+   a separate clean non-main worktree at the original source SHA and origin,
+   and distinct explicit developer/reviewer models. CAO creates a new bounded
+   WRITE team with one incident-owning developer; this developer must
+   re-check original evidence and work through diagnosis, edit and tests within
+   one task. The independent reviewer checks the exact commit and correction
+   attempts. The shared Registry performs all WRITE preflights/claims.
+   The operator CLI action is not a cryptographic proof of human identity:
+   secure the command with separate host permissions and external authority.
+4. **RELEASE / MEASURE.** The correction team cannot publish or deploy. An
+   external authorized owner performs those actions and exports distinct
+   review, CI, deployment and post-change measurement evidence in the
+   existing `cao.improvement.after.v1` format, named `case_id.json` inside
+   the watch's optional outcomes directory. CAO compares those reports with
+   the same accepted correction HEAD, original source fingerprint, goals
+   and guardrails. The positive verdict is `SOURCE_REPORTED_IMPROVEMENT`,
+   and `accepted_as_canonical_operating_proof` stays false.
+5. **LEARN.** An optional separately source-attested operator-accepted history
+   file is read through existing `improvement.learn`. It proposes detection
+   checks only for repeated independent improved incidents. No detector,
+   policy, model prompt, tenant system, or knowledge source is overwritten.
+
+Sample private watch structure (replace all example paths/model ids, and
+qualify the selected provider for the data):
+
+```json
+{
+  "schema": "cao.feedback.watch.v1",
+  "watch_id": "sample-loop",
+  "inbox_dir": "/srv/app/observations",
+  "repo": "/srv/app/checkouts/platform-snapshot",
+  "owner_repo": "example/platform",
+  "model": "provider/qualified-private-model",
+  "max_cases_per_tick": 4,
+  "outcomes_dir": "/srv/app/verified-outcomes",
+  "history_file": "/srv/app/operator-accepted-history.json"
+}
+```
+
+Use `cao improve watch --file /absolute/watch.json --dry-run` to examine
+admissions with no team records or model calls. `cao improve watch --file
+/absolute/watch.json` creates eligible READ team checkpoints. To enable
+recurring intake through the existing daemon, add the opt-in path to the
+operator's private CAO config:
+
+```json
+{"daemon": {"feedback_watch_file": "/absolute/watch.json"}}
+```
+
+This adds a `daemon` section to an **existing** product config; never replace
+the whole config with the fragment above. A missing/unreadable inbox,
+conflicting release owner/HEAD, symlink, malformed JSON, duplicate case ID,
+or more cases than the manifest's bounded per-tick capacity causes a hold
+rather than inventing zero signals. The case identity is stable; publish a
+new incident ID for genuinely new detection runs.
+
+After actual external authorization, the accountable operator can start a
+bounded correction with:
+
+```sh
+cao improve authorize --file /absolute/watch.json \
+  --case-file /srv/app/observations/case.json \
+  --cause /absolute/cause.json \
+  --checkout /srv/app/worktrees/case-fix \
+  --model provider/qualified-developer \
+  --review-model provider/qualified-reviewer
+```
+
+The output is only a durable started Team Execution intent;
+`cao team status --id <team-id>` reports what the existing daemon/Registry
+has actually completed. A READ completion receipt, code review verdict or
+green CI is not permission to deploy. Use `cao improve verify` and
+`cao improve learn` for evidence handling after external release/acceptance.
+
+The published portable feature ships **no live cloud/Factory collectors,
+credentials, automatic PR publication or tenant release permissions**.
+Provider-specific, source-governed adapters and authenticated acceptance
+remain external integrations. For an initial disposable synthetic evaluation,
+set up a Git checkout and case with matching declared source SHA; the
+dry-run API will expose candidate queries/impact but refuses live automatic
+investigation for synthetic evidence.

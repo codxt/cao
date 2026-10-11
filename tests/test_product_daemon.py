@@ -636,6 +636,35 @@ class StartIdentityTests(DaemonCase):
 
 
 class ReconciliationTests(DaemonCase):
+    def test_daemon_watch_uses_existing_tick_and_never_grants_write(self):
+        watch = str(self.root / "feedback-watch.json")
+        configured = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "example/model"},
+            "daemon": {"feedback_watch_file": watch},
+        })
+        daemon = self.build(FakeDriver(), config=configured)
+        daemon.start()
+        reply = {"status": "RUNNING", "watch_id": "sample-one",
+                 "observations": [{"decision": "INVESTIGATE"}]}
+        with mock.patch("cao.feedback_loop.tick", return_value=reply) as ran:
+            output = daemon.tick()
+        ran.assert_called_once_with(watch)
+        self.assertTrue(any(x.get("action") == "feedback_watch"
+                            and x.get("status") == "RUNNING"
+                            and x.get("cases") == 1
+                            for x in output["effects"]))
+        self.assertEqual(product_state.read_daemon(self.env)["errors"], 0)
+        # The same daemon holds unknown rather than interpreting absence of
+        # source as a healthy no-action observation.
+        with mock.patch("cao.feedback_loop.tick",
+                        side_effect=ValueError("source unavailable")):
+            held = daemon.tick()
+        self.assertTrue(any(x.get("action") == "feedback_watch_hold"
+                            and x.get("status") == "UNKNOWN"
+                            for x in held["effects"]))
+        self.assertEqual(product_state.read_daemon(self.env)["errors"], 1)
+
     def test_one_tick_reconciles_a_running_task(self) -> None:
         driver = FakeDriver()
         task = self.run_read(driver)
@@ -834,11 +863,11 @@ class ReconciliationTests(DaemonCase):
                 result = super().agent_prompt(
                     target, text, timeout_ms=timeout_ms, wait=wait)
                 challenge = re.search(
-                    r"CAO_TEAM_CHALLENGE: ([0-9a-f]{16})", text)
+                    r"CAO_TEAM_NONCE_V2: ([0-9a-f]{16})", text)
                 assert challenge
                 self.read_text = (
                     "Inspected the bounded source.\nCAO_TEAM_RESULT: "
-                    + challenge.group(1)[::-1])
+                    + challenge.group(1))
                 self._panes[self._agents[target]]["agent_status"] = "done"
                 return result
 
@@ -880,6 +909,53 @@ class ReconciliationTests(DaemonCase):
         self.assertEqual(
             product_state.read_daemon(self.env)["supervision"][ident]["action"],
             "team_owned")
+
+    def test_retry_read_preserves_current_and_historical_team_ownership(self) -> None:
+        """A stopped failed READ remains historical; its retry is team-owned."""
+        spec = {
+            "schema": "cao.team.v1", "team_id": "retried-inspection",
+            "max_parallel": 1, "max_writers": 0,
+            "roles": {"reader": {"instruction": "Inspect."}},
+            "tasks": [{
+                "id": "source", "role": "reader", "repo": str(self.repo),
+                "mode": "read", "prompt": "Read bounded source",
+            }],
+        }
+        team.initialize(spec, env=self.env)
+        old_id = team._execution_id("retried-inspection", "source", "work", 0)
+        new_id = team._execution_id("retried-inspection", "source", "work", 0, 1)
+        checkpoint = team._required("retried-inspection", self.env)
+        slot = checkpoint["slots"]["source"]
+        slot.update(status="running", execution_id=new_id,
+                    retry_no=1, prompt="read retry")
+        checkpoint["desired"] = "paused"
+        team._save(checkpoint, self.env)
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA, "task_id": old_id,
+            "run_id": "cao-team-retried-inspection", "status": "stopped",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }, self.env)
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA, "task_id": new_id,
+            "run_id": "cao-team-retried-inspection", "status": "running",
+            "updated_at": "2026-01-01T00:00:01Z",
+        }, self.env)
+        driver = FakeDriver()
+        daemon = self.build(driver)
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("team task was re-driven")) as run:
+            daemon.tick()
+        run.assert_not_called()
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        self.assertEqual(supervision[old_id]["action"], "team_historical")
+        self.assertEqual(supervision[old_id]["status"], "stopped")
+        self.assertEqual(supervision[new_id]["action"], "team_owned")
+        self.assertEqual(supervision[new_id]["status"], "running")
+        self.assertFalse(any(
+            v.get("status") == "HELD_UNKNOWN" for v in
+            (supervision[old_id], supervision[new_id])
+        ))
 
     def test_prior_review_and_correction_stages_preserve_team_ownership(self) -> None:
         # A reviewer/correction team retains durable per-phase task records

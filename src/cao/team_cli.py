@@ -25,6 +25,9 @@ def main(arguments: Sequence[str]) -> int:
     recovery = subs.add_parser("resume", help="resume an inspected UNKNOWN task without a new execution ID")
     recovery.add_argument("--id", required=True)
     recovery.add_argument("--task", required=True)
+    retry = subs.add_parser("retry-read", help="admit a fresh READ attempt after an invalid receipt and verified stop")
+    retry.add_argument("--id", required=True)
+    retry.add_argument("--task", required=True)
     subs.add_parser("list", help="inspect all stored teams")
     try:
         args = parser.parse_args(list(arguments))
@@ -46,6 +49,8 @@ def main(arguments: Sequence[str]) -> int:
             result = team.status(args.id)
         elif args.command == "resume":
             result = team.resume(args.id, args.task)
+        elif args.command == "retry-read":
+            result = team.retry_read(args.id, args.task)
         elif args.command in ("start", "pause"):
             result = team.set_desired(
                 args.id, "running" if args.command == "start" else "paused")

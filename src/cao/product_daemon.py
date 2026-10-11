@@ -51,6 +51,7 @@ from typing import Any, Callable
 from . import (
     coordinator,
     evidence,
+    improvement,
     product_config,
     product_driver,
     product_state,
@@ -118,26 +119,34 @@ def _team_execution_owners(
                 0 if slot["phase"] == "work"
                 else 2 * slot["round"] + (1 if slot["phase"] == "review" else 0)
             )
-            candidates = [("work", 0)]
+            # Include both the original READ work identity and a one-time
+            # explicitly admitted retry, preserving previous task ownership.
+            retry_no = slot.get("retry_no", 0)
+            candidates = [("work", 0, 0)]
+            if retry_no:
+                candidates.append(("work", 0, retry_no))
             if task["reviewer"] is not None:
                 candidates.extend(
-                    ("review", r)
+                    ("review", r, 0)
                     for r in range(task["max_corrections"] + 1)
                 )
                 candidates.extend(
-                    ("correction", r)
+                    ("correction", r, 0)
                     for r in range(1, task["max_corrections"] + 1)
                 )
-            for phase, round_no in candidates:
+            for phase, round_no, attempt in candidates:
                 execution_id = team._execution_id(
-                    team_id, task["id"], phase, round_no)
+                    team_id, task["id"], phase, round_no, attempt)
                 stage_position = (
                     0 if phase == "work"
                     else 2 * round_no + (1 if phase == "review" else 0)
                 )
                 stage_kind = (
                     "current" if execution_id == slot["execution_id"]
-                    else "historical" if stage_position < current_position
+                    else "historical" if (
+                        stage_position < current_position
+                        or (phase == "work" and attempt < retry_no)
+                    )
                     else "unlaunched"
                 )
                 owner = (team_id, stage_kind)
@@ -780,6 +789,7 @@ class Daemon:
 
     def tick(self) -> dict[str, Any]:
         """One deterministic reconciliation cycle."""
+        from . import team
 
         record = product_state.read_daemon(self._env) or product_state.default_daemon_record()
         if record.get("desired") == "stopped":
@@ -849,6 +859,26 @@ class Daemon:
                 )
 
         wakes = self._relay_tasks(tasks, owners=owners)
+        # Source-attested feedback uses this existing cadence. A watch admits
+        # bounded READ investigations only; all WRITE remains explicit and
+        # Registry-gated in Team Execution. No separate scheduler or ledger.
+        if self._config is not None and self._defaults.feedback_watch_file is not None:
+            from . import feedback_loop
+            try:
+                report = feedback_loop.tick(self._defaults.feedback_watch_file)
+                effects.append({
+                    "action": "feedback_watch", "status": report["status"],
+                    "watch_id": report["watch_id"],
+                    "cases": len(report["observations"]),
+                })
+            except (feedback_loop.FeedbackError, improvement.ImprovementError,
+                    team.TeamError, product_config.ProductConfigError, StateError,
+                    OSError, ValueError, TypeError, UnicodeError) as exc:
+                record["errors"] = int(record.get("errors") or 0) + 1
+                effects.append({
+                    "action": "feedback_watch_hold", "status": "UNKNOWN",
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                })
         # Teams reuse this daemon and the existing Registry/task runner. No
         # second wake daemon, queue or WRITE authority is introduced.
         if self._config is not None and self._driver is not None:

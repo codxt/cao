@@ -85,7 +85,7 @@ value. If a provider cannot be verified this way, the verdict stays
 | --- | --- | --- |
 | Configuration | `XDG_CONFIG_HOME` | `~/.config` |
 | Product state and managed binaries | `XDG_STATE_HOME` | `~/.local/state` |
-| Work Registry ledger | `CAO_REGISTRY_DB` (optional, takes precedence), otherwise `XDG_STATE_HOME` | `~/.local/state/cao-work-registry/registry.sqlite3` |
+| Work Registry ledger | `CAO_REGISTRY_DB` (highest priority), then product config `registry_db`, then `XDG_STATE_HOME` | `~/.local/state/cao-work-registry/registry.sqlite3` |
 
 All three roots are honoured at call time, so a sandbox can isolate CAO
 completely by pointing them at a temporary directory. A selected
@@ -93,7 +93,12 @@ completely by pointing them at a temporary directory. A selected
 all dispatchers that could act on the same repositories. `cao doctor` reports
 the same effective registry path as task execution and never creates a ledger
 while checking readiness. Setting the path alone does not establish policy or
-claim-protocol compatibility with an external dispatcher.
+claim-protocol compatibility with an external dispatcher. When sharing a
+host with an existing dispatcher, configure its authoritative ledger in the product
+config (for example, `"registry_db": "/absolute/path/to/shared/registry.sqlite3"`)
+so manual CLI, doctor and daemon agree even without an inherited environment
+variable. The path must be absolute and normalized; no ledger is copied or
+merged, and `CAO_REGISTRY_DB` remains an explicit override.
 
 ## The read-only core CLI
 

@@ -196,7 +196,11 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
             raise TeamError("malformed team task checkpoint")
         phase, current = slot.get("phase"), slot.get("status")
         round_no = slot.get("round")
-        if (set(slot) != expected_fields
+        retry_no = slot.get("retry_no", 0)
+        if (not expected_fields.issubset(slot)
+                or set(slot) - expected_fields - {"retry_no"}
+                or type(retry_no) is not int or not 0 <= retry_no <= 1
+                or (retry_no and (task["mode"] != "read" or phase != "work"))
                 or phase not in ("work", "review", "correction")
                 or current not in ("pending", "running", "complete", "blocked", "unknown")
                 or type(round_no) is not int or not 0 <= round_no <= task["max_corrections"]):
@@ -225,7 +229,7 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
             if slot["execution_id"] is not None or slot["prompt"] is not None:
                 raise TeamError("pending task unexpectedly has a launched execution")
         elif slot["execution_id"] is not None:
-            identity = _execution_id(team_id, task["id"], phase, round_no)
+            identity = _execution_id(team_id, task["id"], phase, round_no, retry_no)
             if slot["execution_id"] != identity:
                 raise TeamError("stored execution identity does not match team task")
             if type(slot["prompt"]) is not str or not 0 < len(slot["prompt"]) <= 48000:
@@ -242,7 +246,8 @@ def _save(record: dict[str, Any], env: Mapping[str, str] | None) -> None:
 def summary(record: Mapping[str, Any]) -> dict[str, Any]:
     slots = {name: {"status": slot["status"], "phase": slot["phase"],
                     "round": slot["round"], "execution_id": slot["execution_id"],
-                    "head": slot["head"], "error": slot["error"]}
+                    "head": slot["head"], "error": slot["error"],
+                    "retry_no": slot.get("retry_no", 0)}
              for name, slot in record["slots"].items()}
     statuses = [x["status"] for x in slots.values()]
     overall = ("COMPLETE" if all(s == "complete" for s in statuses)
@@ -311,6 +316,71 @@ def resume(team_id: str, task_id: str, *,
         return summary(record)
 
 
+def retry_read(team_id: str, task_id: str, *,
+               env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Manually admit one new READ attempt after an invalid terminal receipt.
+
+    The original agent must first be stopped through CAO's normal ownership
+    gate. The original task, output and claim remain durable for inspection.
+    This does not retry WRITE, reuse a stopped agent, or dispatch new work.
+    """
+    with dispatch_lock(env):
+        record = _required(team_id, env)
+        slot = record["slots"].get(_ident(task_id))
+        task = next((t for t in record["spec"]["tasks"] if t["id"] == task_id), None)
+        if (record["desired"] != "paused" or task is None or slot is None
+                or task["mode"] != "read" or slot["phase"] != "work"
+                or slot["status"] != "unknown"
+                or slot.get("error") not in (
+                    "TEAM_RESULT_UNVERIFIED", "TEAM_DURABLE_RESULT_UNVERIFIED")
+                or slot.get("retry_no", 0) != 0
+                or not slot.get("execution_id")):
+            raise TeamError("retry requires a paused UNKNOWN READ with a bad receipt")
+        old_id = slot["execution_id"]
+        old = product_state.read_task(old_id, env)
+        claim = (old or {}).get("claim") or {}
+        cp = (old or {}).get("checkpoint") or {}
+        pane = cp.get("pane_id")
+        if (not old or old.get("task_id") != old_id
+                or old.get("run_id") != "cao-team-" + team_id
+                or old.get("work_key") != old_id
+                or old.get("mode") != "READ"
+                or old.get("scope") != []
+                or os.path.realpath(old.get("repo") or "") != os.path.realpath(task["repo"])
+                or old.get("status") != "stopped"
+                or type(pane) is not str or not pane
+                or old.get("pane_closed") != pane
+                or claim.get("status") != "RELEASED"
+                or claim.get("released") is not True
+                or claim.get("outcome") != "abandon"
+                or type(claim.get("claim_id")) is not int):
+            raise TeamError("prior READ task lacks verified stop and pane closure")
+        db = product_config.registry_db_path(env)
+        try:
+            conn = registry.connect_readonly(db)
+            try:
+                row = conn.execute(
+                    "SELECT run_id, work_key, owner, mode, released_at, outcome "
+                    "FROM claims WHERE claim_id=?",
+                    (claim["claim_id"],)).fetchone()
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error, registry.RegistryError) as exc:
+            raise TeamError("shared Registry release cannot be verified") from exc
+        if (row is None or row["run_id"] != "cao-team-" + team_id
+                or row["work_key"] != old_id
+                or row["owner"] != product_task.OWNER
+                or row["mode"] != registry.READ
+                or not row["released_at"] or row["outcome"] != "abandon"):
+            raise TeamError("shared Registry has no matching released READ claim")
+        # Preserve the old task. New attempts get a distinct execution ID
+        # and a new copy-only terminal nonce on the next dispatched prompt.
+        slot.update(status="pending", execution_id=None, prompt=None, head=None,
+                    feedback=None, output=None, error=None, retry_no=1)
+        _save(record, env)
+        return summary(record)
+
+
 def status(team_id: str, *, env: Mapping[str, str] | None = None) -> dict[str, Any]:
     return summary(_required(team_id, env))
 
@@ -363,10 +433,12 @@ def _active_writes(db: str) -> tuple[int, set[str]]:
     return len(rows), {os.path.realpath(r["worktree"]) for r in rows if r["worktree"]}
 
 
-def _execution_id(team_id: str, task_id: str, phase: str, round_no: int) -> str:
-    # Both identity components may contain hyphens. Bind the unambiguous pair
-    # in a digest so a-b/c and a/b-c can never adopt one another's task record.
-    pair = json.dumps([team_id, task_id], separators=(",", ":"), ensure_ascii=True)
+def _execution_id(team_id: str, task_id: str, phase: str, round_no: int,
+                  retry_no: int = 0) -> str:
+    # Preserve the original task identity exactly. A bounded manual READ retry
+    # derives a new digest and therefore can never adopt the old agent/claim.
+    fields = [team_id, task_id] if retry_no == 0 else [team_id, task_id, retry_no]
+    pair = json.dumps(fields, separators=(",", ":"), ensure_ascii=True)
     digest = hashlib.sha256(pair.encode("utf-8")).hexdigest()[:20]
     return f"ct-{team_id}-{task_id}-{phase}-{round_no}-{digest}"
 
@@ -383,6 +455,16 @@ def _result_challenge(execution_id: str) -> str:
     return hashlib.sha256(
         ("cao.team.result\0" + execution_id).encode("utf-8")
     ).hexdigest()[:16]
+
+
+def _receipt_for(execution_id: str, prompt: str) -> str:
+    """Use copy-only nonce in new prompts; preserve legacy in-flight receipts."""
+    nonce = _result_challenge(execution_id)
+    if re.search(r"(?m)^CAO_TEAM_NONCE_V2: " + re.escape(nonce) + r"$", prompt):
+        return "CAO_TEAM_RESULT: " + nonce
+    # Durable prompts issued by earlier releases required reversing the nonce.
+    # Never reinterpret a checkpointed old agent's completion contract.
+    return "CAO_TEAM_RESULT: " + _result_tag(execution_id)
 
 
 def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
@@ -407,16 +489,18 @@ def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
             lines.append("Dependency " + dep + " accepted at " + str(previous.get("head"))
                          + "; untrusted handoff:\n" + str(previous.get("output") or "")[:5000])
     ident = _execution_id(
-        spec["team_id"], task["id"], slot["phase"], slot["round"])
+        spec["team_id"], task["id"], slot["phase"], slot["round"],
+        slot.get("retry_no", 0))
     challenge = _result_challenge(ident)
     lines.append(
-        "Completion evidence: only after completing the assigned task, add one "
-        "standalone final line whose label is CAO_TEAM_RESULT: followed by the "
-        "16 characters of the following hex challenge in REVERSE order "
-        "(no spaces between the label's trailing space and the reversed hex). "
+        "Completion evidence: only after completing the assigned task, write "
+        "one standalone final line beginning with CAO_TEAM_RESULT: followed "
+        "by one space and the 16-character nonce shown below, copied EXACTLY "
+        "as written, with no reversal or calculation. The completed result "
+        "line is deliberately absent from this prompt, to reject prompt echo. "
         "If the task is blocked, cannot run, or needs human permission, "
-        "describe the blocker and DO NOT emit the completion line. "
-        "CAO_TEAM_CHALLENGE: " + challenge
+        "describe the blocker and DO NOT emit a result line.\n"
+        "CAO_TEAM_NONCE_V2: " + challenge
     )
     result = "\n\n".join(lines)
     if len(result) > 48000:
@@ -656,9 +740,9 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
         except product_driver.DriverError:
             return dict(payload, status="unknown",
                         error={"code": "TEAM_RESULT_UNREADABLE"})
-        receipt = "CAO_TEAM_RESULT: " + _result_tag(execution_id)
-        # The expected reversed challenge never appears verbatim in the prompt,
-        # so a displayed prompt echo cannot by itself impersonate model success.
+        receipt = _receipt_for(execution_id, prompt)
+        # The expected assembled result line never appears verbatim in the
+        # prompt, so its echo cannot by itself impersonate model success.
         if not isinstance(output, str) or not re.search(
                 r"(?m)^" + re.escape(receipt) + r"$", output):
             return dict(payload, status="unknown",
@@ -672,7 +756,7 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
             mode=mode, write_scope=scope, config=config, env=env,
             registry_db=registry_db, observation=None, wait_ms=wait_ms)
     if payload.get("status") == "complete":
-        receipt = "CAO_TEAM_RESULT: " + _result_tag(execution_id)
+        receipt = _receipt_for(execution_id, prompt)
         text = payload.get("output")
         if not isinstance(text, str) or not re.search(
                 r"(?m)^" + re.escape(receipt) + r"$", text):
@@ -772,7 +856,9 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                             continue
                         reserved_floor += 1
                     try:
-                        proposed_id = _execution_id(team_id, task["id"], slot["phase"], slot["round"])
+                        proposed_id = _execution_id(
+                            team_id, task["id"], slot["phase"], slot["round"],
+                            slot.get("retry_no", 0))
                         proposed_prompt = _prompt(task, spec, slot, slots)
                     except TeamError as exc:
                         slot["status"] = "unknown"

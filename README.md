@@ -113,11 +113,30 @@ and suggest detection-check improvements after repeated results:
 The check-proof command hashes a selected original evidence artifact and
 compares its bytes to the source-attested reference without displaying it.
 
-These commands require no model or background service. They never claim work,
-start agents, change detection rules or deploy. Real provider observations
-require source-specific adapters; input fingerprints are source assertions,
-not independently authenticated proof. See
-[Evidence-to-Investigation](docs/evidence-to-investigation.md).
+These assessment commands require no model or background service. They do
+not claim work or start agents. Real provider observations need source-specific
+sanitized adapters; input fingerprints assert provenance without authenticating
+the source. See [Evidence-to-Investigation](docs/evidence-to-investigation.md).
+
+### Optional continuous feedback (bounded)
+
+An explicitly configured CAO daemon can scan a source-attested JSON inbox,
+correlate observations against a declared resource graph, and admit one durable
+READ-only investigator per incident. Evidence refs, source SHA, ownership,
+precomputed metric questions, and potential impact stay attached to the same
+incident. There is no new queue, scheduler, ledger, telemetry scraper, or
+unattended WRITE authority.
+
+    cao improve watch --file /path/to/private-watch.json --dry-run
+    cao improve watch --file /path/to/private-watch.json
+
+After independent cause/scope review, an operator may explicitly create a
+scoped developer-plus-reviewer team for an isolated Git worktree with
+`cao improve authorize`. The ordinary Work Registry gate still decides every
+WRITE. Publish/deploy remain separately authorized; `verify` evaluates external
+review/CI/deployment evidence and before/after guardrails, while `learn`
+proposes detection changes without silently applying them. See the detailed
+[feedback operating contract](docs/evidence-to-investigation.md).
 
 ## CLI
 
