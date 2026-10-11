@@ -214,8 +214,11 @@ class SignedTeamTests(unittest.TestCase):
             signed = output.getvalue().encode("ascii")
             self.assertEqual(signed, team_approval.proposal(team.validate_spec(self.spec),
                                                              self.config))
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(output := io.StringIO()):
                 self.assertEqual(team_cli.main(["init", "--file", str(document)]), 3)
+            denied = json.loads(output.getvalue())
+            self.assertEqual(denied["code"], "TEAM_APPROVAL_REQUIRED")
+            self.assertEqual(denied["status"], "UNAVAILABLE")
             approval = self.root / "external.sig"
             approval.write_bytes(self.signature())
             with contextlib.redirect_stdout(output := io.StringIO()):

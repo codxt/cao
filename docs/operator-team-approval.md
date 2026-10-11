@@ -77,6 +77,11 @@ Start verifies stored approval. The daemon rechecks approved routing before
 starting or reconciling tasks. Changed model/provider arguments or revoked
 operator trust hold the team instead of silently substituting a backend.
 
+An unsigned, revoked or unverifiable decision reports
+`UNAVAILABLE` with code `TEAM_APPROVAL_REQUIRED` on initialization
+and newly requested starts. Use `cao team plan` and `proposal` to request
+operator review; do not retry by inventing a replacement team.
+
 A CLI-provided `approved_by` string, model completion, GitHub access,
 a valid Registry claim, and the ability to edit a config file are **not**
 operator authorization. Signed team approval grants only this team/role/task

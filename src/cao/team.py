@@ -34,6 +34,11 @@ class TeamError(ValueError):
     code = "TEAM_INVALID"
 
 
+class TeamAdmissionError(TeamError):
+    """The operator's independent approval is absent or not verifiable."""
+    code = "TEAM_APPROVAL_REQUIRED"
+
+
 def _fields(value: object, allowed: set[str], required: set[str], label: str) -> dict:
     if type(value) is not dict or set(value) - allowed or required - set(value):
         raise TeamError(f"{label}: missing/unknown fields")
@@ -352,12 +357,12 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
         admission = None
         if mode == "signed":
             if signature is None:
-                raise TeamError("team initialization needs operator approval")
+                raise TeamAdmissionError("team initialization needs operator approval")
             _check_initiative_lineage(selected, env)
             try:
                 admission = team_approval.verify(selected, resolved, signature)
             except team_approval.ApprovalError as exc:
-                raise TeamError(str(exc)) from exc
+                raise TeamAdmissionError(str(exc)) from exc
         elif signature is not None:
             raise TeamError("signed approval was not configured")
         record = {
@@ -393,9 +398,9 @@ def set_desired(team_id: str, desired: str, *, env: Mapping[str, str] | None = N
                 try:
                     team_approval.verify_saved(record["spec"], config, record["admission"])
                 except team_approval.ApprovalError as exc:
-                    raise TeamError(str(exc)) from exc
+                    raise TeamAdmissionError(str(exc)) from exc
             elif team_approval.policy(config)["mode"] == "signed":
-                raise TeamError("existing unapproved team cannot be newly started")
+                raise TeamAdmissionError("existing unapproved team cannot be newly started")
         record["desired"] = desired
         _save(record, env)
         return summary(record)
@@ -915,7 +920,7 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
             try:
                 team_approval.verify_saved(spec, config, admission)
             except team_approval.ApprovalError as exc:
-                raise TeamError(str(exc)) from exc
+                raise TeamAdmissionError(str(exc)) from exc
         freeze_legacy_pending = signed_mode and admission is None
         record["tick_count"] += 1
         changes = 0
