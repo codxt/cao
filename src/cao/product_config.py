@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import state as state_module
+from . import agent_profiles, state as state_module
 
 __all__ = [
     "SCHEMA",
@@ -178,6 +178,13 @@ def validate_config(payload: Mapping[str, Any]) -> ProductConfig:
             ),
             model=_optional_nonempty_str(raw_provider.get("model"), "provider.model"),
         )
+
+    # Agent launch preferences are operator-local data; reject unknown flags,
+    # executable identifiers and unsafe forms before task admission.
+    try:
+        agent_profiles.validate_profiles(payload.get("agent_profiles"))
+    except agent_profiles.AgentProfileError as exc:
+        raise ProductConfigError(str(exc)) from exc
 
     managed = payload.get("managed")
     if managed is not None and not isinstance(managed, Mapping):
