@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import improvement, feedback_loop, team
+from . import improvement, feedback_loop, engineering_loop, team
 from .state import StateError
 
 MAX_INPUT_BYTES = 512 * 1024
@@ -137,6 +137,13 @@ def build_parser() -> argparse.ArgumentParser:
     authorize.add_argument("--checkout", required=True, help="dedicated clean Git worktree")
     authorize.add_argument("--model", required=True, help="investigation-to-correction specialist")
     authorize.add_argument("--review-model", required=True, help="independent review model")
+    engineering = subs.add_parser(
+        "engineering", help="observe qualified evaluation and exact GitHub CI/PR promotion gates")
+    target = engineering.add_mutually_exclusive_group(required=True)
+    target.add_argument("--file", help="one private engineering automation manifest")
+    target.add_argument("--directory", help="bounded ordered queue of private engineering manifests")
+    engineering.add_argument("--execute", action="store_true",
+                             help="enable preauthorized GitHub-native auto-merge request")
     cmd = subs.add_parser("learn")
     cmd.add_argument("--history", required=True,
                      help="list of source-attested case and outcome pairs")
@@ -163,6 +170,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = feedback_loop.authorize_correction(
                 args.file, args.case_file, args.cause, args.checkout,
                 args.model, args.review_model)
+        elif args.command == "engineering":
+            result = (engineering_loop.tick(args.file, execute=args.execute)
+                      if args.file else engineering_loop.tick_queue(
+                          args.directory, execute=args.execute))
         else:
             case = _load(args.file)
             if args.command == "assess":
@@ -177,6 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = improvement.verify(case, _load(args.after))
     except (improvement.ImprovementError, feedback_loop.FeedbackError,
+            engineering_loop.EngineeringError,
             team.TeamError, StateError, subprocess.TimeoutExpired,
             OSError, UnicodeError, ValueError,
             RecursionError, TypeError, KeyError, StopIteration) as exc:

@@ -469,6 +469,8 @@ class DaemonDefaults:
     retry_bound: int
     stop_timeout: float
     feedback_watch_file: str | None = None
+    engineering_watch_file: str | None = None
+    engineering_queue_dir: str | None = None
 
 
 def daemon_defaults(
@@ -516,7 +518,24 @@ def daemon_defaults(
         or not os.path.isabs(watch) or os.path.normpath(watch) != watch
     ):
         raise ProductConfigError("daemon.feedback_watch_file must be a normalized absolute path")
+    engineering_watch = raw.get("engineering_watch_file")
+    if engineering_watch is not None and (
+        type(engineering_watch) is not str or not engineering_watch
+        or len(engineering_watch) > 2048 or not os.path.isabs(engineering_watch)
+        or os.path.normpath(engineering_watch) != engineering_watch
+    ):
+        raise ProductConfigError("daemon.engineering_watch_file must be a normalized absolute path")
+    queue_dir = raw.get("engineering_queue_dir")
+    if queue_dir is not None and (
+        type(queue_dir) is not str or not queue_dir or len(queue_dir) > 2048
+        or not os.path.isabs(queue_dir) or os.path.normpath(queue_dir) != queue_dir
+    ):
+        raise ProductConfigError("daemon.engineering_queue_dir must be a normalized absolute path")
+    if queue_dir is not None and engineering_watch is not None:
+        raise ProductConfigError("choose one engineering watch or engineering queue")
     return DaemonDefaults(
+        engineering_queue_dir=queue_dir,
+        engineering_watch_file=engineering_watch,
         feedback_watch_file=watch,
         tick_interval=interval,
         min_tick_interval=min_interval,

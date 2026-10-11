@@ -636,6 +636,57 @@ class StartIdentityTests(DaemonCase):
 
 
 class ReconciliationTests(DaemonCase):
+    def test_engineering_queue_uses_same_daemon_and_no_worker_change(self):
+        queue = str(self.root / "private-queue")
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "example/model"},
+            "daemon": {"engineering_queue_dir": queue},
+        })
+        daemon = self.build(FakeDriver(), config=config)
+        daemon.start()
+        report = {
+            "status": "PENDING", "in_flight": "one-case",
+            "items": [{"merge_requested": False, "status": "AWAITING_OPERATOR_APPROVAL"}],
+        }
+        with mock.patch("cao.engineering_loop.tick_queue", return_value=report) as called:
+            observed = daemon.tick()
+        called.assert_called_once_with(queue, execute=True)
+        self.assertTrue(any(item.get("action") == "engineering_queue"
+                            and item.get("status") == "PENDING"
+                            and not item["merge_requested"]
+                            for item in observed["effects"]))
+
+    def test_optional_engineering_watch_uses_same_daemon_without_unapproved_merge(self):
+        watch = str(self.root / "engineering-watch.json")
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "example/model"},
+            "daemon": {"engineering_watch_file": watch},
+        })
+        driver = FakeDriver()
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        report = {
+            "watch_id": "sample-loop", "status": "AWAITING_OPERATOR_APPROVAL",
+            "merge_requested": False,
+        }
+        with mock.patch("cao.engineering_loop.tick", return_value=report) as called:
+            result = daemon.tick()
+        called.assert_called_once_with(watch, execute=True)
+        self.assertTrue(any(x.get("action") == "engineering_watch"
+                            and x.get("status") == "AWAITING_OPERATOR_APPROVAL"
+                            and not x["merge_requested"]
+                            for x in result["effects"]))
+        self.assertEqual(product_state.read_daemon(self.env)["errors"], 0)
+        with mock.patch("cao.engineering_loop.tick",
+                        side_effect=ValueError("private source invalid")):
+            held = daemon.tick()
+        self.assertTrue(any(x.get("action") == "engineering_watch_hold"
+                            and x.get("status") == "UNKNOWN"
+                            for x in held["effects"]))
+        self.assertEqual(product_state.read_daemon(self.env)["errors"], 1)
+
     def test_daemon_watch_uses_existing_tick_and_never_grants_write(self):
         watch = str(self.root / "feedback-watch.json")
         configured = product_config.validate_config({

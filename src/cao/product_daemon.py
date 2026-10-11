@@ -879,6 +879,44 @@ class Daemon:
                     "action": "feedback_watch_hold", "status": "UNKNOWN",
                     "reason": getattr(exc, "code", type(exc).__name__),
                 })
+        # One bounded engineering automation uses this same daemon cadence.
+        # Only a separately authenticated operator approval can admit a
+        # GitHub-native auto-merge request; the daemon never grants it.
+        if self._config is not None and self._defaults.engineering_watch_file is not None:
+            from . import engineering_loop
+            try:
+                report = engineering_loop.tick(
+                    self._defaults.engineering_watch_file, execute=True)
+                effects.append({
+                    "action": "engineering_watch", "status": report["status"],
+                    "watch_id": report["watch_id"],
+                    "merge_requested": report["merge_requested"],
+                })
+            except (engineering_loop.EngineeringError, OSError, ValueError,
+                    TypeError, UnicodeError) as exc:
+                record["errors"] = int(record.get("errors") or 0) + 1
+                effects.append({
+                    "action": "engineering_watch_hold", "status": "UNKNOWN",
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                })
+        if self._config is not None and self._defaults.engineering_queue_dir is not None:
+            from . import engineering_loop
+            try:
+                report = engineering_loop.tick_queue(
+                    self._defaults.engineering_queue_dir, execute=True)
+                effects.append({
+                    "action": "engineering_queue", "status": report["status"],
+                    "in_flight": report["in_flight"],
+                    "merge_requested": any(
+                        item["merge_requested"] for item in report["items"]),
+                })
+            except (engineering_loop.EngineeringError, OSError, ValueError,
+                    TypeError, UnicodeError) as exc:
+                record["errors"] = int(record.get("errors") or 0) + 1
+                effects.append({
+                    "action": "engineering_queue_hold", "status": "UNKNOWN",
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                })
         # Teams reuse this daemon and the existing Registry/task runner. No
         # second wake daemon, queue or WRITE authority is introduced.
         if self._config is not None and self._driver is not None:
