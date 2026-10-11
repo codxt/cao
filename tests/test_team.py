@@ -457,6 +457,121 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(team._receipt_for(ident, "legacy prompt"),
                          "CAO_TEAM_RESULT: " + team._result_tag(ident))
 
+    def test_result_receipt_matcher_tolerates_bounded_terminal_indentation(self):
+        ident = "ct-squad-reader-work-0"
+        receipt = team._receipt_for(ident, "legacy prompt")
+        for indent in ("", " ", "  ", "   ", "    ", "\t", "\t\t",
+                       "\t\t\t", "\t\t\t\t", " \t", "  \t "):
+            with self.subTest(indent=indent):
+                self.assertTrue(team._receipt_present(
+                    "notes\n" + indent + receipt + "\nmore notes", receipt))
+
+    def test_result_receipt_matcher_rejects_altered_lines(self):
+        ident = "ct-squad-reader-work-0"
+        receipt = team._receipt_for(ident, "legacy prompt")
+        challenge = team._result_challenge(ident)
+        for text in (
+            None,
+            "analysis without any receipt line",
+            "     " + receipt,                       # indentation past the bound
+            "\t    " + receipt,                       # five indentation columns
+            " " + receipt + " plus trailing text",
+            " " + receipt[:-1],                       # truncated nonce
+            " CAO_TEAM_RESULT: " + ("f" * 16),        # changed nonce
+            " CAO_TEAM_NONCE_V2: " + challenge,       # prompt echo, not a receipt
+            "summary " + receipt,                     # leading text on the line
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(team._receipt_present(text, receipt))
+
+    def test_indented_live_result_receipt_marks_task_complete(self):
+        ident = "ct-squad-reader-work-0"
+        challenge = team._result_challenge(ident)
+        prompt = "Analyze source\nCAO_TEAM_NONCE_V2: " + challenge
+        receipt = team._receipt_for(ident, prompt)
+        driver = FakeDriver()
+        driver.read_text = "analysis complete\n  " + receipt + "\n"
+        checkpoint = {"checkpoint": {"agent_name": "actor",
+                                     "prompt_ack": "accepted"}}
+        with mock.patch("cao.product_task.run_task", side_effect=[
+                {"status": "running", "claim": {"released": False}},
+                {"status": "complete", "claim": {
+                    "released": True, "released_head": A},
+                 "output": receipt}]), \
+                mock.patch("cao.product_state.read_task", return_value=checkpoint):
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "write",
+                      "write_scope": ["README.md"]},
+                prompt=prompt, phase="work", config=self.config,
+                driver=driver, env=self.env, wait_ms=1000,
+                registry_db="unused")
+        self.assertEqual(result["status"], "complete")
+
+    def test_indented_durable_result_receipt_marks_task_complete(self):
+        ident = "ct-squad-reader-work-0"
+        challenge = team._result_challenge(ident)
+        prompt = "Analyze source\nCAO_TEAM_NONCE_V2: " + challenge
+        receipt = team._receipt_for(ident, prompt)
+        payload = {"status": "complete", "claim": {
+            "released": True, "released_head": A},
+            "output": "final summary\n\t" + receipt + "\n"}
+        record = {"checkpoint": {"agent_name": "reader",
+                                 "workspace_id": "w9", "pane_id": "w9:p1"}}
+        with mock.patch("cao.product_task.run_task", return_value=payload) as runner, \
+                mock.patch("cao.product_state.read_task", return_value=record), \
+                mock.patch("cao.product_task._close_owned_pane",
+                           return_value=("w9:p1", None)), \
+                mock.patch("cao.product_state.update_task"):
+            result = team._execute(
+                execution_id=ident,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt=prompt, phase="work", config=self.config,
+                driver=FakeDriver(), env=self.env, wait_ms=1000,
+                registry_db="unused")
+        self.assertEqual(result["status"], "complete")
+        runner.assert_called_once()
+
+    def test_over_indented_or_altered_receipts_fail_closed_on_both_checks(self):
+        ident = "ct-squad-reader-work-0"
+        challenge = team._result_challenge(ident)
+        prompt = "Analyze source\nCAO_TEAM_NONCE_V2: " + challenge
+        receipt = team._receipt_for(ident, prompt)
+        altered = ("     " + receipt,             # indentation past the bound
+                   "  " + receipt + " extra",      # appended text
+                   "  CAO_TEAM_RESULT: " + ("f" * 16))  # changed nonce
+        for text in altered:
+            driver = FakeDriver()
+            driver.read_text = "analysis\n" + text
+            checkpoint = {"checkpoint": {"agent_name": "actor",
+                                         "prompt_ack": "accepted"}}
+            with self.subTest(check="live", text=text), \
+                    mock.patch("cao.product_task.run_task",
+                               return_value={"status": "running"}), \
+                    mock.patch("cao.product_state.read_task",
+                               return_value=checkpoint):
+                result = team._execute(
+                    execution_id=ident,
+                    task={"repo": self.paths[0], "mode": "write",
+                          "write_scope": ["README.md"]},
+                    prompt=prompt, phase="work", config=self.config,
+                    driver=driver, env=self.env, wait_ms=1000,
+                    registry_db="unused")
+            self.assertEqual(result["error"]["code"], "TEAM_RESULT_UNVERIFIED")
+        for text in altered:
+            payload = {"status": "complete", "claim": {
+                "released": True, "released_head": A}, "output": text}
+            with self.subTest(check="durable", text=text), \
+                    mock.patch("cao.product_task.run_task", return_value=payload):
+                result = team._execute(
+                    execution_id=ident,
+                    task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                    prompt=prompt, phase="work", config=self.config,
+                    driver=FakeDriver(), env=self.env, wait_ms=1000,
+                    registry_db="unused")
+            self.assertEqual(result["error"]["code"],
+                             "TEAM_DURABLE_RESULT_UNVERIFIED")
+
     def test_team_read_agent_pane_must_be_closed_before_handback(self):
         ident = "ct-squad-read-work-0"
         payload = {"status": "complete", "claim": {

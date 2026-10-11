@@ -576,6 +576,19 @@ def _receipt_for(execution_id: str, prompt: str) -> str:
     return "CAO_TEAM_RESULT: " + _result_tag(execution_id)
 
 
+def _receipt_present(output: Any, receipt: str) -> bool:
+    """Match one exact receipt line tolerating bounded terminal indentation.
+
+    A terminal may render an otherwise exact standalone line indented by up
+    to four spaces or tabs. The receipt token and the rest of the line must
+    still match exactly, so a changed nonce, appended text, or a prompt echo
+    is never accepted.
+    """
+    if not isinstance(output, str):
+        return False
+    return bool(re.search(r"(?m)^[ \t]{0,4}" + re.escape(receipt) + r"$", output))
+
+
 def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
             slot: Mapping[str, Any], slots: Mapping[str, Any]) -> str:
     role_id = task["reviewer"] if slot["phase"] == "review" else task["role"]
@@ -866,8 +879,7 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
         receipt = _receipt_for(execution_id, prompt)
         # The expected assembled result line never appears verbatim in the
         # prompt, so its echo cannot by itself impersonate model success.
-        if not isinstance(output, str) or not re.search(
-                r"(?m)^" + re.escape(receipt) + r"$", output):
+        if not _receipt_present(output, receipt):
             return dict(payload, status="unknown",
                         error={"code": "TEAM_RESULT_UNVERIFIED"})
 
@@ -881,8 +893,7 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
     if payload.get("status") == "complete":
         receipt = _receipt_for(execution_id, prompt)
         text = payload.get("output")
-        if not isinstance(text, str) or not re.search(
-                r"(?m)^" + re.escape(receipt) + r"$", text):
+        if not _receipt_present(text, receipt):
             return dict(payload, status="unknown",
                         error={"code": "TEAM_DURABLE_RESULT_UNVERIFIED"})
     if mode == "read" and payload.get("status") == "complete":
