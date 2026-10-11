@@ -41,6 +41,7 @@ Fail-closed rules this module enforces:
 from __future__ import annotations
 
 import os
+import re
 import signal
 import time
 from collections.abc import Mapping
@@ -75,6 +76,97 @@ DAEMON_STATUS_SCHEMA = "cao.product.daemon.status.v0"
 
 _TERMINAL_STATUSES = ("complete", "stopped")
 _RECOVERABLE_STATUSES = ("pending", "claimed", "running")
+_TEAM_EXECUTION_ID = re.compile(
+    r"^ct-.+-(?:work|review|correction)-[0-9]+-[0-9a-f]{20}$"
+)
+
+
+def _team_execution_owners(
+    env: Mapping[str, str] | None,
+) -> dict[str, tuple[str, str] | None]:
+    """Resolve current and historical stage IDs from validated team manifests.
+
+    A task's work, review and correction stages each have a distinct durable
+    execution ID. The current slot alone is insufficient: previous stage
+    records still exist and must never be adopted by generic recovery.
+    """
+    from . import team
+
+    owners: dict[str, tuple[str, str] | None] = {}
+    try:
+        listed = team.list_teams(env=env)
+    except Exception:
+        # If the team directory itself is unreadable, do not impede ordinary
+        # task recovery. Unverifiable team-shaped tasks still hold UNKNOWN.
+        return owners
+    for info in listed:
+        if info.get("status") == "CORRUPT":
+            continue
+        team_id = info.get("team_id")
+        if not isinstance(team_id, str):
+            continue
+        try:
+            checkpoint = team._required(team_id, env)
+        except Exception:
+            # A disappearing or corrupt team cannot grant a new owner.
+            # Its task records will hold UNKNOWN via their team run ID.
+            continue
+        for task in checkpoint["spec"]["tasks"]:
+            slot = checkpoint["slots"][task["id"]]
+            # work0 -> review0 -> correction1 -> review1 -> ...
+            current_position = (
+                0 if slot["phase"] == "work"
+                else 2 * slot["round"] + (1 if slot["phase"] == "review" else 0)
+            )
+            candidates = [("work", 0)]
+            if task["reviewer"] is not None:
+                candidates.extend(
+                    ("review", r)
+                    for r in range(task["max_corrections"] + 1)
+                )
+                candidates.extend(
+                    ("correction", r)
+                    for r in range(1, task["max_corrections"] + 1)
+                )
+            for phase, round_no in candidates:
+                execution_id = team._execution_id(
+                    team_id, task["id"], phase, round_no)
+                stage_position = (
+                    0 if phase == "work"
+                    else 2 * round_no + (1 if phase == "review" else 0)
+                )
+                stage_kind = (
+                    "current" if execution_id == slot["execution_id"]
+                    else "historical" if stage_position < current_position
+                    else "unlaunched"
+                )
+                owner = (team_id, stage_kind)
+                if execution_id not in owners:
+                    owners[execution_id] = owner
+                elif owners[execution_id] != owner:
+                    owners[execution_id] = None
+    return owners
+
+
+def _task_owner_lane(
+    record: Mapping[str, Any],
+    owners: Mapping[str, tuple[str, str] | None],
+) -> str:
+    """Choose ordinary/current-team/historical-team/unknown recovery."""
+    run_id, task_id = record.get("run_id"), record.get("task_id")
+    if isinstance(task_id, str) and task_id in owners:
+        owner = owners[task_id]
+        if owner is not None and run_id == "cao-team-" + owner[0]:
+            return "team_" + owner[1]
+        return "unknown"
+    if isinstance(run_id, str) and run_id.startswith("cao-team-"):
+        # Missing/invalid checkpoint is never generic recovery authority.
+        return "unknown"
+    if isinstance(task_id, str) and _TEAM_EXECUTION_ID.fullmatch(task_id):
+        # Fail closed even if BOTH the team checkpoint and run ID are missing.
+        # Prefix-only lookalikes such as ct-job remain ordinary.
+        return "unknown"
+    return "ordinary"
 
 
 class DaemonError(Exception):
@@ -700,6 +792,9 @@ class Daemon:
 
         occupancy = self._occupied()
         tasks = product_state.list_tasks(self._env)
+        # Snapshot team ownership once, ahead of generic recovery effects.
+        # Ordinary tasks still operate even when a separate team is corrupt.
+        owners = _team_execution_owners(self._env)
         retries = dict(record.get("retries") or {})
         checkpoints = dict(record.get("checkpoints") or {})
         supervision = dict(record.get("supervision") or {})
@@ -708,6 +803,35 @@ class Daemon:
         for task in tasks:
             task_id = task.get("task_id")
             if not isinstance(task_id, str) or not task_id:
+                continue
+            lane = _task_owner_lane(task, owners)
+            if lane != "ordinary":
+                # Only a positively checkpointed team can own a team task.
+                # Ambiguous/missing identity holds UNKNOWN; never re-drive
+                # or release its Registry claim through the generic loop.
+                retries.pop(task_id, None)
+                recorded_status = str(task.get("status") or "")
+                historical = lane == "team_historical"
+                hold = lane in ("unknown", "team_unlaunched") or (
+                    historical and recorded_status not in _TERMINAL_STATUSES)
+                reason = (
+                    "team ownership is unverified" if lane == "unknown"
+                    else "team stage was not launched" if lane == "team_unlaunched"
+                    else "non-current team stage" if hold else None
+                )
+                supervision[task_id] = {
+                    "status": "HELD_UNKNOWN" if hold else recorded_status,
+                    "action": ("hold" if hold else
+                               "team_historical" if historical else "team_owned"),
+                    "terminal": not hold and recorded_status in _TERMINAL_STATUSES,
+                    "reason": reason,
+                    "reconciler": "team" if lane != "unknown" else None,
+                }
+                if hold:
+                    effects.append({
+                        "task_id": task_id, "action": "team_ownership_hold",
+                        "status": "UNKNOWN", "reason": reason,
+                    })
                 continue
             entry = self._reconcile_task(task, occupancy, retries, record)
             supervision[task_id] = entry
@@ -724,7 +848,7 @@ class Daemon:
                     }
                 )
 
-        wakes = self._relay_tasks(tasks)
+        wakes = self._relay_tasks(tasks, owners=owners)
         # Teams reuse this daemon and the existing Registry/task runner. No
         # second wake daemon, queue or WRITE authority is introduced.
         if self._config is not None and self._driver is not None:
@@ -738,8 +862,9 @@ class Daemon:
                         "team_id": update["team_id"], "action": "team_reconcile",
                         "status": update["status"],
                     })
-            except (team.TeamError, StateError, product_driver.DriverError,
-                    registry.RegistryError, product_config.ProductConfigError) as exc:
+            except (team.TeamError, StateError, OSError,
+                    product_driver.DriverError, registry.RegistryError,
+                    product_config.ProductConfigError) as exc:
                 record["errors"] = int(record.get("errors") or 0) + 1
                 effects.append({
                     "action": "team_hold", "status": "UNKNOWN",
@@ -937,13 +1062,18 @@ class Daemon:
             "metrics": {"prompt_issued": 1 if checkpoint.get("prompt_issued") else 0},
         }
 
-    def _relay_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _relay_tasks(self, tasks: list[dict[str, Any]], *,
+                     owners: Mapping[str, tuple[str, str] | None] | None = None
+                     ) -> list[dict[str, Any]]:
         # Clear in place: the cached relay sink is bound to this list object.
         self._wakes_this_tick.clear()
         progress_relay = self._relay_obj()
+        owners = owners if owners is not None else _team_execution_owners(self._env)
         for task in tasks:
             task_id = task.get("task_id")
             if not isinstance(task_id, str) or not task_id:
+                continue
+            if _task_owner_lane(task, owners) != "ordinary":
                 continue
             if str(task.get("status") or "") in _TERMINAL_STATUSES:
                 continue

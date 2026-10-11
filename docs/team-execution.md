@@ -79,8 +79,20 @@ Init stores the manifest and defaults PAUSED; it launches nothing. Start sets
 the durable desired state RUNNING, without itself starting a worker. Tick
 dispatches ready tasks and observes running ones. For continuing unattended
 ticks, use the existing CAO daemon (cao daemon start); no other manager/timer
-is needed. Doctor READY alone is not proof of a qualified private provider
-or autonomous Factory operator.
+is needed. Team-owned product tasks are reconciled **only** by the team loop.
+The daemon resolves ownership from validated durable team checkpoints: an
+execution ID must be referenced by one team and its run ID must agree.
+The older single-task recovery loop and progress relay skip those verified
+team-owned tasks, so they cannot bypass the team result receipt or release
+a claim prematurely. Missing, conflicting or corrupted team ownership is
+held UNKNOWN with an explicit reason; a matching name alone is not authority
+and is never silently routed to the generic recovery loop. Earlier work,
+review and correction execution records remain team-owned after a phase
+transition. Terminal historical stages are recorded without false UNKNOWN
+holds; unexpectedly non-terminal historical stages and stages not yet launched
+hold for inspection. Ordinary product tasks retain their original recovery
+path. Doctor READY alone
+is not proof of a qualified private provider or autonomous Factory operator.
 
 State is stored privately under the XDG CAO state root in teams/team_id.json
 (mode 0600). A shared kernel lock serializes CAO team dispatches. A crash

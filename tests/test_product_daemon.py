@@ -30,6 +30,7 @@ from cao import (
     product_state,
     product_task,
     registry,
+    team,
 )
 from cao.registry import RuntimeObservation, AgentObservation
 from cao.state import StateError
@@ -647,6 +648,403 @@ class ReconciliationTests(DaemonCase):
         self.assertIn("workspace_list", driver.names())
         supervision = product_state.read_daemon(self.env)["supervision"]
         self.assertEqual(supervision[task["task_id"]]["status"], "active")
+
+    def test_team_owned_done_worker_is_never_redriven_by_plain_daemon(self) -> None:
+        # Reproduce the actual ownership collision: a team-owned product task
+        # still has a shared READ claim, its agent became DONE, and an ordinary
+        # daemon tick must not complete/release it before Team Execution has
+        # verified the post-prompt result receipt.
+        driver = FakeDriver()
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"run_id": "cao-team-factory"},
+        })
+        spec = {
+            "schema": "cao.team.v1", "team_id": "factory",
+            "roles": {"reader": {"instruction": "Read only."}},
+            "tasks": [{"id": "inspection", "role": "reader",
+                       "repo": str(self.repo), "mode": "read",
+                       "prompt": "Read tenant source"}],
+        }
+        team.initialize(spec, env=self.env)
+        team.set_desired("factory", "running", env=self.env)
+        ident = team._execution_id("factory", "inspection", "work", 0)
+        record = team._required("factory", self.env)
+        record["slots"]["inspection"].update(
+            status="running", execution_id=ident, prompt="Read tenant source")
+        team._save(record, self.env)
+        created = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Read tenant source",
+            task_id=ident, mode="read", config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(created["status"], "running")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        # Simulate true completed agent instead of vanishing.
+        pane_id = product_state.read_task(ident, self.env)["checkpoint"]["pane_id"]
+        driver._panes[pane_id]["agent_status"] = "done"
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        with (
+            mock.patch("cao.product_task.run_task",
+                       side_effect=AssertionError("legacy re-drive of team task")) as legacy,
+            mock.patch("cao.team.tick_all", return_value=[
+                {"team_id": "factory", "status": "RUNNING"}]) as team_tick,
+        ):
+            report = daemon.tick()
+        legacy.assert_not_called()
+        team_tick.assert_called_once()
+        self.assertTrue(report["ticked"])
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertFalse(record["claim"].get("released", False))
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertNotIn("pane_close", driver.names())
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        self.assertEqual(supervision[ident]["action"], "team_owned")
+        self.assertEqual(supervision[ident]["status"], "running")
+        self.assertTrue(any(x.get("action") == "team_reconcile"
+                            for x in report["effects"]))
+        self.assertEqual(report["wakes"], 0)
+        c = registry.connect_readonly(self.db)
+        try:
+            rows = c.execute(
+                "SELECT mode,released_at FROM claims WHERE work_key=?",
+                (ident,)).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["mode"], "READ")
+            self.assertIsNone(rows[0]["released_at"])
+        finally:
+            c.close()
+
+    def test_unregistered_team_prefixed_product_task_is_held_unknown(self) -> None:
+        # A manually configured run_id/name does not grant team ownership.
+        driver = FakeDriver()
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"run_id": "cao-team-unregistered"},
+        })
+        ident = "ct-unregistered-declared-work-0-abcd"
+        original = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Orphaned-looking job",
+            task_id=ident, config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(original["status"], "running")
+        driver.drop_agents()
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("must not infer ownership")) as legacy:
+            result = daemon.tick()
+        legacy.assert_not_called()
+        entry = product_state.read_daemon(self.env)["supervision"][ident]
+        self.assertEqual(entry["status"], "HELD_UNKNOWN")
+        self.assertEqual(entry["action"], "hold")
+        self.assertTrue(any(x.get("action") == "team_ownership_hold"
+                            for x in result["effects"]))
+        self.assertEqual(product_state.read_task(ident, self.env)["status"], "running")
+
+    def test_team_checkpoint_with_corrupted_run_id_blocks_generic_recovery(self) -> None:
+        driver = FakeDriver()
+        spec = {
+            "schema": "cao.team.v1", "team_id": "factory",
+            "roles": {"reader": {"instruction": "Read only."}},
+            "tasks": [{"id": "inspection", "role": "reader",
+                       "repo": str(self.repo), "mode": "read",
+                       "prompt": "Read tenant source"}],
+        }
+        team.initialize(spec, env=self.env)
+        ident = team._execution_id("factory", "inspection", "work", 0)
+        record = team._required("factory", self.env)
+        record["slots"]["inspection"].update(
+            status="running", execution_id=ident, prompt="Read tenant source")
+        team._save(record, self.env)
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"run_id": "cao-team-factory"},
+        })
+        product_task.run_task(driver=driver, repo=str(self.repo),
+                              prompt="Read tenant source", task_id=ident,
+                              config=config, env=self.env,
+                              registry_db=self.db, wait_ms=0)
+        existing = product_state.read_task(ident, self.env)
+        existing["run_id"] = None
+        product_state.write_task(existing, self.env)
+        driver.drop_agents()
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("cannot bypass team ownership")) as legacy:
+            daemon.tick()
+        legacy.assert_not_called()
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        self.assertEqual(supervision[ident]["status"], "HELD_UNKNOWN")
+
+    def test_team_checkpoint_loss_keeps_unverified_task_out_of_legacy_loop(self) -> None:
+        # A team task still has its original claim and task record after its
+        # team checkpoint disappears. We must not silently recover it as an
+        # ordinary task when its completion receipt is no longer verifiable.
+        driver = FakeDriver()
+        spec = {
+            "schema": "cao.team.v1", "team_id": "missing-state",
+            "roles": {"reader": {"instruction": "Read only."}},
+            "tasks": [{"id": "inspection", "role": "reader",
+                       "repo": str(self.repo), "mode": "read",
+                       "prompt": "Read tenant source"}],
+        }
+        team.initialize(spec, env=self.env)
+        ident = team._execution_id("missing-state", "inspection", "work", 0)
+        record = team._required("missing-state", self.env)
+        record["slots"]["inspection"].update(
+            status="running", execution_id=ident,
+            prompt="Read tenant source")
+        team._save(record, self.env)
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"run_id": "cao-team-missing-state"},
+        })
+        product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Read tenant source",
+            task_id=ident, config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        team_path = team.team_path("missing-state", self.env)
+        Path(team_path).write_text("corrupt checkpoint", encoding="utf-8")
+        driver.drop_agents()
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        with mock.patch(
+                "cao.product_task.run_task",
+                side_effect=AssertionError("must not recover absent team")) as legacy:
+            daemon.tick()
+        legacy.assert_not_called()
+        entry = product_state.read_daemon(self.env)["supervision"][ident]
+        self.assertEqual(entry["status"], "HELD_UNKNOWN")
+        self.assertEqual(product_state.read_task(ident, self.env)["status"], "running")
+
+    def test_team_loop_can_finish_on_same_daemon_without_legacy_redrive(self) -> None:
+        # Prove that blocking legacy recovery does not also block the team
+        # execution loop: the same daemon owns exactly one active team turn.
+        import re
+
+        class CompletedTeamDriver(FakeDriver):
+            def agent_prompt(self, target, text, *, timeout_ms=None, wait=False):
+                result = super().agent_prompt(
+                    target, text, timeout_ms=timeout_ms, wait=wait)
+                challenge = re.search(
+                    r"CAO_TEAM_CHALLENGE: ([0-9a-f]{16})", text)
+                assert challenge
+                self.read_text = (
+                    "Inspected the bounded source.\nCAO_TEAM_RESULT: "
+                    + challenge.group(1)[::-1])
+                self._panes[self._agents[target]]["agent_status"] = "done"
+                return result
+
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                self._panes.pop(pane_id, None)
+                return "{}"
+
+        driver = CompletedTeamDriver()
+        spec = {
+            "schema": "cao.team.v1", "team_id": "actual-run",
+            "max_parallel": 1, "max_writers": 0,
+            "roles": {"reader": {"instruction": "Read only."}},
+            "tasks": [{"id": "inspection", "role": "reader",
+                       "repo": str(self.repo), "mode": "read",
+                       "prompt": "Read bounded source"}],
+        }
+        team.initialize(spec, env=self.env)
+        team.set_desired("actual-run", "running", env=self.env)
+        daemon = self.build(driver)
+        daemon.start()
+        first = daemon.tick()
+        state = team.status("actual-run", env=self.env)
+        self.assertEqual(state["status"], "COMPLETE", state)
+        self.assertTrue(any(
+            x.get("action") == "team_reconcile"
+            and x.get("status") == "COMPLETE" for x in first["effects"]))
+        ident = state["tasks"]["inspection"]["execution_id"]
+        task = product_state.read_task(ident, self.env)
+        self.assertEqual(task["status"], "complete")
+        self.assertTrue(task["claim"]["released"])
+        self.assertEqual(task["pane_closed"], task["checkpoint"]["pane_id"])
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        # On the following daemon tick, terminal team task remains team-owned;
+        # no legacy recovery or additional model turn is permitted.
+        second = daemon.tick()
+        self.assertTrue(second["ticked"])
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(
+            product_state.read_daemon(self.env)["supervision"][ident]["action"],
+            "team_owned")
+
+    def test_prior_review_and_correction_stages_preserve_team_ownership(self) -> None:
+        # A reviewer/correction team retains durable per-phase task records
+        # after the current checkpoint has moved on. Old complete stages are
+        # historical, not unregistered team tasks or daemon retry targets.
+        driver = FakeDriver()
+        spec = {
+            "schema": "cao.team.v1", "team_id": "review-phases",
+            "max_parallel": 1, "max_writers": 1,
+            "roles": {
+                "writer": {"instruction": "Scoped implementation."},
+                "reviewer": {"instruction": "Independent review."},
+            },
+            "tasks": [{
+                "id": "changes", "role": "writer", "repo": str(self.repo),
+                "mode": "write", "write_scope": ["a.txt"],
+                "prompt": "Make one bounded change", "reviewer": "reviewer",
+                "max_corrections": 1,
+            }],
+        }
+        team.initialize(spec, env=self.env)
+        checkpoint = team._required("review-phases", self.env)
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            text=True).strip()
+        # The team has completed work0, review0 and correction1 and is
+        # queued for the final review1; paused means no fresh worker launches.
+        checkpoint["slots"]["changes"].update(
+            phase="review", round=1, status="pending",
+            head=head, execution_id=None, prompt=None)
+        team._save(checkpoint, self.env)
+        team._required("review-phases", self.env)  # validate exact checkpoint
+        prior = [
+            team._execution_id("review-phases", "changes", phase, round_no)
+            for phase, round_no in (
+                ("work", 0), ("review", 0), ("correction", 1))]
+        for index, ident in enumerate(prior):
+            product_state.write_task({
+                "schema": product_state.TASK_SCHEMA,
+                "task_id": ident, "run_id": "cao-team-review-phases",
+                "status": "complete", "updated_at": f"2026-01-01T00:00:0{index}Z",
+            }, self.env)
+        daemon = self.build(driver)
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("historical task re-driven")) as legacy:
+            first = daemon.tick()
+        legacy.assert_not_called()
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        for ident in prior:
+            self.assertEqual(supervision[ident]["action"], "team_historical")
+            self.assertEqual(supervision[ident]["status"], "complete")
+            self.assertTrue(supervision[ident]["terminal"])
+        self.assertFalse(any(
+            effect.get("action") == "team_ownership_hold"
+            for effect in first["effects"]))
+
+        # A historical stage that inexplicably remains running is held for
+        # inspection instead of being revived or released by generic recovery.
+        stale = product_state.read_task(prior[0], self.env)
+        stale["status"] = "running"
+        product_state.write_task(stale, self.env)
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("stale team task re-driven")) as legacy:
+            second = daemon.tick()
+        legacy.assert_not_called()
+        held = product_state.read_daemon(self.env)["supervision"][prior[0]]
+        self.assertEqual(held["status"], "HELD_UNKNOWN")
+        self.assertEqual(held["reason"], "non-current team stage")
+        self.assertTrue(any(
+            effect.get("task_id") == prior[0]
+            and effect.get("action") == "team_ownership_hold"
+            for effect in second["effects"]))
+
+        # A future review stage that has not been launched cannot claim a
+        # historical completion and would also be held if materialized.
+        unlaunched = team._execution_id(
+            "review-phases", "changes", "review", 1)
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA,
+            "task_id": unlaunched, "run_id": "cao-team-review-phases",
+            "status": "complete", "updated_at": "2026-01-01T00:00:05Z",
+        }, self.env)
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("future team stage adopted")) as legacy:
+            daemon.tick()
+        legacy.assert_not_called()
+        future = product_state.read_daemon(self.env)["supervision"][unlaunched]
+        self.assertEqual(future["status"], "HELD_UNKNOWN")
+        self.assertEqual(future["reason"], "team stage was not launched")
+
+    def test_missing_team_and_corrupt_run_id_does_not_redrive_team_shaped_id(self):
+        # Both independently identifying records have been lost/altered.
+        # A deterministic CAO Team Execution ID is a residual safety hint,
+        # not an ownership grant: hold instead of performing a generic re-drive.
+        driver = FakeDriver()
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"run_id": "cao-team-vanished"},
+        })
+        ident = team._execution_id("vanished", "missing", "work", 0)
+        created = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Read source",
+            task_id=ident, config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(created["status"], "running")
+        task = product_state.read_task(ident, self.env)
+        task["run_id"] = None
+        product_state.write_task(task, self.env)
+        driver.drop_agents()
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("dual-fault recovery")) as legacy:
+            daemon.tick()
+        legacy.assert_not_called()
+        entry = product_state.read_daemon(self.env)["supervision"][ident]
+        self.assertEqual(entry["status"], "HELD_UNKNOWN")
+        self.assertEqual(entry["reason"], "team ownership is unverified")
+        self.assertEqual(product_state.read_task(ident, self.env)["status"], "running")
+
+    def test_unreadable_team_directory_preserves_ordinary_task_recovery(self):
+        # A directory-level error must not abort all ordinary supervision.
+        # CAO's team dispatch reports the error rather than silently succeeding.
+        driver = FakeDriver()
+        ordinary = self.run_read(driver, wait_ms=0)
+        self.assertEqual(ordinary["status"], "running")
+        driver.drop_agents()
+        daemon = self.build(driver)
+        daemon.start()
+        with mock.patch("cao.team.list_teams",
+                        side_effect=PermissionError("simulated teams unreadable")):
+            update = daemon.tick()
+        self.assertTrue(update["ticked"])
+        self.assertTrue(any(
+            item.get("action") == "team_hold"
+            and item.get("status") == "UNKNOWN"
+            for item in update["effects"]))
+        result = product_state.read_task(ordinary["task_id"], self.env)
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["claim"]["released"])
+        self.assertEqual(
+            product_state.read_daemon(self.env)["supervision"]
+            [ordinary["task_id"]]["action"], "redrive")
+
+    def test_ordinary_product_task_still_uses_original_recovery_loop(self) -> None:
+        # The new filter is narrow: a fake team-prefixed *task ID* alone is
+        # not enough to exclude an ordinary run from its existing recovery.
+        driver = FakeDriver()
+        created = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Ordinary task",
+            task_id="ct-id-lookalike", config=self.config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(created["status"], "running")
+        driver.drop_agents()
+        daemon = self.build(driver)
+        daemon.start()
+        daemon.tick()
+        record = product_state.read_task("ct-id-lookalike", self.env)
+        self.assertEqual(record["status"], "complete")
+        self.assertTrue(record["claim"]["released"])
+        self.assertEqual(
+            product_state.read_daemon(self.env)["supervision"]
+            ["ct-id-lookalike"]["action"], "redrive")
 
     def test_stale_task_is_redriven_without_a_duplicate_prompt(self) -> None:
         driver = FakeDriver()
