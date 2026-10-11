@@ -1,8 +1,8 @@
 """Durable specialist-team orchestration over the existing CAO task/Registry.
 
 Team state tracks dependencies, handoffs, bounded review/correction and roles.
-An enabled signed team admission gate binds roster and routing to an operator
-decision; it grants no publication, credential or deployment authority.
+Chat approval records the operator-declared team decision; it does not
+authenticate a person or grant publication or deployment authority.
 """
 from __future__ import annotations
 
@@ -284,8 +284,8 @@ def summary(record: Mapping[str, Any]) -> dict[str, Any]:
         result["supersedes"] = record["spec"].get("supersedes")
     if record.get("admission"):
         proof = record["admission"]
-        result["approval"] = {"signer": proof.get("signer"),
-                              "proposal_sha256": proof.get("proposal_sha256"),
+        result["approval"] = {"method": proof.get("method"),
+                              "spec_sha256": proof.get("spec_sha256"),
                               "routes_sha256": proof.get("routes_sha256")}
     return result
 
@@ -344,7 +344,7 @@ def _check_initiative_lineage(spec: Mapping[str, Any],
 
 def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
                config: product_config.ProductConfig | None = None,
-               signature: bytes | None = None) -> dict[str, Any]:
+               approved: bool = False) -> dict[str, Any]:
     selected = validate_spec(spec)
     resolved = _admission_config(env, config)
     mode = team_approval.policy(resolved)["mode"]
@@ -355,16 +355,16 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
                 raise TeamError("team ID already exists with different immutable manifest")
             return summary(old)
         admission = None
-        if mode == "signed":
-            if signature is None:
-                raise TeamAdmissionError("team initialization needs operator approval")
+        if mode == "chat":
+            if approved is not True:
+                raise TeamAdmissionError("confirm the team in chat before --approved")
             _check_initiative_lineage(selected, env)
             try:
-                admission = team_approval.verify(selected, resolved, signature)
+                admission = team_approval.confirmation(selected, resolved)
             except team_approval.ApprovalError as exc:
                 raise TeamAdmissionError(str(exc)) from exc
-        elif signature is not None:
-            raise TeamError("signed approval was not configured")
+        elif approved:
+            raise TeamError("--approved requires chat approval mode")
         record = {
             "schema": STATE_SCHEMA, "team_id": selected["team_id"],
             "spec": selected, "spec_hash": fingerprint(selected),
@@ -399,7 +399,7 @@ def set_desired(team_id: str, desired: str, *, env: Mapping[str, str] | None = N
                     team_approval.verify_saved(record["spec"], config, record["admission"])
                 except team_approval.ApprovalError as exc:
                     raise TeamAdmissionError(str(exc)) from exc
-            elif team_approval.policy(config)["mode"] == "signed":
+            elif team_approval.policy(config)["mode"] == "chat":
                 raise TeamAdmissionError("existing unapproved team cannot be newly started")
         record["desired"] = desired
         _save(record, env)
@@ -914,14 +914,14 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
         if record["desired"] != "running":
             return summary(record)
         spec, slots = record["spec"], record["slots"]
-        signed_mode = team_approval.policy(config)["mode"] == "signed"
+        chat_mode = team_approval.policy(config)["mode"] == "chat"
         admission = record.get("admission")
         if admission is not None:
             try:
                 team_approval.verify_saved(spec, config, admission)
             except team_approval.ApprovalError as exc:
                 raise TeamAdmissionError(str(exc)) from exc
-        freeze_legacy_pending = signed_mode and admission is None
+        freeze_legacy_pending = chat_mode and admission is None
         record["tick_count"] += 1
         changes = 0
         # Reconcile ALL existing executions before starting any new ones.

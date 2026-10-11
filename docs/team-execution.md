@@ -292,18 +292,25 @@ unchanged. The public repository ships no authentication tokens or
 hardcoded personal models. An operator may keep local credential policies
 for subscriptions, API providers or enterprise access entirely outside CAO.
 
-## Operator-approved teams
+## Team composition approval
 
-Public CAO optionally requires an operator-signed proposal before team
-initialization. The proposal commits to the complete manifest and effective
-model/agent configuration. `cao team plan` shows the proposed composition;
-`cao team proposal` generates the statement to sign outside the agent host.
-`cao team init --signature` verifies the signature and still starts PAUSED.
+Agree on roles, models, tasks and limits with the operator in chat.
+If an installation wants an explicit confirmation, configure:
+`"team_approval": {"mode": "chat"}`.
 
-Signed mode requires one stable initiative per approved team. Changing
-composition, model, writer limits or identity requires a new proposal
-and signature. Successor teams name their predecessor and a substantive
-reason; earlier checkpoints are preserved.
+```sh
+cao team plan --file team.json
+cao team init --file team.json --approved
+cao team start --id team-id
+```
 
-See [operator-team-approval.md](operator-team-approval.md) for configuration,
-key separation, verification, legacy migration and recovery requirements.
+The flag records the caller's declaration of chat approval. CAO cannot
+verify the conversation or authenticate a person; it uses no signing keys,
+identity service or approval files. The immutable team and selected model
+configuration are retained so later changes cannot silently alter dispatch.
+
+Reuse a team for one initiative. A separately approved successor identifies
+its predecessor with `supersedes` and gives a short `change_reason`; the old
+team must be paused and terminal. Existing teams and Registry claims stay
+intact. Public installations without this optional chat policy retain the
+existing initialization behavior.

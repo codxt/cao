@@ -16,11 +16,11 @@ def _emit(value: object) -> None:
 def main(arguments: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="cao team")
     subs = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "init", "proposal", "plan"):
+    for name in ("validate", "init", "plan"):
         cmd = subs.add_parser(name, help="inspect or initialize a bounded team manifest")
         cmd.add_argument("--file", required=True)
         if name == "init":
-            cmd.add_argument("--signature", help="operator-signed exact proposal file")
+            cmd.add_argument("--approved", action="store_true", help="confirm that the operator approved this team")
     for name in ("start", "pause", "tick", "status"):
         cmd = subs.add_parser(name, help="control or inspect an existing team")
         cmd.add_argument("--id", required=True)
@@ -36,21 +36,17 @@ def main(arguments: Sequence[str]) -> int:
     except SystemExit as exc:
         return int(exc.code)
     try:
-        if args.command in ("validate", "init", "proposal", "plan"):
+        if args.command in ("validate", "init", "plan"):
             with open(args.file, encoding="utf-8") as f:
                 spec = team.validate_spec(json.load(f))
             if args.command == "validate":
                 result = {"schema": "cao.team.validate.v1", "status": "VALID",
                           "team_id": spec["team_id"], "tasks": len(spec["tasks"]),
                           "roles": len(spec["roles"])}
-            elif args.command in ("proposal", "plan"):
+            elif args.command == "plan":
                 config = product_config.load_config()
                 if config is None:
                     raise team.TeamError("local CAO product configuration is unavailable")
-                message = team_approval.proposal(spec, config)
-                if args.command == "proposal":
-                    print(message.decode("ascii"), end="")
-                    return 0
                 result = {"schema": "cao.team.plan.v1",
                           "team_id": spec["team_id"],
                           "initiative": spec.get("initiative"),
@@ -61,14 +57,10 @@ def main(arguments: Sequence[str]) -> int:
                                    "depends_on", "reviewer")} for t in spec["tasks"]],
                           "max_writers": spec["max_writers"],
                           "max_parallel": spec["max_parallel"],
-                          "approval": json.loads(message)}
+                          "approval_mode": team_approval.policy(config)["mode"]}
             else:
                 config = product_config.load_config()
-                signature = None
-                if args.signature:
-                    with open(args.signature, "rb") as f:
-                        signature = f.read(16385)
-                result = team.initialize(spec, config=config, signature=signature)
+                result = team.initialize(spec, config=config, approved=args.approved)
         elif args.command == "list":
             result = {"schema": "cao.team.list.v1", "teams": team.list_teams()}
         elif args.command == "status":

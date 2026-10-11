@@ -36,7 +36,8 @@ class TeamTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.env = {"XDG_STATE_HOME": str(self.root / "state")}
+        self.env = {"XDG_STATE_HOME": str(self.root / "state"),
+                    "XDG_CONFIG_HOME": str(self.root / "config")}
         self.config = product_config.validate_config({
             "schema": product_config.SCHEMA,
             "provider": {"cli": "opencode", "id": "test", "model": "opencode/default"},
