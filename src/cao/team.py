@@ -1,7 +1,8 @@
 """Durable specialist-team orchestration over the existing CAO task/Registry.
 
 Team state tracks dependencies, handoffs, bounded review/correction and roles.
-A team approval is advisory: no publication, credential, or deployment grant.
+An enabled signed team admission gate binds roster and routing to an operator
+decision; it grants no publication, credential or deployment authority.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from . import agent_profiles, product_config, product_driver, product_state, product_task, registry, state
+from . import agent_profiles, product_config, product_driver, product_state, product_task, registry, state, team_approval
 
 SPEC_SCHEMA = "cao.team.v1"
 STATE_SCHEMA = "cao.team.state.v1"
@@ -58,11 +59,23 @@ def _string(value: object, limit: int) -> str:
 
 
 def validate_spec(value: Any) -> dict[str, Any]:
-    raw = _fields(value, {"schema", "team_id", "roles", "tasks", "max_writers", "max_parallel"},
+    raw = _fields(value, {"schema", "team_id", "initiative", "supersedes",
+                          "change_reason", "roles", "tasks", "max_writers", "max_parallel"},
                   {"schema", "team_id", "roles", "tasks"}, "team")
     if raw["schema"] != SPEC_SCHEMA:
         raise TeamError("unsupported team specification")
     _ident(raw["team_id"])
+    if "initiative" in raw:
+        _ident(raw["initiative"])
+    if "supersedes" in raw:
+        _ident(raw["supersedes"])
+        if raw["supersedes"] == raw["team_id"] or not raw.get("initiative"):
+            raise TeamError("successor must name a distinct prior team and initiative")
+        if ("change_reason" not in raw or type(raw["change_reason"]) is not str
+                or not 20 <= len(raw["change_reason"].strip()) <= 1000):
+            raise TeamError("team successor requires a substantive change reason")
+    elif "change_reason" in raw:
+        raise TeamError("change reason requires an explicit predecessor")
     writers = _number(raw.get("max_writers", 2), 0, MAX_WRITERS)
     parallel = _number(raw.get("max_parallel", 4), 1, MAX_PARALLEL)
     roles = raw["roles"]
@@ -258,19 +271,95 @@ def summary(record: Mapping[str, Any]) -> dict[str, Any]:
                else "BLOCKED" if any(s in ("blocked", "unknown") for s in statuses)
                else "RUNNING" if any(s == "running" for s in statuses)
                else "PAUSED" if record["desired"] == "paused" else "PENDING")
-    return {"schema": "cao.team.status.v1", "team_id": record["team_id"],
-            "desired": record["desired"], "status": overall,
-            "tick_count": record["tick_count"], "tasks": slots}
+    result = {"schema": "cao.team.status.v1", "team_id": record["team_id"],
+              "desired": record["desired"], "status": overall,
+              "tick_count": record["tick_count"], "tasks": slots}
+    if record["spec"].get("initiative"):
+        result["initiative"] = record["spec"]["initiative"]
+        result["supersedes"] = record["spec"].get("supersedes")
+    if record.get("admission"):
+        proof = record["admission"]
+        result["approval"] = {"signer": proof.get("signer"),
+                              "proposal_sha256": proof.get("proposal_sha256"),
+                              "routes_sha256": proof.get("routes_sha256")}
+    return result
 
 
-def initialize(spec: Any, *, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def _admission_config(env: Mapping[str, str] | None,
+                      supplied: product_config.ProductConfig | None
+                      ) -> product_config.ProductConfig | None:
+    return supplied if supplied is not None else product_config.load_config(
+        product_config.config_path(env))
+
+
+def _check_initiative_lineage(spec: Mapping[str, Any],
+                              env: Mapping[str, str] | None) -> None:
+    """One team per initiative; a successor needs a safe, explicit handoff."""
+    initiative = spec.get("initiative")
+    if not initiative:
+        raise TeamError("operator-approved team requires an initiative")
+    directory = team_dir(env)
+    prior: dict[str, dict[str, Any]] = {}
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json") or not _ID.fullmatch(name[:-5]):
+            continue
+        record = _read(name[:-5], env)
+        if record and record["spec"].get("initiative") == initiative:
+            prior[record["team_id"]] = record
+    previous_id = spec.get("supersedes")
+    if not prior:
+        if previous_id:
+            raise TeamError("successor references an unknown initiative team")
+        return
+    successors = {r["spec"].get("supersedes") for r in prior.values()}
+    terminal = [r for n, r in prior.items() if n not in successors]
+    if len(terminal) != 1 or previous_id != terminal[0]["team_id"]:
+        raise TeamError("initiative already has a team; approve exact predecessor")
+    old = terminal[0]
+    current = summary(old)
+    if (old["desired"] != "paused" or current["status"] not in ("COMPLETE", "BLOCKED")
+            or any(s["status"] == "running" for s in old["slots"].values())):
+        raise TeamError("predecessor must be paused and terminal before replacement")
+    # A blocked task can retain an execution ID after a failed receipt. Its
+    # claim must be independently closed before a new team is admitted.
+    db = product_config.registry_db_path(env)
+    try:
+        conn = registry.connect_readonly(db)
+        try:
+            active = conn.execute(
+                "SELECT COUNT(*) FROM claims WHERE run_id=? AND released_at IS NULL",
+                ("cao-team-" + previous_id,)).fetchone()[0]
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, registry.RegistryError) as exc:
+        raise TeamError("predecessor Registry evidence unavailable") from exc
+    if active:
+        raise TeamError("predecessor still owns active Registry claims")
+
+
+def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
+               config: product_config.ProductConfig | None = None,
+               signature: bytes | None = None) -> dict[str, Any]:
     selected = validate_spec(spec)
+    resolved = _admission_config(env, config)
+    mode = team_approval.policy(resolved)["mode"]
     with dispatch_lock(env):
         old = _read(selected["team_id"], env)
         if old is not None:
             if old["spec_hash"] != fingerprint(selected):
                 raise TeamError("team ID already exists with different immutable manifest")
             return summary(old)
+        admission = None
+        if mode == "signed":
+            if signature is None:
+                raise TeamError("team initialization needs operator approval")
+            _check_initiative_lineage(selected, env)
+            try:
+                admission = team_approval.verify(selected, resolved, signature)
+            except team_approval.ApprovalError as exc:
+                raise TeamError(str(exc)) from exc
+        elif signature is not None:
+            raise TeamError("signed approval was not configured")
         record = {
             "schema": STATE_SCHEMA, "team_id": selected["team_id"],
             "spec": selected, "spec_hash": fingerprint(selected),
@@ -280,6 +369,8 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None) -> dict[str, 
                                 "feedback": None, "output": None, "error": None}
                       for t in selected["tasks"]},
         }
+        if admission is not None:
+            record["admission"] = admission
         _save(record, env)
         return summary(record)
 
@@ -296,6 +387,15 @@ def set_desired(team_id: str, desired: str, *, env: Mapping[str, str] | None = N
         raise TeamError("desired must be paused or running")
     with dispatch_lock(env):
         record = _required(team_id, env)
+        if desired == "running" and record["desired"] != "running":
+            config = _admission_config(env, None)
+            if record.get("admission") is not None:
+                try:
+                    team_approval.verify_saved(record["spec"], config, record["admission"])
+                except team_approval.ApprovalError as exc:
+                    raise TeamError(str(exc)) from exc
+            elif team_approval.policy(config)["mode"] == "signed":
+                raise TeamError("existing unapproved team cannot be newly started")
         record["desired"] = desired
         _save(record, env)
         return summary(record)
@@ -809,6 +909,14 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
         if record["desired"] != "running":
             return summary(record)
         spec, slots = record["spec"], record["slots"]
+        signed_mode = team_approval.policy(config)["mode"] == "signed"
+        admission = record.get("admission")
+        if admission is not None:
+            try:
+                team_approval.verify_saved(spec, config, admission)
+            except team_approval.ApprovalError as exc:
+                raise TeamError(str(exc)) from exc
+        freeze_legacy_pending = signed_mode and admission is None
         record["tick_count"] += 1
         changes = 0
         # Reconcile ALL existing executions before starting any new ones.
@@ -829,6 +937,10 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                 if slot["status"] in ("complete", "blocked", "unknown"):
                     continue
                 if slot["status"] == "pending":
+                    if freeze_legacy_pending:
+                        slot["error"] = "TEAM_APPROVAL_REQUIRED"
+                        _save(record, env)
+                        continue
                     if halted or not all(slots[d]["status"] == "complete" for d in task["depends_on"]):
                         continue
                     if sum(s["status"] == "running" for s in slots.values()) >= spec["max_parallel"]:

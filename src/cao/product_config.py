@@ -19,9 +19,10 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
-from . import agent_profiles, state as state_module
+from . import agent_profiles, team_approval, state as state_module
 
 __all__ = [
     "SCHEMA",
@@ -184,6 +185,13 @@ def validate_config(payload: Mapping[str, Any]) -> ProductConfig:
     try:
         agent_profiles.validate_profiles(payload.get("agent_profiles"))
     except agent_profiles.AgentProfileError as exc:
+        raise ProductConfigError(str(exc)) from exc
+
+    # Portable operator governance. Absence preserves legacy OSS behavior;
+    # a configured signed gate is enforced on every new team initialization.
+    try:
+        team_approval.policy(SimpleNamespace(raw=payload))
+    except team_approval.ApprovalError as exc:
         raise ProductConfigError(str(exc)) from exc
 
     managed = payload.get("managed")
