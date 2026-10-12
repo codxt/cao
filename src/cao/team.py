@@ -339,10 +339,14 @@ def _verify_admission(record: Mapping[str, Any],
                       config: product_config.ProductConfig | None) -> None:
     """Re-verify a saved confirmation before any NEW dispatch.
 
-    A confirmation only ever gates work that has not started. An already-running
-    task keeps its exact execution identity, prompt and claim and still has to
-    be reconciled and released, so an unrelated configuration change can never
-    freeze it: such a change stops the team from starting anything new instead.
+    Called from ``tick`` at the per-pending-slot dispatch site, before a slot
+    is flipped to running. A confirmation only ever gates work that has not
+    started: an already-running task keeps its exact execution identity,
+    prompt and claim, so a refused admission never raises out of the tick —
+    it holds the pending slot with ``TEAM_ADMISSION_CHANGED`` and leaves every
+    running task to be reconciled and released. An unrelated configuration
+    change therefore stops the team from starting anything new instead of
+    freezing what already runs.
     """
     admission = record.get("admission")
     if admission is None or not _new_dispatch_possible(record):
@@ -810,6 +814,12 @@ def _prepare_verified_correction(
     """
     if slot["phase"] != "correction" or not task["reviewer"]:
         raise TeamError("historical continuation requires an approved correction phase")
+    # A team manifest may list exactly the same write paths in a different
+    # order, while the task record and the Registry row both store the
+    # canonically sorted form. Lineage verification therefore compares the
+    # normalized path list, so ordering can never break an exact match and a
+    # genuinely different scope still fails the content comparison.
+    scope = product_task.normalize_scope(task["write_scope"])
     round_no = slot["round"]
     previous_phase = "work" if round_no == 1 else "correction"
     previous_round = round_no - 1
@@ -822,7 +832,7 @@ def _prepare_verified_correction(
     if (old is None or old.get("status") != "complete"
             or old.get("mode") != registry.WRITE
             or os.path.realpath(old.get("repo") or "") != os.path.realpath(task["repo"])
-            or old.get("scope") != task["write_scope"]
+            or old.get("scope") != scope
             or old_claim.get("released") is not True
             or old_claim.get("released_head") != accepted_head
             or type(old_claim.get("claim_id")) is not int
@@ -858,7 +868,7 @@ def _prepare_verified_correction(
                 or c["mode"] != registry.WRITE or c["outcome"] != "complete"
                 or not c["released_at"] or c["released_head"] != accepted_head
                 or c["repo"] != registry.git.normalize_repo(task["repo"])
-                or c["paths"].split("\n") != task["write_scope"]):
+                or c["paths"].split("\n") != scope):
             raise TeamError("intermediate claim lineage does not match exact Registry row")
         evidence = registry.gather_evidence(task["repo"], live, task["repo"])
         report = registry.reconcile(conn, evidence)
@@ -904,7 +914,7 @@ def _prepare_verified_correction(
                     or earlier_claim.get("released") is not True
                     or type(earlier_claim.get("released_head")) is not str
                     or not _HEAD.fullmatch(earlier_claim["released_head"])
-                    or earlier.get("scope") != task["write_scope"]
+                    or earlier.get("scope") != scope
                     or type(earlier_pane.get("pane_id")) is not str
                     or not earlier_pane["pane_id"]
                     or earlier.get("pane_closed") != earlier_pane["pane_id"]):
@@ -915,7 +925,6 @@ def _prepare_verified_correction(
                 or old_claim.get("released_head") != accepted_head):
             raise TeamError("current intermediate commit has unproven ancestry")
         changed = finding.get("committed") or []
-        scope = task["write_scope"]
         if (finding.get("head") != accepted_head or finding.get("live")
                 or finding.get("unverifiable") or finding.get("committed_unknown")
                 or finding.get("scope_unknown") or finding.get("changes")
@@ -1042,7 +1051,6 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
         spec, slots = record["spec"], record["slots"]
         chat_mode = team_approval.policy(config)["mode"] == "chat"
         admission = record.get("admission")
-        _verify_admission(record, config)
         freeze_legacy_pending = chat_mode and admission is None
         record["tick_count"] += 1
         changes = 0
@@ -1069,6 +1077,17 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                         _save(record, env)
                         continue
                     if halted or not all(slots[d]["status"] == "complete" for d in task["depends_on"]):
+                        continue
+                    # Re-verify the saved confirmation at the dispatch site,
+                    # never for the whole tick: a refused admission holds only
+                    # this pending slot, while already-running tasks below keep
+                    # their exact execution identity, claim and pane and are
+                    # still reconciled and released.
+                    try:
+                        _verify_admission(record, config)
+                    except TeamAdmissionError:
+                        slot["error"] = "TEAM_ADMISSION_CHANGED"
+                        _save(record, env)
                         continue
                     if sum(s["status"] == "running" for s in slots.values()) >= spec["max_parallel"]:
                         continue

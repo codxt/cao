@@ -110,9 +110,11 @@ class ChatTeamTests(unittest.TestCase):
                                               "read_args": ["go"]}
         self.configure()
         effects = []
-        with self.assertRaises(team.TeamAdmissionError):
-            self.tick(effects)
+        result = self.tick(effects)
         self.assertEqual(effects, [])
+        self.assertEqual(result["tasks"]["read"]["status"], "pending")
+        self.assertEqual(result["tasks"]["read"]["error"],
+                         "TEAM_ADMISSION_CHANGED")
 
     def test_dispatched_provider_change_holds_before_any_agent_effect(self):
         self.admit(approved=True)
@@ -120,9 +122,11 @@ class ChatTeamTests(unittest.TestCase):
         self.raw["provider"]["id"] = "renamed-provider"
         self.configure()
         effects = []
-        with self.assertRaises(team.TeamAdmissionError):
-            self.tick(effects)
+        result = self.tick(effects)
         self.assertEqual(effects, [])
+        self.assertEqual(result["tasks"]["read"]["status"], "pending")
+        self.assertEqual(result["tasks"]["read"]["error"],
+                         "TEAM_ADMISSION_CHANGED")
 
     def test_inherited_provider_change_holds_before_any_agent_effect(self):
         # A role that declares neither a model nor a profile dispatches with the
@@ -134,9 +138,11 @@ class ChatTeamTests(unittest.TestCase):
         self.raw["provider"]["model"] = "opencode/changed"
         self.configure()
         effects = []
-        with self.assertRaises(team.TeamAdmissionError):
-            self.tick(effects)
+        result = self.tick(effects)
         self.assertEqual(effects, [])
+        self.assertEqual(result["tasks"]["read"]["status"], "pending")
+        self.assertEqual(result["tasks"]["read"]["error"],
+                         "TEAM_ADMISSION_CHANGED")
 
     def test_running_tasks_are_reconciled_when_new_dispatch_is_refused(self):
         self.admit(approved=True)
@@ -156,6 +162,59 @@ class ChatTeamTests(unittest.TestCase):
         result = self.tick(reconciled)
         self.assertEqual(len(reconciled), 1)
         self.assertEqual(result["tasks"]["read"]["status"], "running")
+
+    def test_pending_sibling_is_held_while_a_running_task_reconciles(self):
+        # A two-task team where capacity leaves a pending sibling beside the
+        # running task: a changed effective route must refuse ONLY new dispatch.
+        self.spec["roles"]["worker"] = {
+            "instruction": "Analyze further", "model": "opencode/work"}
+        self.spec["tasks"].append(
+            {"id": "work", "role": "worker", "repo": str(self.root / "repo2"),
+             "mode": "read", "prompt": "Analyze the other source"})
+        self.spec["max_parallel"] = 1
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        actions = []
+
+        def fake(**kwargs):
+            actions.append(kwargs["task"]["id"])
+            return dict(status="running")
+
+        result = team.tick("alpha", config=self.config, driver=None, env=self.env,
+                           execute=fake, writer_snapshot=lambda _: (0, set()),
+                           head_reader=lambda _: "a" * 40)
+        self.assertEqual(actions, ["read"])
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+        self.assertEqual(result["tasks"]["work"]["status"], "pending")
+        self.raw["provider"]["id"] = "renamed-provider"
+        self.configure()
+
+        def completing(**kwargs):
+            actions.append(kwargs["task"]["id"])
+            return dict(status="complete",
+                        claim={"released": True, "released_head": "a" * 40},
+                        output="final answer")
+
+        result = team.tick("alpha", config=self.config, driver=None, env=self.env,
+                           execute=completing, writer_snapshot=lambda _: (0, set()),
+                           head_reader=lambda _: "a" * 40)
+        # The already-running task keeps its exact identity, is reconciled and
+        # released; the refused NEW dispatch only holds the pending sibling.
+        self.assertEqual(actions, ["read", "read"])
+        self.assertEqual(result["tasks"]["read"]["status"], "complete")
+        self.assertEqual(result["tasks"]["work"]["status"], "pending")
+        self.assertEqual(result["tasks"]["work"]["error"],
+                         "TEAM_ADMISSION_CHANGED")
+        # Restoring the effective route is the in-product remedy for the held
+        # sibling: it dispatches on the next tick without a successor team.
+        self.raw["provider"]["id"] = "test"
+        self.configure()
+        result = team.tick("alpha", config=self.config, driver=None, env=self.env,
+                           execute=fake, writer_snapshot=lambda _: (0, set()),
+                           head_reader=lambda _: "a" * 40)
+        self.assertEqual(actions, ["read", "read", "work"])
+        self.assertEqual(result["tasks"]["work"]["status"], "running")
+        self.assertEqual(result["tasks"]["work"]["error"], None)
 
     def test_absent_configuration_refuses_new_dispatch_of_an_approved_team(self):
         self.admit(approved=True)
