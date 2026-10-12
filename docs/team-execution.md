@@ -411,6 +411,23 @@ identity service or approval files. The immutable team and the exact
 model/provider selection each task would dispatch are retained so later
 changes cannot silently alter dispatch.
 
+`cao team plan` is read-only. Alongside the declared task graph it shows the
+resolved work/review route each task would dispatch — the agent kind, the
+provider CLI/id and the effective model — and, in chat mode, the exact
+`spec_sha256` and `routes_sha256` that a following `cao team init --approved`
+would save, so an operator can confirm the digests before approving. Roles are
+shown only by their safe declared selection (an inline model or an
+`agent_profile`); raw role instructions, raw argument vectors, prompts,
+environment and configured document text are never emitted. The provider
+CLI/id and model fields shown are operator-declared identifier values, so an
+operator must keep them non-secret; each is emitted only when it has a bounded
+identifier shape and the provider entry and any argv `--model` agree, and a
+divergent, repeated, flag-like or otherwise unqualified selection is reported
+unresolved instead of echoed. An unknown profile or unresolvable route fails
+closed with a nonzero exit, and a missing or unavailable product configuration
+is refused rather than guessed. Legacy approval mode reports truthful null
+digests and claims no chat-confirmation authority.
+
 That binding is the resolved selection an agent actually receives — the role
 model or agent profile of every task and phase — and not the surrounding
 configuration document, so a registry path, runtime name or profile no role
