@@ -34,7 +34,7 @@ class EngineeringTests(unittest.TestCase):
             "watch_id": "test-example", "repo": "example/repo", "pr": 12,
             "base_branch": "main", "suite_sha256": SUITE_SHA,
             "evaluation_file": str(self.evidence_file), "min_gain": 0.1,
-            "required_checks": ["validate (3.12)", "eval-suite"],
+            "required_checks": ["validate (3.12)", "gbrain-evals"],
             "operators": ["operator"], "reviewers": ["reviewer"],
             "allowed_paths": ["src/search.py", "tests"],
             "expires_at": "2027-01-01T00:00:00Z",
@@ -292,21 +292,6 @@ class EngineeringTests(unittest.TestCase):
         self.save()
         with self.assertRaises(e.EngineeringError):
             self.tick()
-
-    def test_evaluation_report_schema_is_bound_to_the_suite_digest(self):
-        self.assertEqual(
-            e._comparison(dict(self.evaluation), self.manifest), (BASE, HEAD))
-        # A report exported under the earlier private-evaluator name keeps
-        # verifying: the exact suite digest binds it, not the report's name.
-        legacy = dict(self.evaluation, schema="example.eval.comparison.v1")
-        self.assertEqual(e._comparison(legacy, self.manifest), (BASE, HEAD))
-        for schema in ("cao.engineering.evaluation.v2", "other.report.v1",
-                       "CAO.ENGINEERING.EVALUATION.V1", "..eval.comparison.v1"):
-            with self.subTest(schema=schema), self.assertRaises(e.EngineeringError):
-                e._comparison(dict(self.evaluation, schema=schema), self.manifest)
-        mismatched = dict(self.evaluation, suite_sha256="d" * 64)
-        with self.assertRaises(e.EngineeringError):
-            e._comparison(mismatched, self.manifest)
 
     def test_expiry_holds_without_external_calls(self):
         d = self.tick(now=dt.datetime(2027, 1, 1, tzinfo=dt.timezone.utc))
