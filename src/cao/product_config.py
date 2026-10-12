@@ -48,6 +48,10 @@ __all__ = [
     "DEFAULT_READ_LINES",
     "DEFAULT_MAX_OUTPUT_CHARS",
     "DEFAULT_RUN_ID",
+    "DEFAULT_TEAM_STALL_TIMEOUT_MS",
+    "MIN_TEAM_STALL_TIMEOUT_MS",
+    "MAX_TEAM_STALL_TIMEOUT_MS",
+    "team_stall_timeout_ms",
     "REGISTRY_ATTACH_GOVERNED",
     "TaskDefaults",
     "task_defaults",
@@ -79,6 +83,13 @@ DEFAULT_WAIT_TIMEOUT_MS = 300_000
 DEFAULT_READ_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 20_000
 DEFAULT_RUN_ID = "cao-product"
+#: The liveness bound for one team task execution. It is deliberately far
+#: longer than any single model response, is reported only when the task's own
+#: worker is gone and its durable state has stopped changing, and never releases
+#: a claim or re-prompts an agent.
+DEFAULT_TEAM_STALL_TIMEOUT_MS = 7_200_000
+MIN_TEAM_STALL_TIMEOUT_MS = 60_000
+MAX_TEAM_STALL_TIMEOUT_MS = 604_800_000
 #: The only registry attach policy: every product task attaches to the single
 #: governed ledger (whose path ``registry_db_path`` resolves). A configuration
 #: naming any other policy is refused rather than silently ignored.
@@ -428,6 +439,32 @@ def task_defaults(
         or DEFAULT_RUN_ID,
         registry_attach=attach,
     )
+
+
+def team_stall_timeout_ms(config: ProductConfig | None = None) -> int:
+    """The conservative liveness bound for one team task execution.
+
+    Read from the same optional ``task`` section as the other task timeouts and
+    deliberately without requiring an agent kind: a liveness bound must stay
+    readable for any configuration, including one that cannot launch an agent.
+    """
+
+    raw: dict[str, Any] = {}
+    if config is not None:
+        section = config.raw.get(TASK_SECTION)
+        if section is not None:
+            if not isinstance(section, Mapping):
+                raise ProductConfigError("task must be an object")
+            raw = dict(section)
+    value = raw.get("team_stall_timeout_ms")
+    if value is None:
+        return DEFAULT_TEAM_STALL_TIMEOUT_MS
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not MIN_TEAM_STALL_TIMEOUT_MS <= value <= MAX_TEAM_STALL_TIMEOUT_MS):
+        raise ProductConfigError(
+            "task.team_stall_timeout_ms must be an integer between "
+            f"{MIN_TEAM_STALL_TIMEOUT_MS} and {MAX_TEAM_STALL_TIMEOUT_MS}")
+    return value
 
 
 def registry_db_path(env: Mapping[str, str] | None = None) -> str:

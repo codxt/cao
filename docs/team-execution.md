@@ -157,8 +157,20 @@ CAO compares the SHA with the work result and current checkout HEAD. A change
 request triggers a new, separately identified, bounded correction task in
 the same authorized WRITE scope and a fresh review. Missing/ambiguous markers,
 stale source, provider failure and correction-budget exhaustion hold UNKNOWN
-or BLOCKED, never implicit approval. Outputs truncated before validation
-cannot approve review.
+or BLOCKED, never implicit approval.
+
+A long review answer can exceed the task's bounded capture. product_task keeps
+the **terminal suffix** of a runtime read and states truthfully, in the durable
+task record, that it kept the tail, exactly how many characters it dropped, and
+how many it captured. Such a bounded capture may decide a review **only** when
+all of these hold: the record itself says it kept the tail; the window is
+exactly sized and equals the stored text; the reviewed source HEAD still
+matches; and the exact verdict plus this task's own completion nonce are both
+present in what was kept. A head-only capture, an unsized window, a capture
+of unknown provenance, a missing or forged nonce, a wrong `CAO_REVIEWED_HEAD`
+and a repeated verdict all hold UNKNOWN with `REVIEW_OUTPUT_BOUND_UNVERIFIED`.
+The bounds are CAO's own recorded provenance, never a value supplied by the
+answer being judged.
 
 Reviewer verdicts are workflow advisory, not deployment/publication/credential
 authority and not independent proof of correctness. Final acceptance still
@@ -223,6 +235,70 @@ Registry claim, use:
 
 This resets only the stored UNKNOWN observation to RUNNING. It preserves
 the **same execution ID and prompt** and does not force a fresh model call.
+
+### One bounded READ retry after an invalid receipt
+
+A READ attempt that produced an invalid terminal receipt
+(`TEAM_RESULT_UNVERIFIED` or `TEAM_DURABLE_RESULT_UNVERIFIED`) can be retried
+once, after an operator has independently stopped the original worker:
+
+    cao team retry-read --id sample-project --task review
+
+The retry is admitted only when the original attempt's own durable evidence
+proves all of: it is a READ execution; it is `stopped`; its CAO-owned pane was
+closed and recorded; its claim was released `abandon`; and the shared Registry
+holds exactly that released READ claim for this team, work key and owner. This
+covers a failed **review** attempt, including a review of a correction round:
+such a retry still reviews the same accepted source revision, with the same
+work handoff and the same review findings, because those are retained. The
+failed attempt's record, receipt and nonce stay durable and untouched. The new
+attempt receives a new execution identity and its own copy-only nonce, so it
+can never adopt the stopped agent or its released claim. A WRITE attempt is
+never retryable in any phase, and a second retry is refused.
+
+### Bounded stalled task handling
+
+Every dispatched task records durable start and progress stamps. Progress is a
+fingerprint of what the task observably produced — its durable status, its
+bounded captured output, its pane handback and its last observation — so a tick
+that merely rewrites a record is never mistaken for progress.
+
+A task is reported stalled (`TEAM_TASK_STALLED`, status UNKNOWN) only when all
+of these hold: its durable record is not terminal; no observable progress has
+been recorded for longer than the bound; and the runtime can no longer report
+its worker. A worker the runtime still reports as present keeps its bound
+however long model thinking takes, so a long authorized computation is never
+reported as a stall. A record with no stamps at all is never reported stalled
+on the strength of a missing value.
+
+The bound is `task.team_stall_timeout_ms` (default two hours, configurable
+between one minute and seven days, validated fail-closed). It is always
+measured from the last durable observation, so evidence discovered during a
+tick cannot quietly reset a bound that had already expired.
+
+Reporting a stall never releases a claim, never replaces or re-prompts an
+agent and never fabricates an identity. The exact existing execution identity,
+prompt and claim are retained for the operator, who resolves the runtime and
+then uses `cao team resume` (or the bounded retry above where it applies).
+
+### Crash recovery between the Registry claim and the record save
+
+A product task persists its **acquisition intent** — run, work key,
+repository, mode, normalized scope, branch and the exact precrash HEAD — to
+its own record *before* the durable Registry claim. If the process then dies
+between the claim and the record save, the next run can recognize the OPEN row
+as this task's own instead of leaving an operator staring at an invisible claim.
+
+Adoption still requires positive proof that the row is the same attempt: exact
+run, work key, owner, mode, repository, registered scope, branch, worktree and
+identity, plus a `claimed_at` no older than the task record. For WRITE it also
+requires that the checkout still sits exactly on the recorded precrash baseline
+and is clean. A post-acquisition commit, a dirty checkout, an unverifiable
+checkout, a tampered intent, a mismatched scope or a row that belongs to
+something else are refused with `NEEDS_RECONCILIATION` and a precise reason.
+The claim is preserved, never released, and never replaced by a second claim.
+A WRITE claim that exists without any provable intent keeps the original
+refusal rather than being adopted.
 
 Unknown/blocked task states remain held for explicit investigation, with the
 original execution identity retained. Pausing a team only stops new dispatch:
@@ -338,3 +414,13 @@ its predecessor with `supersedes` and gives a short `change_reason`; the old
 team must be paused and terminal. Existing teams and Registry claims stay
 intact. Public installations without this optional chat policy retain the
 existing initialization behavior.
+
+A paused predecessor that **never dispatched anything** — no execution identity
+in any slot, no Registry claim of any outcome, and unreadable Registry evidence
+still fails closed — may instead be replaced by an approved successor, because
+it started no work and holds no authority. That successor is a genuinely
+changed immutable manifest admitted under its own ID, run, admission and
+execution identities; nothing of the predecessor's identity or authority is
+reused, and re-admitting the identical manifest is still re-approved in place
+rather than replaced. Any predecessor that dispatched work or holds a claim
+keeps the full terminal and Registry checks above.

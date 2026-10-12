@@ -334,6 +334,105 @@ class ChatTeamTests(unittest.TestCase):
         state.write_state(p, data)
         self.assertEqual(self.admit(later, approved=True)["status"], "PAUSED")
 
+    def successor(self, **overrides):
+        return {**self.spec, "team_id": "beta", "supersedes": "alpha",
+                "change_reason": ("Operator inspected the original issue and "
+                                  "approved a successor"),
+                **overrides}
+
+    def test_paused_never_dispatched_team_hands_off_to_an_approved_successor(self):
+        """A genuinely changed manifest recovers under a NEW identity.
+
+        The paused predecessor never started work, so the operator-approved
+        successor replaces its unused manifest. Recovery never reuses the old
+        team's identity, admission or execution identities, and the same team
+        ID still cannot adopt a different immutable manifest.
+        """
+        self.admit(approved=True)
+        self.assertEqual(self.admit(approved=True)["status"], "PAUSED")
+        registry.connect(self.raw["registry_db"]).close()
+        successor = self.successor(max_parallel=2)
+        admitted = self.admit(successor, approved=True)
+        self.assertEqual(admitted["status"], "PAUSED")
+        self.assertEqual(admitted["team_id"], "beta")
+        predecessor = team._required("alpha", self.env)
+        self.assertEqual(predecessor["desired"], "paused")
+        self.assertTrue(all(slot["execution_id"] is None and slot["prompt"] is None
+                            for slot in predecessor["slots"].values()))
+        self.assertNotEqual(admitted["approval"]["spec_sha256"],
+                            predecessor["admission"]["spec_sha256"])
+        self.assertEqual(admitted["approval"]["spec_sha256"],
+                         team.fingerprint(team.validate_spec(successor)))
+        # A genuinely changed manifest, and no identity or authority reuse.
+        self.assertEqual(team._required("beta", self.env)["spec_hash"],
+                         team.fingerprint(team.validate_spec(successor)))
+        self.assertNotEqual(team._required("beta", self.env)["spec_hash"],
+                            predecessor["spec_hash"])
+        # The old identity is never reused for a different immutable manifest.
+        with self.assertRaises(team.TeamError):
+            self.admit({**self.spec, "max_parallel": 2}, approved=True)
+        # The identical manifest is still re-approved in place, not replaced.
+        self.assertEqual(self.admit(approved=True)["team_id"], "alpha")
+        self.assertEqual(len(team.list_teams(env=self.env)), 2)
+
+    def test_successor_requires_a_declared_substantive_change_reason(self):
+        self.admit(approved=True)
+        registry.connect(self.raw["registry_db"]).close()
+        for change in ({"change_reason": "too short"},
+                       {"change_reason": "x" * 1001}):
+            with self.subTest(change=change):
+                with self.assertRaises(team.TeamError):
+                    self.admit(self.successor(**change), approved=True)
+        broken = self.successor()
+        del broken["change_reason"]
+        with self.assertRaises(team.TeamError):
+            self.admit(broken, approved=True)
+
+    def test_dispatched_predecessor_cannot_be_replaced_by_a_successor(self):
+        self.admit(approved=True)
+        registry.connect(self.raw["registry_db"]).close()
+        team.set_desired("alpha", "running", env=self.env)
+        self.tick([])
+        team.set_desired("alpha", "paused", env=self.env)
+        with self.assertRaises(team.TeamError):
+            self.admit(self.successor(), approved=True)
+        self.assertEqual(len(team.list_teams(env=self.env)), 1)
+        # The dispatched execution identity survives for explicit recovery.
+        record = team._required("alpha", self.env)
+        self.assertEqual(record["slots"]["read"]["execution_id"],
+                         team._execution_id("alpha", "read", "work", 0))
+        self.assertEqual(record["slots"]["read"]["status"], "running")
+
+    def test_predecessor_with_an_open_registry_claim_cannot_be_replaced(self):
+        self.admit(approved=True)
+        execution_id = team._execution_id("alpha", "read", "work", 0)
+        ledger = registry.connect(self.raw["registry_db"])
+        try:
+            registry.propose(ledger, "cao-team-alpha", execution_id,
+                             str(self.root / "repo"), components=["review"])
+            registry.claim(ledger, registry.ClaimSpec(
+                run_id="cao-team-alpha", work_key=execution_id,
+                owner="cao-product", mode="READ", issue=""), None)
+        finally:
+            ledger.close()
+        with self.assertRaises(team.TeamError):
+            self.admit(self.successor(), approved=True)
+        self.assertEqual(len(team.list_teams(env=self.env)), 1)
+
+    def test_unreadable_predecessor_evidence_fails_closed(self):
+        self.admit(approved=True)
+        registry.connect(self.raw["registry_db"]).close()
+        with mock.patch("cao.registry.connect_readonly",
+                        side_effect=OSError("ledger unavailable")):
+            with self.assertRaises(team.TeamError):
+                self.admit(self.successor(), approved=True)
+        # A team that never dispatched anything still needs readable evidence.
+        with mock.patch("cao.team._team_claim_count",
+                        side_effect=team.TeamError("team Registry evidence unavailable")):
+            with self.assertRaises(team.TeamError):
+                self.admit(self.successor(), approved=True)
+        self.assertEqual(len(team.list_teams(env=self.env)), 1)
+
     def test_never_started_team_is_reconfirmed_on_the_identical_manifest(self):
         self.raw.pop("team_approval")
         self.configure()

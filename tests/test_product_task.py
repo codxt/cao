@@ -1116,6 +1116,180 @@ class BoundedOutputTests(TaskCase):
         self.assertEqual(logs["output_bounds"]["dropped_chars"], 0)
 
 
+class ClaimAcquisitionCrashTests(TaskCase):
+    """A crash between the durable claim and the record save must be provable.
+
+    The acquisition intent is written before the claim, so recovery can only
+    adopt the row when the checkout is still exactly the recorded precrash
+    baseline. Dirty, drifted or unattributable evidence is refused instead.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_repo = git_repo(self.root, name="crash-scope", files=("a.txt",))
+        remote = self.root / "upstream.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                       capture_output=True, env={**os.environ, **GIT_ENV})
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "--set-upstream", "origin", "main")
+        self.driver = FakeDriver()
+
+    def git(self, *arguments: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(self.write_repo), "-c", "commit.gpgsign=false", *arguments],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, **GIT_ENV},
+        )
+        return proc.stdout.strip()
+
+    def write_kwargs(self, driver=None, **overrides):
+        kwargs = dict(
+            driver=driver or self.driver, repo=str(self.write_repo),
+            prompt="Edit a.txt", task_id="crash-case", mode="write",
+            write_scope=("a.txt",), observation=RuntimeObservation.empty(),
+            config=self.config, env=self.env, registry_db=self.db,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def claims(self):
+        conn = registry.connect(db=self.db)
+        try:
+            return conn.execute(
+                "SELECT claim_id, mode, branch, worktree, released_at, outcome, "
+                "released_head FROM claims ORDER BY claim_id").fetchall()
+        finally:
+            conn.close()
+
+    def crash_after_the_durable_claim(self):
+        """Die in the exact window this finding is about."""
+        real = registry.claim
+
+        def crashing(conn, spec, observation=None, persist_run=None):
+            real(conn, spec, observation, persist_run)
+            raise RuntimeError("crash between the durable claim and the record save")
+
+        with patch.object(registry, "claim", crashing):
+            with self.assertRaises(RuntimeError):
+                product_task.run_task(**self.write_kwargs(), wait_ms=0)
+        held = self.claims()
+        self.assertEqual(len(held), 1)
+        self.assertIsNone(held[0]["released_at"])
+        # The record on disk never saw the claim, but it did see the intent.
+        record = product_state.read_task("crash-case", self.env)
+        self.assertIsNone(record["claim"])
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["claim_intent"]["base_head"], self.git("rev-parse", "HEAD"))
+        return held[0]["claim_id"]
+
+    def assert_refused_and_still_claimed(self, needle):
+        payload = product_task.run_task(**self.write_kwargs(), wait_ms=0)
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["status"], registry.NEEDS_RECONCILIATION)
+        self.assertIn(needle, " ".join(payload["refusal"]["errors"]))
+        held = self.claims()
+        # Never a second claim, never an invalid release, never a silent stall.
+        self.assertEqual(len(held), 1)
+        self.assertIsNone(held[0]["released_at"])
+        self.assertEqual(self.driver.names().count("agent_start"), 0)
+        return held[0]["claim_id"]
+
+    def test_crash_in_the_claim_window_recovers_the_same_claim_and_exact_release(self):
+        claim_id = self.crash_after_the_durable_claim()
+        resumed = product_task.run_task(**self.write_kwargs(), wait_ms=0)
+        self.assertEqual(resumed["status"], "running")
+        self.assertEqual(resumed["claim"]["claim_id"], claim_id)
+        self.assertEqual(len(self.claims()), 1)
+        (self.write_repo / "a.txt").write_text("committed\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-m", "task output")
+        final = product_task.run_task(**self.write_kwargs(), wait_ms=1000)
+        self.assertEqual(final["status"], "complete")
+        held = self.claims()
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["claim_id"], claim_id)
+        self.assertEqual(held[0]["outcome"], "complete")
+        self.assertEqual(held[0]["released_head"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(final["claim"]["released_head"], self.git("rev-parse", "HEAD"))
+
+    def test_crash_recovery_refuses_an_unprovable_dirty_checkout(self):
+        self.crash_after_the_durable_claim()
+        (self.write_repo / "a.txt").write_text("uncommitted work\n")
+        self.assert_refused_and_still_claimed("dirty after claim acquisition")
+
+    def test_crash_recovery_refuses_a_post_acquisition_commit(self):
+        self.crash_after_the_durable_claim()
+        (self.write_repo / "other.txt").write_text("drifted\n")
+        self.git("add", "other.txt")
+        self.git("commit", "-m", "work after the claim")
+        self.assert_refused_and_still_claimed("precrash baseline")
+
+    def test_crash_recovery_refuses_a_tampered_or_mismatched_intent(self):
+        self.crash_after_the_durable_claim()
+        record = product_state.read_task("crash-case", self.env)
+        record["claim_intent"]["scope"] = ["b.txt"]
+        product_state.write_task(record, self.env)
+        self.assert_refused_and_still_claimed(
+            "the recorded claim intent is not this task's own")
+
+    def test_crash_recovery_refuses_a_claim_row_that_is_not_this_task(self):
+        claim_id = self.crash_after_the_durable_claim()
+        conn = registry.connect(db=self.db)
+        try:
+            conn.execute("UPDATE claims SET mode='READ' WHERE claim_id=?", (claim_id,))
+        finally:
+            conn.close()
+        self.assert_refused_and_still_claimed("mode is not this task's mode")
+
+    def test_claim_without_a_provable_intent_is_still_refused(self):
+        # A row this task cannot attribute to a recorded intent keeps the
+        # original fail-closed refusal instead of being adopted.
+        held = self.claims()
+        self.assertEqual(held, [])
+        record = product_state.read_task("crash-case", self.env)
+        self.assertIsNone(record)
+        conn = registry.connect(db=self.db)
+        try:
+            registry.propose(conn, "cao-product", "crash-case", str(self.write_repo),
+                             paths=["a.txt"], objective="foreign")
+            registry.claim(conn, registry.ClaimSpec(
+                run_id="cao-product", work_key="crash-case",
+                owner=product_task.OWNER, mode=registry.WRITE, issue="",
+                branch="main", worktree=str(self.write_repo)),
+                RuntimeObservation.empty())
+        finally:
+            conn.close()
+        payload = product_task.run_task(**self.write_kwargs(), wait_ms=0)
+        self.assertEqual(payload["status"], "refused")
+        self.assertTrue(payload["refusal"]["errors"])
+        held = self.claims()
+        self.assertEqual(len(held), 1)
+        self.assertIsNone(held[0]["released_at"])
+        self.assertEqual(held[0]["mode"], "WRITE")
+        self.assertEqual(self.driver.names().count("agent_start"), 0)
+
+    def test_read_crash_in_the_claim_window_recovers_its_own_read_claim(self):
+        driver = FakeDriver()
+        real = registry.claim
+
+        def crashing(conn, spec, observation=None, persist_run=None):
+            real(conn, spec, observation, persist_run)
+            raise RuntimeError("crash between the durable claim and the record save")
+
+        kwargs = dict(driver=driver, repo=str(self.repo), prompt="Read this repository",
+                      task_id="read-crash", observation=RuntimeObservation.empty(),
+                      config=self.config, env=self.env, registry_db=self.db)
+        with patch.object(registry, "claim", crashing):
+            with self.assertRaises(RuntimeError):
+                product_task.run_task(**kwargs, wait_ms=0)
+        held = self.claims()
+        self.assertEqual([row["mode"] for row in held], ["READ"])
+        resumed = product_task.run_task(**kwargs, wait_ms=0)
+        self.assertEqual(resumed["status"], "running")
+        self.assertEqual(resumed["claim"]["claim_id"], held[0]["claim_id"])
+        self.assertEqual(len(self.claims()), 1)
+
+
 class FailClosedTests(TaskCase):
     def test_corrupt_task_record_raises(self) -> None:
         task_id = product_task.task_id_for(str(self.repo), "Review this repository")

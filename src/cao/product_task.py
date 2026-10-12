@@ -324,15 +324,109 @@ def task_payload(record: Mapping[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _recover_acquired_claim(conn: Any, record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Adopt an OPEN claim this task already acquired but never recorded.
+
+    A crash between the durable Registry claim and the product record save
+    leaves the ledger holding ownership this task can no longer see. Adoption
+    is only ever of *this attempt's own* row, and only when the intent
+    persisted before the claim still proves it: exact run, work key, owner,
+    mode, repository, registered scope, branch and worktree, plus -- for WRITE
+    -- a checkout still sitting exactly on the recorded precrash baseline with
+    no dirty, drifted or unverifiable evidence. A precrash baseline that cannot
+    be proven is refused with a precise blocker rather than re-derived from the
+    current checkout, because a post-acquisition commit would then look like
+    this claim's own baseline. Nothing here creates a second claim, releases a
+    row the task cannot justify, or leaves the operator a silent stall.
+    """
+
+    intent = record.get("claim_intent")
+    if not isinstance(intent, Mapping):
+        # No durable intent means no provable precrash baseline. Fall through to
+        # the Registry's own gate, which refuses an unattributable preexisting
+        # WRITE claim instead of adopting it.
+        return None
+    held = registry.get_open_claim(
+        conn, record["run_id"], record["work_key"], "", OWNER)
+    if held is None:
+        return None
+    work = registry.get_work(conn, record["run_id"], record["work_key"], "")
+    scope = list(record.get("scope") or [])
+    problems = []
+    if (intent.get("run_id") != record["run_id"]
+            or intent.get("work_key") != record["work_key"]
+            or intent.get("repo") != record["repo"]
+            or intent.get("mode") != record["mode"]
+            or intent.get("scope") != scope):
+        problems.append("the recorded claim intent is not this task's own")
+    if work is None or work["repo"] != git.normalize_repo(record["repo"]):
+        problems.append("the preexisting claim's repository is not this checkout")
+    elif list(work["paths"].split("\n") if work["paths"] else []) != scope:
+        problems.append("the preexisting claim's registered scope is not this task's scope")
+    if held["mode"] != record["mode"]:
+        problems.append("the preexisting claim's mode is not this task's mode")
+    elif held["claimed_at"] < record["created_at"]:
+        problems.append("the preexisting claim predates this task record")
+    base_head = base_branch = None
+    if record["mode"] == registry.WRITE:
+        base_head, base_branch = _repo_head_and_branch(record["repo"])
+        if (held["branch"] != base_branch or held["worktree"] != record["repo"]
+                or base_head != intent.get("base_head")
+                or base_branch != intent.get("base_branch")):
+            problems.append(
+                "the WRITE checkout no longer matches the claim's recorded "
+                "branch, worktree or precrash baseline")
+        elif not base_head or not base_branch:
+            problems.append("the WRITE checkout HEAD or branch could not be verified")
+        else:
+            # An unclean checkout means uncommitted work whose author cannot be
+            # proven. Refuse rather than attribute it to this claim.
+            status = git.probe_status(record["repo"])
+            if not status.get("ok") or not isinstance(status.get("items"), list):
+                problems.append("the WRITE checkout state could not be verified")
+            elif status["items"]:
+                problems.append("the WRITE checkout is dirty after claim acquisition")
+    elif held["branch"] or held["worktree"]:
+        problems.append("the preexisting READ claim carries write identity")
+    if problems:
+        return {
+            "ok": False,
+            "stage": "claim",
+            "result": {
+                "status": registry.NEEDS_RECONCILIATION,
+                "errors": ["recovery of the acquired claim was refused: "
+                           + "; ".join(problems)],
+                "conflicts": [],
+            },
+        }
+    return {
+        "ok": True,
+        "claim_id": held["claim_id"],
+        "status": registry.RESUMED,
+        "claim_mode": record["mode"],
+        "base_head": base_head,
+        "base_branch": base_branch,
+    }
+
+
 def _claim_authority(
     conn: Any,
     record: dict[str, Any],
     observation: registry.RuntimeObservation | None,
+    env: Mapping[str, str] | None,
+    clock: Callable[[], Any] | None,
 ) -> dict[str, Any]:
-    """Propose and claim the task's scope through the registry's own gate."""
+    """Propose and claim the task's scope through the registry's own gate.
+
+    The acquisition intent is persisted *before* the durable Registry claim. It
+    is the only precrash baseline a crash inside that window can later be
+    recovered against, so the baseline is recorded once, here, and never
+    re-derived from the checkout after the claim exists.
+    """
 
     repo = record["repo"]
     scope = list(record.get("scope") or [])
+    base_head = base_branch = None
     if record["mode"] == registry.WRITE:
         # Bind the terminal result to the exact original source state. A
         # resumed claim must never treat another commit as its new baseline.
@@ -347,6 +441,18 @@ def _claim_authority(
                     "conflicts": [],
                 },
             }
+        record["claim_intent"] = {
+            "run_id": record["run_id"],
+            "work_key": record["work_key"],
+            "repo": repo,
+            "mode": record["mode"],
+            "scope": list(scope),
+            "base_head": base_head,
+            "base_branch": base_branch,
+            "recorded_at": evidence.utc_now(clock),
+        }
+        _save(record, env, clock)
+
         proposed = registry.propose(
             conn,
             record["run_id"],
@@ -663,7 +769,11 @@ def run_task(
                 "status": registry.RESUMED,
             }
         else:
-            authority = _claim_authority(conn, record, observation)
+            # A crash between the durable Registry claim and this record's
+            # save leaves an OPEN row this task must recognize as its own.
+            authority = _recover_acquired_claim(conn, record)
+            if authority is None:
+                authority = _claim_authority(conn, record, observation, env, clock)
         if not authority.get("ok"):
             record["status"] = "refused"
             record["refusal"] = {
