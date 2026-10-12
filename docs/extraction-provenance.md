@@ -6,8 +6,10 @@ left behind, and the pinned source used for provenance.
 
 ## Pinned source
 
-- Source: the BRAIN autonomous-execution control-plane protocol and the
-  supervising-agent skill that owns it.
+- Source: a private, governed autonomous-execution control-plane protocol and
+  the supervising-agent skill that owns it. The accountable upstream source
+  owns its own attribution; this public record carries only the attested facts
+  below.
 - Pinned source SHA: `0d16e9b5ac732d6ea353851cba0ed5bfe0b2b580`.
 - Extraction mode: read-only. The source repository was **not** edited.
 

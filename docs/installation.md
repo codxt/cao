@@ -57,6 +57,19 @@ cd cao
 
 Setting `CAO_PYTHON` selects the interpreter used for the bootstrap step.
 
+## The managed runtime protocol
+
+The product layer talks to the installed runtime through that runtime's own
+command line, not through the `RuntimePlugin`/`RuntimeClient` contract. The
+managed executable is run as a subprocess with list-built argv, and every
+identifier CAO then addresses is read back from the runtime's JSON response and
+bound to the request; a response that cannot be read is a protocol failure, not
+a fabricated success. The verbs and envelope types are the managed runtime's
+own — currently Herdr-shaped `workspace`, `tab`, `pane` and `agent` verbs. This
+is a separate surface from the runtime-neutral plugin API and is not a second
+plugin abstraction. See [`product-pilot.md`](product-pilot.md) and
+[`architecture.md`](architecture.md).
+
 ## Provider and model selection
 
 Installation does not itself authenticate anything. To be considered `READY`,

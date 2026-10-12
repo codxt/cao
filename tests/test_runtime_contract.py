@@ -3,9 +3,14 @@ prompt, close, explicit selection, and no silent fallback."""
 
 from __future__ import annotations
 
+import ast
+import json
 import unittest
 from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
 
+from cao import product_driver
+from cao import runtime as cao_runtime
 from cao.contracts import (
     Capability,
     InvalidStartRequest,
@@ -21,6 +26,7 @@ from cao.runtime import (
     PluginNotFound,
     PluginRegistry,
     RuntimeClient,
+    RuntimePlugin,
 )
 from support import (
     FIXED_CAPTURE_TIME,
@@ -732,6 +738,77 @@ class StartRequestPlacementTests(unittest.TestCase):
         self.assertIn("EXISTING", StartRequest.__doc__ or "")
         self.assertIn("PROVISION", StartRequest.__doc__ or "")
         self.assertIn("agent_kind", validate_placement.__doc__ or "")
+
+
+class TwoSurfaceContractTests(unittest.TestCase):
+    """The runtime-neutral plugin contract and the product managed-runtime CLI
+    protocol are two separate surfaces and must not be conflated.
+
+    Synthetic only: a fake in-process plugin and a fake runner. No live runtime
+    is contacted.
+    """
+
+    def test_runtime_client_exposes_only_the_generic_capability_contract(self) -> None:
+        client = RuntimeClient(FakeRuntimePlugin())
+        for name in (
+            "discover",
+            "snapshot",
+            "inspect",
+            "observe",
+            "start",
+            "prompt",
+            "close",
+        ):
+            with self.subTest(method=name):
+                self.assertTrue(callable(getattr(client, name)))
+        # The runtime-neutral contract never speaks a runtime-shaped CLI verb.
+        for verb in ("workspace_create", "tab_create", "pane_read", "agent_start"):
+            with self.subTest(verb=verb):
+                self.assertFalse(hasattr(client, verb))
+
+    def test_product_driver_is_not_a_runtime_plugin(self) -> None:
+        self.assertFalse(issubclass(product_driver.RuntimeDriver, RuntimePlugin))
+        self.assertFalse(hasattr(product_driver.RuntimeDriver, "capabilities"))
+        for name in ("discover", "snapshot", "inspect", "observe", "prompt", "close"):
+            with self.subTest(method=name):
+                self.assertFalse(hasattr(product_driver.RuntimeDriver, name))
+
+    def test_product_driver_speaks_managed_runtime_cli_verbs(self) -> None:
+        seen: list[list[str]] = []
+
+        def runner(argv: object) -> str:
+            argv = list(argv)  # type: ignore[arg-type]
+            seen.append(argv)
+            verb = argv[0]
+            if verb == "workspace":
+                return json.dumps(
+                    {"result": {"type": "workspace_list", "workspaces": []}}
+                )
+            if verb == "pane":
+                return json.dumps({"result": {"type": "pane_list", "panes": []}})
+            if verb == "agent":
+                return json.dumps({"result": {"type": "agent_wait", "state": "idle"}})
+            raise AssertionError(f"unexpected verb {verb!r}")
+
+        driver = product_driver.RuntimeDriver(runner=runner)
+        self.assertEqual(driver.workspace_list(), [])
+        self.assertEqual(driver.pane_list("ws-1"), [])
+        self.assertEqual(
+            product_driver.wait_state(driver.agent_wait("agent-1")), "idle"
+        )
+        self.assertEqual([argv[0] for argv in seen], ["workspace", "pane", "agent"])
+        self.assertEqual(seen[1], ["pane", "list", "--workspace", "ws-1"])
+
+    def test_core_runtime_module_does_not_import_the_product_driver(self) -> None:
+        source = Path(cao_runtime.__file__).read_text(encoding="utf-8")
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        self.assertNotIn("cao.product_driver", imported)
+        self.assertNotIn("product_driver", imported)
 
 
 if __name__ == "__main__":

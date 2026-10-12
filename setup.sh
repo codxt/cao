@@ -7,7 +7,7 @@
 #   1. writes an idempotent CAO product configuration into the XDG config dir,
 #      recording the pinned runtime dependency;
 #   2. installs or adopts the pinned runtime binary through the stdlib-only
-#      installer in ``src/cao/managed_herdr.py``, which verifies the SHA-256
+#      installer in ``src/cao/bootstrap.py``, which verifies the SHA-256
 #      before anything is put in place.
 #
 # This file is the single source of the pinned coordinates. The release asset

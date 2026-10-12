@@ -11,6 +11,11 @@ That is the whole source setup. `./setup.sh` writes the CAO product
 configuration and installs or adopts the pinned runtime binary; `./cao doctor`
 reports whether the install is actually usable.
 
+This quickstart uses the effectful product CLI, which drives the managed runtime
+through that runtime's own command line. The read-only foundation commands
+(`cao plugins list`, `cao work list`, …) are unchanged and separate; see
+[`operators.md`](operators.md).
+
 ## Reading the verdict
 
 `./cao doctor` prints JSON and exits `0` only when every readiness gate passes:
