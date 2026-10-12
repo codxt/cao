@@ -418,13 +418,15 @@ provider CLI/id and the effective model — and, in chat mode, the exact
 would save, so an operator can confirm the digests before approving. Roles are
 shown only by their safe declared selection (an inline model or an
 `agent_profile`); raw role instructions, raw argument vectors, prompts,
-environment, credentials and private paths are never emitted. A model is shown
-only as a bounded provider/model token; an unqualified selection that is not a
-recognized safe `--model` switch is reported unresolved instead of echoed. An
-unknown profile or unresolvable route fails closed with a nonzero exit, and a
-missing or unavailable product configuration is refused rather than guessed.
-Legacy approval mode reports truthful null digests and claims no
-chat-confirmation authority.
+environment and configured document text are never emitted. The provider
+CLI/id and model fields shown are operator-declared identifier values, so an
+operator must keep them non-secret; each is emitted only when it has a bounded
+identifier shape and the provider entry and any argv `--model` agree, and a
+divergent, repeated, flag-like or otherwise unqualified selection is reported
+unresolved instead of echoed. An unknown profile or unresolvable route fails
+closed with a nonzero exit, and a missing or unavailable product configuration
+is refused rather than guessed. Legacy approval mode reports truthful null
+digests and claims no chat-confirmation authority.
 
 That binding is the resolved selection an agent actually receives — the role
 model or agent profile of every task and phase — and not the surrounding

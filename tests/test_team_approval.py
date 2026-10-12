@@ -183,6 +183,76 @@ class ChatTeamTests(unittest.TestCase):
         self.assertIsNone(route["model"])
         self.assertEqual(route["model_status"], "unresolved")
 
+    def test_plan_reports_unresolved_when_argv_model_differs_from_provider_model(self):
+        # A non-OpenCode agent kind can carry a provider model and an argv
+        # --model at once. The plan is an operator preview, so a divergence is
+        # never rendered as one falsely resolved model.
+        self.raw["provider"] = {"cli": "claude", "id": "account",
+                                "model": "claude/aaa"}
+        self.raw["task"] = {"agent_args": ["--model", "bbb"]}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["provider"]["model"], "claude/aaa")
+        self.assertIsNone(route["model"])
+        self.assertEqual(route["model_status"], "unresolved")
+        self.assertNotIn("bbb", json.dumps(plan))
+        # The route shown stays the exact selection admission binds.
+        self.assertEqual(plan["routes_sha256"],
+                         team_approval.confirmation(
+                             self.spec, self.config,
+                             team._effective_routes(self.config, self.spec))
+                         ["routes_sha256"])
+
+    def test_plan_treats_a_model_switch_used_as_a_flag_value_as_unresolved(self):
+        # --model here is the value of the preceding flag, not a model switch.
+        self.raw["agent_profiles"] = {"claude_review": {
+            "agent_kind": "claude",
+            "read_args": ["--append-system-prompt", "--model", "hunter2-secret"]}}
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Review the change", "agent_profile": "claude_review"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertIsNone(route["model"])
+        self.assertEqual(route["model_status"], "unresolved")
+        self.assertNotIn("hunter2-secret", json.dumps(plan))
+
+    def test_plan_unresolved_model_arguments_are_not_hidden_by_a_provider_model(self):
+        self.raw["provider"] = {"cli": "claude", "id": "account",
+                                "model": "claude/aaa"}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source"}
+        cases = {"repeated": ["--model", "bbb", "--model", "ccc"],
+                 "equals-form": ["--model=bbb"],
+                 "missing-value": ["--model"]}
+        for name, args in cases.items():
+            with self.subTest(case=name):
+                self.raw["task"] = {"agent_args": args}
+                self.configure()
+                code, plan = self.plan(self.write_manifest())
+                self.assertEqual(code, 0)
+                route = plan["tasks"][0]["routes"]["work"]
+                self.assertEqual(route["provider"]["model"], "claude/aaa")
+                self.assertIsNone(route["model"])
+                self.assertEqual(route["model_status"], "unresolved")
+
+    def test_plan_resolves_a_model_switch_after_a_value_token(self):
+        # A --model preceded by a real value (not a flag) is still a switch.
+        self.raw["agent_profiles"] = {"claude_review": {
+            "agent_kind": "claude",
+            "read_args": ["--permission-mode", "plan", "--model", "sonnet"]}}
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Review the change", "agent_profile": "claude_review"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["model"], "sonnet")
+        self.assertEqual(route["model_status"], "resolved")
+
     def test_plan_fails_closed_for_unknown_agent_profile(self):
         self.spec["roles"]["reviewer"] = {
             "instruction": "Review", "agent_profile": "absent"}

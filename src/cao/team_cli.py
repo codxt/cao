@@ -26,20 +26,56 @@ def _safe_token(value: object) -> str | None:
     return None
 
 
-def _arg_model(arguments: object) -> str | None:
-    """The one safe ``--model <value>`` switch an agent argv declares.
+def _argv_model(arguments: object) -> tuple[str | None, int, bool]:
+    """One agent argv's declared ``--model`` switch, without echoing raw argv.
 
-    Only a single bounded switch value is surfaced; a repeated switch, a
-    missing value, any other flag or an unsafe value stays unresolved.
+    Returns ``(value, mentions, trap)``: ``value`` is the bounded token of the
+    single ``--model`` value (``None`` when that value is missing, unsafe or in
+    ``--model=value`` form), ``mentions`` counts ``--model`` switches, and
+    ``trap`` is set when a ``--model`` token is really the value of a preceding
+    flag. A caller treats more than one mention, an unusable value or a trap as
+    unresolved rather than guessing which token is the model.
     """
 
     if type(arguments) is not list:
+        return None, 0, False
+    mentions = 0
+    value: str | None = None
+    trap = False
+    for index, argument in enumerate(arguments):
+        if type(argument) is not str:
+            continue
+        if argument.startswith("--model="):
+            mentions += 1
+            value = None
+        elif argument == "--model":
+            mentions += 1
+            previous = arguments[index - 1] if index else None
+            if type(previous) is str and previous.startswith("-"):
+                trap = True
+            value = (_safe_token(arguments[index + 1])
+                     if index + 1 < len(arguments) else None)
+    return value, mentions, trap
+
+
+def _effective_model(provider_model: str | None, value: str | None,
+                     mentions: int, trap: bool) -> str | None:
+    """The one model the provider entry and the argv agree on, else ``None``.
+
+    A resolved model must never misreport what dispatch would select. OpenCode
+    rejects a provider/argv divergence at configuration time, but any other
+    agent kind can carry both, and a ``--model`` token that is really a
+    preceding flag's value is not a model at all. An ambiguous, invalid or
+    divergent selection is reported unresolved instead of falsely resolved.
+    """
+
+    if mentions == 0:
+        return provider_model
+    if mentions > 1 or value is None:
         return None
-    values = [arguments[index + 1] for index, argument in enumerate(arguments)
-              if argument == "--model" and index + 1 < len(arguments)]
-    if len(values) != 1:
-        return None
-    return _safe_token(values[0])
+    if provider_model is not None:
+        return provider_model if provider_model == value else None
+    return None if trap else value
 
 
 def _route(entry: Mapping[str, object]) -> dict[str, object]:
@@ -47,14 +83,16 @@ def _route(entry: Mapping[str, object]) -> dict[str, object]:
 
     The effective selection CAO would dispatch is reported (agent kind and
     provider), never the raw argument vector, environment or other private
-    state. A model is shown only as a safe bounded token.
+    state. A model is shown only as a safe bounded token when the provider
+    entry and any argv ``--model`` agree; a divergent, repeated or malformed
+    model selection is reported unresolved rather than falsely resolved.
     """
 
     provider = entry.get("provider")
     provider = provider if type(provider) is dict else {}
     provider_model = _safe_token(provider.get("model"))
-    model = provider_model if provider_model is not None else _arg_model(
-        entry.get("agent_args"))
+    value, mentions, trap = _argv_model(entry.get("agent_args"))
+    model = _effective_model(provider_model, value, mentions, trap)
     return {
         "agent_kind": _safe_token(entry.get("agent_kind")),
         "provider": {"cli": _safe_token(provider.get("cli")),
