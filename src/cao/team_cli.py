@@ -3,14 +3,108 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 
 from . import product_config, product_driver, team, team_approval
 from .state import StateError
 
+#: A bounded provider/model/agent-kind token. Anything that is not one is
+#: reported as unresolved instead of being echoed into operator output.
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+/#-]{0,150}\Z")
+
 
 def _emit(value: object) -> None:
     print(json.dumps(value, sort_keys=True))
+
+
+def _safe_token(value: object) -> str | None:
+    """The value only when it is a bounded, printable provider/model token."""
+
+    if type(value) is str and _SAFE_TOKEN.fullmatch(value):
+        return value
+    return None
+
+
+def _arg_model(arguments: object) -> str | None:
+    """The one safe ``--model <value>`` switch an agent argv declares.
+
+    Only a single bounded switch value is surfaced; a repeated switch, a
+    missing value, any other flag or an unsafe value stays unresolved.
+    """
+
+    if type(arguments) is not list:
+        return None
+    values = [arguments[index + 1] for index, argument in enumerate(arguments)
+              if argument == "--model" and index + 1 < len(arguments)]
+    if len(values) != 1:
+        return None
+    return _safe_token(values[0])
+
+
+def _route(entry: Mapping[str, object]) -> dict[str, object]:
+    """One read-only view of a resolved work/review route.
+
+    The effective selection CAO would dispatch is reported (agent kind and
+    provider), never the raw argument vector, environment or other private
+    state. A model is shown only as a safe bounded token.
+    """
+
+    provider = entry.get("provider")
+    provider = provider if type(provider) is dict else {}
+    provider_model = _safe_token(provider.get("model"))
+    model = provider_model if provider_model is not None else _arg_model(
+        entry.get("agent_args"))
+    return {
+        "agent_kind": _safe_token(entry.get("agent_kind")),
+        "provider": {"cli": _safe_token(provider.get("cli")),
+                     "id": _safe_token(provider.get("id")),
+                     "model": provider_model},
+        "model": model,
+        "model_status": "resolved" if model is not None else "unresolved",
+    }
+
+
+def _task_plan(task: Mapping[str, object],
+               routes: Mapping[str, object]) -> dict[str, object]:
+    return {"id": task.get("id"), "role": task.get("role"),
+            "mode": task.get("mode"), "depends_on": task.get("depends_on"),
+            "reviewer": task.get("reviewer"),
+            "routes": {phase: _route(routes[phase])
+                       for phase in ("work", "review") if phase in routes}}
+
+
+def _plan(spec: Mapping[str, object],
+          config: product_config.ProductConfig) -> dict[str, object]:
+    """The read-only operator plan for one validated manifest.
+
+    Effective routes come from the same resolver ``team.initialize`` uses, so
+    the reported digests are exactly the confirmation a chat-mode
+    ``cao team init --approved`` would save. Legacy approval mode claims no
+    chat-confirmation authority and reports truthful null hashes.
+    """
+
+    routes = team._effective_routes(config, spec)
+    mode = team_approval.policy(config)["mode"]
+    confirmed = (team_approval.confirmation(spec, config, routes)
+                 if mode == "chat" and spec.get("initiative") else None)
+    return {
+        "schema": "cao.team.plan.v1",
+        "team_id": spec["team_id"],
+        "initiative": spec.get("initiative"),
+        "supersedes": spec.get("supersedes"),
+        "change_reason": spec.get("change_reason"),
+        "roles": {name: {key: role[key]
+                         for key in ("model", "agent_profile") if key in role}
+                  for name, role in spec["roles"].items()},
+        "tasks": [_task_plan(task, routes.get(task["id"], {}))
+                  for task in spec["tasks"]],
+        "max_writers": spec["max_writers"],
+        "max_parallel": spec["max_parallel"],
+        "approval_mode": mode,
+        "spec_sha256": confirmed["spec_sha256"] if confirmed else None,
+        "routes_sha256": confirmed["routes_sha256"] if confirmed else None,
+    }
 
 
 def main(arguments: Sequence[str]) -> int:
@@ -47,17 +141,7 @@ def main(arguments: Sequence[str]) -> int:
                 config = product_config.load_config()
                 if config is None:
                     raise team.TeamError("local CAO product configuration is unavailable")
-                result = {"schema": "cao.team.plan.v1",
-                          "team_id": spec["team_id"],
-                          "initiative": spec.get("initiative"),
-                          "supersedes": spec.get("supersedes"),
-                          "change_reason": spec.get("change_reason"),
-                          "roles": spec["roles"],
-                          "tasks": [{k: t.get(k) for k in ("id", "role", "mode",
-                                   "depends_on", "reviewer")} for t in spec["tasks"]],
-                          "max_writers": spec["max_writers"],
-                          "max_parallel": spec["max_parallel"],
-                          "approval_mode": team_approval.policy(config)["mode"]}
+                result = _plan(spec, config)
             else:
                 config = product_config.load_config()
                 result = team.initialize(spec, config=config, approved=args.approved)

@@ -43,6 +43,17 @@ class ChatTeamTests(unittest.TestCase):
         return team.initialize(spec or self.spec, env=self.env,
                                config=self.config, approved=approved)
 
+    def plan(self, manifest):
+        with mock.patch.dict(os.environ, self.env):
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                code = team_cli.main(["plan", "--file", str(manifest)])
+        return code, json.loads(output.getvalue())
+
+    def write_manifest(self, spec=None):
+        manifest = self.root / "team.json"
+        manifest.write_text(json.dumps(spec if spec is not None else self.spec))
+        return manifest
+
     def test_chat_approval_is_explicit_and_idempotent(self):
         with self.assertRaises(team.TeamAdmissionError):
             self.admit()
@@ -73,6 +84,150 @@ class ChatTeamTests(unittest.TestCase):
                                                 "--approved"]), 0)
             self.assertEqual(json.loads(output.getvalue())["status"], "PAUSED")
         self.assertEqual(len(team.list_teams(env=self.env)), 1)
+
+    def test_plan_reports_the_exact_saved_confirmation_digests(self):
+        manifest = self.write_manifest()
+        code, plan = self.plan(manifest)
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["approval_mode"], "chat")
+        # The plan is the read-only preview of what --approved would save.
+        saved = self.admit(approved=True)["approval"]
+        self.assertEqual(plan["spec_sha256"], saved["spec_sha256"])
+        self.assertEqual(plan["routes_sha256"], saved["routes_sha256"])
+        self.assertEqual(plan["routes_sha256"],
+                         team_approval.confirmation(
+                             self.spec, self.config,
+                             team._effective_routes(self.config, self.spec))
+                         ["routes_sha256"])
+
+    def test_plan_shows_opencode_role_model_without_raw_argv(self):
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        # Roles are limited to their declared, safe selection.
+        self.assertEqual(plan["roles"]["reviewer"], {"model": "opencode/review"})
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["agent_kind"], "opencode")
+        self.assertEqual(route["provider"]["cli"], "opencode")
+        self.assertEqual(route["provider"]["id"], "test")
+        self.assertEqual(route["provider"]["model"], "opencode/review")
+        self.assertEqual(route["model"], "opencode/review")
+        self.assertEqual(route["model_status"], "resolved")
+        # The raw argument vector (and any incidental private text) is absent.
+        self.assertNotIn("agent_args", json.dumps(plan))
+        self.assertNotIn("standalone", json.dumps(plan))
+
+    def test_plan_shows_profiled_reviewer_model_from_validated_args(self):
+        self.raw["agent_profiles"] = {"claude_review": {
+            "agent_kind": "claude",
+            "read_args": ["--model", "sonnet", "--permission-mode", "plan"]}}
+        self.spec["roles"]["worker"] = {"instruction": "Implement the change"}
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Review the exact commit",
+            "agent_profile": "claude_review"}
+        self.spec["tasks"] = [{
+            "id": "implementation", "role": "worker", "mode": "write",
+            "repo": str(self.root / "repo"), "write_scope": ["README.md"],
+            "prompt": "Implement the accepted change", "reviewer": "reviewer",
+            "max_corrections": 1}]
+        self.spec["max_writers"] = 1
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["roles"]["reviewer"],
+                         {"agent_profile": "claude_review"})
+        task = plan["tasks"][0]
+        self.assertEqual(task["reviewer"], "reviewer")
+        # The work phase inherits the validated OpenCode provider.
+        self.assertEqual(task["routes"]["work"]["agent_kind"], "opencode")
+        self.assertEqual(task["routes"]["work"]["model"], "opencode/default")
+        # The review phase resolves the profiled Claude reader's --model value.
+        review = task["routes"]["review"]
+        self.assertEqual(review["agent_kind"], "claude")
+        self.assertEqual(review["provider"]["cli"], "claude")
+        self.assertIsNone(review["provider"]["model"])
+        self.assertEqual(review["model"], "sonnet")
+        self.assertEqual(review["model_status"], "resolved")
+
+    def test_plan_never_leaks_arguments_secrets_or_private_paths(self):
+        secret = "abc123-private-token"
+        private = str(self.root / "ops" / "auth.json")
+        self.raw["agent_profiles"] = {"claude_review": {
+            "agent_kind": "claude",
+            "read_args": ["--model", "sonnet", "--api-key", secret,
+                          "--config", private]}}
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Inspect the private client contract",
+            "agent_profile": "claude_review"}
+        self.spec["tasks"][0]["prompt"] = "Review material kept in " + private
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        blob = json.dumps(plan)
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("api-key", blob)
+        self.assertNotIn(private, blob)
+        self.assertNotIn(str(self.root), blob)
+        self.assertNotIn("private client contract", blob)
+        self.assertNotIn("agent_args", blob)
+
+    def test_plan_reports_unresolved_for_an_unsafe_argument_model(self):
+        self.raw["agent_profiles"] = {"codex_review": {
+            "agent_kind": "codex", "read_args": ["--model", "not a safe token"]}}
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Review the change", "agent_profile": "codex_review"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["agent_kind"], "codex")
+        self.assertIsNone(route["model"])
+        self.assertEqual(route["model_status"], "unresolved")
+
+    def test_plan_fails_closed_for_unknown_agent_profile(self):
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Review", "agent_profile": "absent"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 3)
+        self.assertEqual(plan["status"], "UNAVAILABLE")
+
+    def test_plan_fails_closed_when_role_model_has_no_opencode_provider(self):
+        self.raw["provider"] = {"cli": "other", "id": "account",
+                                "model": "other/default"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 3)
+        self.assertEqual(plan["status"], "UNAVAILABLE")
+
+    def test_plan_route_digest_changes_when_a_used_model_changes(self):
+        before = self.plan(self.write_manifest())[1]
+        self.spec["roles"]["reviewer"]["model"] = "opencode/other"
+        after = self.plan(self.write_manifest())[1]
+        self.assertNotEqual(before["routes_sha256"], after["routes_sha256"])
+        self.assertNotEqual(before["spec_sha256"], after["spec_sha256"])
+
+    def test_plan_route_digest_ignores_unused_configuration(self):
+        before = self.plan(self.write_manifest())[1]
+        # A registry path, runtime name, base provider model and a profile no
+        # role selects are all outside the resolved per-task routes.
+        self.raw["registry_db"] = str(self.root / "moved.sqlite3")
+        self.raw["runtime_id"] = "renamed-runtime"
+        self.raw["provider"]["model"] = "opencode/changed"
+        self.raw["agent_profiles"] = {"unused": {"agent_kind": "gemini",
+                                                 "read_args": []}}
+        self.configure()
+        after = self.plan(self.write_manifest())[1]
+        self.assertEqual(before["routes_sha256"], after["routes_sha256"])
+        self.assertEqual(before["spec_sha256"], after["spec_sha256"])
+
+    def test_plan_legacy_mode_reports_no_confirmation_digests(self):
+        self.raw.pop("team_approval")
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["approval_mode"], "legacy")
+        self.assertIsNone(plan["spec_sha256"])
+        self.assertIsNone(plan["routes_sha256"])
 
     def tick(self, effects):
         return team.tick("alpha", config=self.config, driver=None, env=self.env,
