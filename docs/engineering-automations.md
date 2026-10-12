@@ -1,23 +1,23 @@
 # Engineering evaluations and guarded automation
 
 CAO can poll a governed engineering improvement on its existing daemon cadence,
-compare one source-reported GBrain evaluation with an exact GitHub PR, ask for
+compare one source-reported evaluation with an exact GitHub PR, ask for
 operator approval when warranted, and request GitHub-native auto-merge once
 all independent guards pass. No new scheduler, queue, authority ledger,
 model route, secret store or release executor is introduced.
 
-This extends the earlier Evidence-to-Investigation work. The independent GBrain
+This extends the earlier Evidence-to-Investigation work. The independent
 evaluation calculator is owned by the runtime repository. CAO consumes only its
-sanitized report, and does not implement GBrain search or copy private tenant
+sanitized report, and does not implement evaluator search or copy private tenant
 knowledge into its repository.
 
 ## Workflow
 
-1. The owning system evaluates a fixed suite and exports
-   tolest.gbrain.eval.comparison.v1. Its source SHA and suite digest bind the
-   reported improvement. Missing provider cost, incomplete coverage,
-   regression or an unmeasured gain refuses that verdict at the evaluator.
-   A source-reported improvement is not accepted operating proof.
+1. The owning system evaluates a fixed suite and exports a
+   cao.engineering.evaluation.v1 comparison report. Its source SHA and suite
+   digest bind the reported improvement. Missing provider cost, incomplete
+   coverage, regression or an unmeasured gain refuses that verdict at the
+   evaluator. A source-reported improvement is not accepted operating proof.
 2. An opt-in CAO engineering watch polls the exact report and exact candidate
    GitHub PR. A failed evaluation produces NEEDS_IMPROVEMENT and may be passed
    to a separate source-attested CAO feedback watch for automatic READ-only
@@ -40,9 +40,10 @@ knowledge into its repository.
    that watch; an operator pause or expired grant cannot erase an in-flight
    checkpoint. The next tick checks GitHub for actual merged/armed state,
    and never issues an unchanged second merge request.
-6. Merge is only a Git source state. Factory, release, tenant health and
-   post-deployment evaluation remain separate. A new regression starts a new
-   governed incident rather than silently changing original evidence.
+6. Merge is only a Git source state. A deployment platform, release, tenant
+   health and post-deployment evaluation remain separate. A new regression
+   starts a new governed incident rather than silently changing original
+   evidence.
 
 The engineering watch is a real opt-in recurring automation because CAO's
 existing daemon calls the one-shot checker at its configured cadence. It is
@@ -65,7 +66,7 @@ normalized, and the state directory must already exist under operator control.
   "suite_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "evaluation_file": "/private/example/comparison.json",
   "min_gain": 0.05,
-  "required_checks": ["validate (3.12)", "gbrain-evals"],
+  "required_checks": ["validate (3.12)", "eval-suite"],
   "operators": ["separate-owner-account"],
   "reviewers": ["separate-reviewer-account"],
   "allowed_paths": ["src/search.py", "tests"],
@@ -181,10 +182,10 @@ substitutes for the external GitHub operator grant.
 
 A negative result never promotes a change. Source or provider errors keep
 UNKNOWN and report a bounded code rather than leaking credentials, URLs,
-GBrain results or CI logs. This mechanism does not auto-create PRs, merge
+evaluation results or CI logs. This mechanism does not auto-create PRs, merge
 unreviewed work, edit tenant knowledge, activate production monitors,
-deploy, change credentials, grant permissions, or override Factory's
-release gates.
+deploy, change credentials, grant permissions, or override a deployment
+platform's release gates.
 
 ## Validation and qualification
 
@@ -196,9 +197,9 @@ PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
 Hermetic tests check exact-head identity, CI and branch protection, separate
 operator/reviewer, approval content, scope, TTL, polling cadence, crash
 idempotency, remote merge reconciliation and the daemon integration. They
-never call live GitHub merge or production GBrain.
+never call live GitHub merge or a production evaluator.
 
-Prior to live use, qualify a real GBrain metric adapter/source, exact metrics
+Prior to live use, qualify a real evaluation metric adapter/source, exact metrics
 and CI, safe bot permissions and protected branch, operator and reviewer
 identities, a disposable PR approval/CI canary, and recovery after a missed
 merge response. Enable production automation only under that evidence and

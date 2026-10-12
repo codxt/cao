@@ -21,6 +21,10 @@ Fail-closed rules this module enforces:
   ``unknown`` and it is never re-prompted automatically -- ``status``/``logs``
   surface it for an operator;
 * an unreadable or malformed task record raises; it is never treated as absent;
+* a bounded output capture keeps the terminal suffix of a runtime read and
+  states how much of its beginning was dropped, so the completion receipt is
+  never the part an operator loses, and a later read that captured less never
+  erases the one already captured;
 * ``complete`` handback releases the claim with the observed repository HEAD;
   stop/abandon releases with outcome ``abandon`` and closes only CAO's own
   pane in the CAO-owned workspace.
@@ -162,12 +166,30 @@ def _repo_head_and_branch(repo: str) -> tuple[str | None, str | None]:
 # --------------------------------------------------------------------------
 
 
-def _bounded(text: str, limit: int) -> tuple[str, bool]:
+def _bounded(text: str, limit: int) -> tuple[str, dict[str, Any]]:
+    """Bound one runtime read by keeping its terminal suffix.
+
+    An agent writes its completion receipt last, so a bounded capture retains
+    the end of the read and states exactly how much of the beginning was
+    dropped. Keeping the head instead silently discards the receipt that proves
+    the work finished, which is the one part an operator must be able to read.
+    """
+
     if not isinstance(text, str):
-        return "", False
+        return "", {"kept": "none", "limit": limit, "captured_chars": 0,
+                    "dropped_chars": 0}
     if limit > 0 and len(text) > limit:
-        return text[:limit], True
-    return text, False
+        return (
+            text[-limit:],
+            {
+                "kept": "tail",
+                "limit": limit,
+                "captured_chars": limit,
+                "dropped_chars": len(text) - limit,
+            },
+        )
+    return text, {"kept": "all", "limit": limit, "captured_chars": len(text),
+                  "dropped_chars": 0}
 
 
 def _new_record(
@@ -210,6 +232,7 @@ def _new_record(
         "claim": None,
         "output": None,
         "output_truncated": False,
+        "output_bounds": None,
         "observation": None,
         "error": None,
         "refusal": None,
@@ -287,6 +310,7 @@ def task_payload(record: Mapping[str, Any]) -> dict[str, Any]:
         "observation": record.get("observation"),
         "output": record.get("output"),
         "output_truncated": bool(record.get("output_truncated")),
+        "output_bounds": record.get("output_bounds"),
         "pane_closed": record.get("pane_closed"),
         "error": record.get("error"),
         "refusal": record.get("refusal"),
@@ -527,13 +551,25 @@ def _observe(
     except product_driver.DriverError as exc:
         record["observation"] = {"status": "UNKNOWN", "reason": getattr(exc, "code", None)}
         return
-    bounded, truncated = _bounded(text, defaults.max_output_chars)
+    stamp = evidence.utc_now(clock)
+    bounded, bounds = _bounded(text, defaults.max_output_chars)
+    stored = record.get("output")
+    if isinstance(stored, str) and stored and len(bounded) < len(stored):
+        # Each read is a bounded window of a scrolling pane. A later read that
+        # captured less must not erase a completion receipt an earlier read
+        # already proved, so the longer capture is retained and the newer,
+        # shorter read is recorded as not stored.
+        record["output_bounds"] = dict(
+            record.get("output_bounds") or {},
+            superseded_read_chars=len(text),
+            observed_at=stamp,
+        )
+        record["observation"] = {"status": "OBSERVED", "captured_at": stamp}
+        return
     record["output"] = bounded
-    record["output_truncated"] = truncated
-    record["observation"] = {
-        "status": "OBSERVED",
-        "captured_at": evidence.utc_now(clock),
-    }
+    record["output_truncated"] = bounds["kept"] == "tail"
+    record["output_bounds"] = dict(bounds, observed_at=stamp)
+    record["observation"] = {"status": "OBSERVED", "captured_at": stamp}
 
 
 # --------------------------------------------------------------------------
@@ -987,10 +1023,16 @@ def read_logs(
         }
     output = record.get("output") or ""
     truncated = bool(record.get("output_truncated"))
+    # The stored capture is already a bounded window of the runtime read. A
+    # view limit keeps the SAME end as that bound, so a caller asking for the
+    # last characters still sees the completion receipt, and the metadata keeps
+    # the stored bound and the view bound separate instead of conflating them.
+    bounds = dict(record.get("output_bounds") or {})
     if limit is not None:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise TaskUsageError("limit must be a non-negative integer")
         if len(output) > limit:
+            bounds["view_dropped_chars"] = len(output) - (limit if limit else 0)
             output = output[-limit:] if limit else ""
             truncated = True
     return {
@@ -1003,6 +1045,7 @@ def read_logs(
         "pane_id": (record.get("checkpoint") or {}).get("pane_id"),
         "output": output,
         "truncated": truncated,
+        "output_bounds": bounds or None,
         "updated_at": record.get("updated_at"),
     }
 

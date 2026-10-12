@@ -265,6 +265,34 @@ class WrapperTests(CliCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["status"], "NOT_STARTED")
 
+    def test_installed_console_script_matches_the_source_launcher(self) -> None:
+        text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('cao = "cao.product_cli:main"', text)
+
+    def test_foundation_groups_are_answered_by_their_owner(self) -> None:
+        code, output = run_cli(["plugins", "list", "--json"])
+        self.assertEqual(code, product_cli.EXIT_OK)
+        self.assertEqual(json.loads(output)["schema"], "cao.cli.plugins.v0")
+
+    def test_foundation_run_list_is_not_the_product_task_command(self) -> None:
+        # No ledger exists in the sandbox, so the foundation CLI reports its own
+        # unavailable answer instead of the product task usage refusal.
+        code, output = run_cli(["run", "list"])
+        self.assertEqual(code, product_cli.EXIT_UNAVAILABLE)
+        payload = json.loads(output)
+        self.assertEqual(payload["schema"], "cao.cli.unavailable.v0")
+        self.assertEqual(payload["command"], "list")
+
+    def test_product_run_is_still_the_task_command(self) -> None:
+        # With no product configuration installed the task command reports its
+        # own unavailable answer; the foundation CLI would reject the arguments.
+        code, output = run_cli(["run"])
+        self.assertEqual(code, product_cli.EXIT_UNAVAILABLE)
+        payload = json.loads(output)
+        self.assertEqual(payload["schema"], "cao.product.unavailable.v0")
+        self.assertEqual(payload["command"], "run")
+        self.assertEqual(payload["error"]["code"], "NOT_IMPLEMENTED")
+
 
 class WriteRunCliTests(CliCase):
     """The CLI WRITE path supplies a live occupancy observation to the gate.

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cao import product_config, registry, state, team, team_cli
+from cao import product_config, registry, state, team, team_approval, team_cli
 
 
 class ChatTeamTests(unittest.TestCase):
@@ -74,18 +74,108 @@ class ChatTeamTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())["status"], "PAUSED")
         self.assertEqual(len(team.list_teams(env=self.env)), 1)
 
-    def test_routing_change_holds_before_any_agent_effect(self):
+    def tick(self, effects):
+        return team.tick("alpha", config=self.config, driver=None, env=self.env,
+                         execute=lambda **kwargs: effects.append(kwargs)
+                         or dict(status="running"),
+                         writer_snapshot=lambda _: (0, set()),
+                         head_reader=lambda _: "a" * 40)
+
+    def test_unrelated_configuration_change_does_not_invalidate_an_admitted_team(self):
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        self.raw["registry_db"] = str(self.root / "moved.sqlite3")
+        self.raw["runtime_id"] = "renamed-runtime"
+        self.raw["daemon"] = {"tick_interval": 45}
+        self.raw["agent_profiles"] = {"unused": {"agent_kind": "opencode",
+                                                 "read_args": ["mini"]}}
+        # A role model is what this team dispatches, so the base provider model
+        # that no agent of it reads is an unrelated change.
+        self.raw["provider"]["model"] = "opencode/changed"
+        self.configure()
+        effects = []
+        self.assertEqual(self.tick(effects)["tasks"]["read"]["status"], "running")
+        self.assertEqual(len(effects), 1)
+
+    def test_dispatched_model_selection_change_holds_before_any_agent_effect(self):
+        self.spec["roles"]["reviewer"] = {
+            "instruction": "Inspect source", "agent_profile": "read"}
+        self.raw["agent_profiles"] = {"read": {"agent_kind": "opencode",
+                                               "read_args": ["mini"]}}
+        self.configure()
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        # The profile this role dispatches is re-pointed at another agent kind.
+        self.raw["agent_profiles"]["read"] = {"agent_kind": "other",
+                                              "read_args": ["go"]}
+        self.configure()
+        effects = []
+        with self.assertRaises(team.TeamAdmissionError):
+            self.tick(effects)
+        self.assertEqual(effects, [])
+
+    def test_dispatched_provider_change_holds_before_any_agent_effect(self):
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        self.raw["provider"]["id"] = "renamed-provider"
+        self.configure()
+        effects = []
+        with self.assertRaises(team.TeamAdmissionError):
+            self.tick(effects)
+        self.assertEqual(effects, [])
+
+    def test_inherited_provider_change_holds_before_any_agent_effect(self):
+        # A role that declares neither a model nor a profile dispatches with the
+        # configured provider, so a provider change still holds before dispatch.
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source"}
+        self.configure()
         self.admit(approved=True)
         team.set_desired("alpha", "running", env=self.env)
         self.raw["provider"]["model"] = "opencode/changed"
         self.configure()
         effects = []
         with self.assertRaises(team.TeamAdmissionError):
-            team.tick("alpha", config=self.config, driver=None, env=self.env,
-                      execute=lambda **kwargs: effects.append(kwargs),
-                      writer_snapshot=lambda _: (0, set()),
-                      head_reader=lambda _: "a" * 40)
+            self.tick(effects)
         self.assertEqual(effects, [])
+
+    def test_running_tasks_are_reconciled_when_new_dispatch_is_refused(self):
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        effects = []
+        self.tick(effects)
+        self.assertEqual(len(effects), 1)
+        # Nothing is pending any more: the dispatched task keeps its exact
+        # execution identity and must still be reconciled and released even
+        # though the configuration now selects a different provider.
+        record = state.read_state(Path(team.team_path("alpha", self.env)))
+        record["slots"]["read"]["status"] = "running"
+        state.write_state(Path(team.team_path("alpha", self.env)), record)
+        self.raw["provider"]["id"] = "renamed-provider"
+        self.configure()
+        reconciled = []
+        result = self.tick(reconciled)
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+
+    def test_absent_configuration_refuses_new_dispatch_of_an_approved_team(self):
+        self.admit(approved=True)
+        with mock.patch.object(product_config, "load_config", return_value=None):
+            with self.assertRaises(team.TeamAdmissionError):
+                team.set_desired("alpha", "running", env=self.env)
+        self.assertEqual(team.status("alpha", env=self.env)["desired"], "paused")
+
+    def test_legacy_confirmation_record_still_verifies(self):
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        self.tick([])
+        # An admission recorded against the raw configuration document by an
+        # earlier release keeps verifying instead of freezing the team.
+        record = state.read_state(Path(team.team_path("alpha", self.env)))
+        record["admission"] = team_approval.confirmation(record["spec"], self.config)
+        state.write_state(Path(team.team_path("alpha", self.env)), record)
+        effects = []
+        self.assertEqual(self.tick(effects)["tasks"]["read"]["status"], "running")
+        self.assertEqual(len(effects), 1)
 
     def test_successor_requires_pause_terminal_and_declared_reason(self):
         self.admit(approved=True)
@@ -104,6 +194,61 @@ class ChatTeamTests(unittest.TestCase):
         data["slots"]["read"]["error"] = "TEAM_RESULT_UNVERIFIED"
         state.write_state(p, data)
         self.assertEqual(self.admit(later, approved=True)["status"], "PAUSED")
+
+    def test_never_started_team_is_reconfirmed_on_the_identical_manifest(self):
+        self.raw.pop("team_approval")
+        self.configure()
+        self.admit()
+        self.assertIsNone(self.admit().get("approval"))
+        self.raw["team_approval"] = {"mode": "chat"}
+        self.configure()
+        with self.assertRaises(team.TeamAdmissionError):
+            team.set_desired("alpha", "running", env=self.env)
+        confirmed = self.admit(approved=True)
+        self.assertEqual(confirmed["approval"]["method"], "operator-declared")
+        self.assertEqual(
+            confirmed["approval"]["routes_sha256"],
+            team_approval.confirmation(
+                self.spec, self.config,
+                team._effective_routes(self.config, self.spec))["routes_sha256"])
+        self.assertEqual(team.set_desired("alpha", "running", env=self.env)["desired"],
+                         "running")
+        effects = []
+        self.assertEqual(self.tick(effects)["tasks"]["read"]["status"], "running")
+        self.assertEqual(len(effects), 1)
+
+    def test_dispatched_or_claimed_team_is_never_reapproved(self):
+        self.raw.pop("team_approval")
+        self.configure()
+        self.admit()
+        team.set_desired("alpha", "running", env=self.env)
+        effects = []
+        self.tick(effects)
+        self.assertEqual(len(effects), 1)
+        # Enabling chat policy afterwards can no longer re-approve this team,
+        # because it already dispatched an execution.
+        self.raw["team_approval"] = {"mode": "chat"}
+        self.configure()
+        with self.assertRaises(team.TeamError):
+            self.admit(approved=True)
+        # The same refusal holds when a dispatched execution was cleared but the
+        # shared Registry still holds the team's claim.
+        record = state.read_state(Path(team.team_path("alpha", self.env)))
+        execution_id = record["slots"]["read"]["execution_id"]
+        record["slots"]["read"] = dict(record["slots"]["read"], status="pending",
+                                       execution_id=None, prompt=None, error=None)
+        state.write_state(Path(team.team_path("alpha", self.env)), record)
+        ledger = registry.connect(self.raw["registry_db"])
+        try:
+            registry.propose(ledger, "cao-team-alpha", execution_id,
+                             str(self.root / "repo"), components=["review"])
+            registry.claim(ledger, registry.ClaimSpec(
+                run_id="cao-team-alpha", work_key=execution_id,
+                owner="cao-product", mode="READ", issue=""), None)
+        finally:
+            ledger.close()
+        with self.assertRaises(team.TeamError):
+            self.admit(approved=True)
 
     def test_legacy_pending_is_held_when_chat_policy_is_enabled(self):
         self.raw.pop("team_approval")

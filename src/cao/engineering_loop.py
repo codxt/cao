@@ -26,7 +26,12 @@ from typing import Any, Callable
 
 SCHEMA = "cao.engineering.watch.v1"
 STATE_SCHEMA = "cao.engineering.state.v1"
-METRIC_SCHEMA = "tolest.gbrain.eval.comparison.v1"
+#: The canonical evaluation report schema. A report exported under the earlier
+#: private-evaluator name keeps verifying: the exact suite digest, not the
+#: report's name, is what binds it, so a bounded report family is accepted
+#: without this module naming any operator's evaluator.
+METRIC_SCHEMA = "cao.engineering.evaluation.v1"
+METRIC_FAMILY = re.compile(r"[a-z0-9][a-z0-9._-]{0,64}\.eval\.comparison\.v1\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\Z")
@@ -171,7 +176,9 @@ def validate(value: Any) -> dict:
 
 
 def _comparison(v: dict, manifest: dict) -> tuple[str, str]:
-    if (v.get("schema") != METRIC_SCHEMA
+    if (type(v.get("schema")) is not str
+            or (v["schema"] != METRIC_SCHEMA
+                and not METRIC_FAMILY.fullmatch(v["schema"]))
             or v.get("suite_sha256") != manifest["suite_sha256"]):
         refuse("evaluation suite identity mismatch")
     baseline = v.get("baseline_sha")

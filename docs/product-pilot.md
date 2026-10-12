@@ -258,8 +258,9 @@ Three independent readings, all expected to agree:
 - `status` → `"status": "RUNNING"`, `task.observation.status: "OBSERVED"`, the
   workspace label and the agent name/kind above.
 - `logs` → exit `0`, `"ok": true`, bounded `output` ending in the agent's
-  confirmation. The output is truncated to the configured bound, never dumped
-  unbounded.
+  confirmation. The bound keeps the terminal suffix and reports how much of the
+  beginning it dropped (`output_bounds`), so the completion receipt is the part
+  that survives; the output is never dumped unbounded.
 
 Confirm the live process carries the exact configured kind and model argv:
 

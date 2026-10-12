@@ -297,6 +297,70 @@ def _admission_config(env: Mapping[str, str] | None,
         product_config.config_path(env))
 
 
+def _effective_routes(config: product_config.ProductConfig,
+                      spec: Mapping[str, Any]) -> dict[str, Any]:
+    """The exact model/provider selection each dispatchable execution would use.
+
+    The operator's chat confirmation binds these resolved values instead of the
+    raw configuration document: a role launched through an agent profile never
+    reads the base provider at all, so binding that document would refuse a team
+    over configuration none of its agents use, while a role model or the profile
+    a role selects still changes the binding.
+    """
+    routes: dict[str, Any] = {}
+    for task in spec["tasks"]:
+        entry: dict[str, Any] = {}
+        for phase in ("work", "review"):
+            if phase == "review" and task.get("reviewer") is None:
+                continue
+            resolved = _role_config(config, spec, task, phase)
+            defaults = product_config.task_defaults(resolved)
+            provider = resolved.provider
+            entry[phase] = {
+                "agent_kind": defaults.agent_kind,
+                "agent_args": list(defaults.agent_args),
+                "provider": (None if provider is None else {
+                    "cli": provider.cli,
+                    "id": provider.provider_id,
+                    "model": provider.model,
+                }),
+            }
+        routes[task["id"]] = entry
+    return routes
+
+
+def _new_dispatch_possible(record: Mapping[str, Any]) -> bool:
+    """Whether the team could still start work it has not started yet."""
+
+    return any(slot["status"] == "pending" for slot in record["slots"].values())
+
+
+def _verify_admission(record: Mapping[str, Any],
+                      config: product_config.ProductConfig | None) -> None:
+    """Re-verify a saved confirmation before any NEW dispatch.
+
+    A confirmation only ever gates work that has not started. An already-running
+    task keeps its exact execution identity, prompt and claim and still has to
+    be reconciled and released, so an unrelated configuration change can never
+    freeze it: such a change stops the team from starting anything new instead.
+    """
+    admission = record.get("admission")
+    if admission is None or not _new_dispatch_possible(record):
+        return
+    if config is None:
+        raise TeamAdmissionError(
+            "the approved team's configuration is unavailable; refusing new dispatch"
+        )
+    try:
+        routes = _effective_routes(config, record["spec"])
+    except (TeamError, product_config.ProductConfigError) as exc:
+        raise TeamAdmissionError(str(exc)) from exc
+    try:
+        team_approval.verify_saved(record["spec"], config, admission, routes)
+    except team_approval.ApprovalError as exc:
+        raise TeamAdmissionError(str(exc)) from exc
+
+
 def _check_initiative_lineage(spec: Mapping[str, Any],
                               env: Mapping[str, str] | None) -> None:
     """One team per initiative; a successor needs a safe, explicit handoff."""
@@ -342,6 +406,54 @@ def _check_initiative_lineage(spec: Mapping[str, Any],
         raise TeamError("predecessor still owns active Registry claims")
 
 
+def _team_claim_count(env: Mapping[str, str] | None, team_id: str) -> int:
+    """Claims the shared Registry holds for this team's run id.
+
+    A team that never dispatched anything holds no claim. An absent ledger
+    therefore answers zero; an unreadable one fails closed rather than being
+    read as zero.
+    """
+    path = product_config.registry_db_path(env)
+    if not os.path.isfile(path):
+        return 0
+    try:
+        conn = registry.connect_readonly(path)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM claims WHERE run_id=?",
+                ("cao-team-" + team_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, registry.RegistryError) as exc:
+        raise TeamError("team Registry evidence unavailable") from exc
+
+
+def _confirm_undispatched_team(spec: Mapping[str, Any],
+                               config: product_config.ProductConfig,
+                               record: dict[str, Any],
+                               env: Mapping[str, str] | None) -> None:
+    """Attach the operator's confirmation to a team that never started work.
+
+    A team recorded before chat approval was required is re-confirmed on its
+    identical immutable manifest, so an unused manifest never forces a successor
+    team. Only a team with no execution identity at all and no Registry claim
+    qualifies: a team that already dispatched keeps its existing explicit
+    recovery paths instead of being silently re-approved.
+    """
+    if any(slot.get("execution_id") for slot in record["slots"].values()):
+        raise TeamError("team already dispatched work; reapproval is refused")
+    if _team_claim_count(env, spec["team_id"]):
+        raise TeamError("team holds Registry claims; reapproval is refused")
+    try:
+        record["admission"] = team_approval.confirmation(
+            spec, config, _effective_routes(config, spec)
+        )
+    except team_approval.ApprovalError as exc:
+        raise TeamAdmissionError(str(exc)) from exc
+    _save(record, env)
+
+
 def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
                config: product_config.ProductConfig | None = None,
                approved: bool = False) -> dict[str, Any]:
@@ -353,6 +465,10 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
         if old is not None:
             if old["spec_hash"] != fingerprint(selected):
                 raise TeamError("team ID already exists with different immutable manifest")
+            if (mode == "chat" and approved is True
+                    and old.get("admission") is None and resolved is not None):
+                _confirm_undispatched_team(selected, resolved, old, env)
+                return summary(_required(selected["team_id"], env))
             return summary(old)
         admission = None
         if mode == "chat":
@@ -360,7 +476,9 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
                 raise TeamAdmissionError("confirm the team in chat before --approved")
             _check_initiative_lineage(selected, env)
             try:
-                admission = team_approval.confirmation(selected, resolved)
+                admission = team_approval.confirmation(
+                    selected, resolved, _effective_routes(resolved, selected)
+                )
             except team_approval.ApprovalError as exc:
                 raise TeamAdmissionError(str(exc)) from exc
         elif approved:
@@ -395,10 +513,7 @@ def set_desired(team_id: str, desired: str, *, env: Mapping[str, str] | None = N
         if desired == "running" and record["desired"] != "running":
             config = _admission_config(env, None)
             if record.get("admission") is not None:
-                try:
-                    team_approval.verify_saved(record["spec"], config, record["admission"])
-                except team_approval.ApprovalError as exc:
-                    raise TeamAdmissionError(str(exc)) from exc
+                _verify_admission(record, config)
             elif team_approval.policy(config)["mode"] == "chat":
                 raise TeamAdmissionError("existing unapproved team cannot be newly started")
         record["desired"] = desired
@@ -927,11 +1042,7 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
         spec, slots = record["spec"], record["slots"]
         chat_mode = team_approval.policy(config)["mode"] == "chat"
         admission = record.get("admission")
-        if admission is not None:
-            try:
-                team_approval.verify_saved(spec, config, admission)
-            except team_approval.ApprovalError as exc:
-                raise TeamAdmissionError(str(exc)) from exc
+        _verify_admission(record, config)
         freeze_legacy_pending = chat_mode and admission is None
         record["tick_count"] += 1
         changes = 0
