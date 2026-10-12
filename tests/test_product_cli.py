@@ -161,12 +161,52 @@ class CliCase(unittest.TestCase):
         env = {
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "XDG_STATE_HOME": str(self.root / "state"),
+            # ``registry_db_path`` reads ``CAO_REGISTRY_DB`` first, so an
+            # inherited value would beat both XDG homes and send these CLI
+            # tests' synthetic claims into a shared live ledger. Force the
+            # fixture's own private ledger explicitly; ``clear=False`` alone
+            # does not override a variable the host already exports.
+            "CAO_REGISTRY_DB": str(self.root / "registry.sqlite3"),
         }
         patcher = mock.patch.dict(os.environ, env, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
+        for key in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAO_REGISTRY_DB"):
             self.addCleanup(os.environ.pop, key, None)
+
+
+class FixtureRegistryIsolationTests(CliCase):
+    """The CLI fixture must own its ledger even under a hostile inherited env.
+
+    ``product_config.registry_db_path`` reads ``CAO_REGISTRY_DB`` before any XDG
+    home, so a host that exports its shared ledger must not be able to redirect
+    a CLI test into it. This fails if the fixture stops forcing a private
+    ledger.
+    """
+
+    def setUp(self) -> None:
+        # Simulate an inherited live selection BEFORE the fixture runs.
+        inherited = tempfile.TemporaryDirectory()
+        self.addCleanup(inherited.cleanup)
+        self.inherited_db = Path(inherited.name) / "cao-work-registry" / "registry.sqlite3"
+        previous = os.environ.get("CAO_REGISTRY_DB")
+        self.addCleanup(self._restore_registry_db, previous)
+        os.environ["CAO_REGISTRY_DB"] = str(self.inherited_db)
+        super().setUp()
+
+    @staticmethod
+    def _restore_registry_db(previous: str | None) -> None:
+        if previous is None:
+            os.environ.pop("CAO_REGISTRY_DB", None)
+        else:
+            os.environ["CAO_REGISTRY_DB"] = previous
+
+    def test_inherited_ledger_is_replaced_by_a_private_local_ledger(self) -> None:
+        selected = Path(product_config.registry_db_path(os.environ))
+        self.assertTrue(selected.is_relative_to(self.root), selected)
+        self.assertNotEqual(selected, self.inherited_db)
+        # Selecting the fixture ledger must not have touched the inherited one.
+        self.assertFalse(self.inherited_db.exists())
 
 
 class HelpTests(CliCase):
