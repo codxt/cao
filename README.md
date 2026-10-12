@@ -6,14 +6,27 @@ capabilities, capture state, inspect targets, observe output, start work,
 prompt sessions, and enforce authority — without coupling the core to any one
 runtime.
 
-CAO is **runtime neutral**. A runtime integrates through a plugin selected
-explicitly by id. Herdr is the first first-class runtime plugin; it is
-registered through an installed entry point and is **not** a built-in default.
-Core identities are generic: runtime, workspace, execution, and session ids.
+CAO's core is **runtime neutral**. A runtime integrates through an in-process
+plugin selected explicitly by id; core identities are generic: runtime,
+workspace, execution, and session ids. Herdr is the first first-class runtime
+plugin; it is registered through an installed entry point and is **not** a
+built-in default.
+
+The product layer is a **second, separate surface**. `./setup.sh` and the
+effectful `./cao` commands drive one installed, pinned managed runtime through
+that runtime's own command-line protocol — currently Herdr-shaped `workspace`,
+`tab`, `pane` and `agent` verbs with JSON result envelopes. The product driver
+keeps the executable as data and names no runtime in its code, but the protocol
+it speaks is the managed runtime's CLI. It is not a second plugin abstraction
+and does not replace CAO's runtime-neutral contract.
 
 ## Status
 
-This repository provides a usable, **read-only** control-plane CLI:
+CAO ships two surfaces from this tree, and they differ in effect.
+
+The **read-only foundation** is the accepted F0 core CLI. Every command reports
+structured JSON, delegates to the module that owns the state, fails closed, and
+never mutates state:
 
 - runtime plugin discovery (`cao plugins list`);
 - read-only registry views over proposed work, active claims, and runs
@@ -28,14 +41,25 @@ This repository provides a usable, **read-only** control-plane CLI:
 nonzero exit**: composing a brief needs a concrete source reader per declared
 source, and CAO ships none. See [`docs/automations.md`](docs/automations.md).
 
-Every command reports structured JSON, delegates to the module that owns the
-state, and fails closed. The CLI never mutates state and never fabricates a
-result: when required state cannot be read it prints explicit `UNAVAILABLE`
-evidence and exits nonzero.
+The **effectful product CLI** is `./cao`, built on the source bootstrap. It
+drives the installed managed runtime and owns task, team and daemon state:
+`./setup.sh` installs or adopts the pinned runtime, `./cao doctor` reports
+readiness, `./cao run`/`status`/`logs`/`stop` drive one governed task, and
+`./cao daemon start|stop|status` adds optional supervision. The specialist
+`cao team` commands build on the same task ownership. These commands can start
+an agent and write state under the CAO roots; they fail closed with an explicit
+`UNAVAILABLE` or `NOT_READY` (exit `3`) instead of fabricating progress.
+
+Neither surface invents a result: when required state cannot be read, the
+command prints explicit `UNAVAILABLE` evidence and exits nonzero.
 
 ## Install
 
-Requires Python 3.10+.
+Requires Python 3.10+ and a POSIX `sh`. The read-only core is pure Python and
+runs wherever Python 3.10+ runs. The managed runtime the product layer installs
+or adopts is supported on Linux `x86_64` and `aarch64`; on an unpinned platform
+the readiness report marks the runtime dependency `UNSUPPORTED` rather than
+substituting a different runtime.
 
 ### From source (no wheel)
 

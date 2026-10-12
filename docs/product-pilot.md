@@ -11,6 +11,11 @@ creates and later closes. It never downloads over a managed runtime, never
 stops the runtime's own server, and never touches an unrelated workspace,
 session or process.
 
+It observes and drives the runtime through the runtime's own command line (the
+`workspace`, `pane` and `agent` verbs shown below), which is a separate surface
+from CAO's runtime-neutral plugin API; see
+[`architecture.md`](architecture.md).
+
 Read the whole runbook before running any command. Steps 1-4 are preparation;
 steps 5-11 are the pilot; "Evidence" says what to keep.
 

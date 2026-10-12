@@ -4,6 +4,11 @@ CAO never names a concrete runtime in its core. A runtime integrates by
 providing a `RuntimePlugin` and registering it under an explicit id. This
 document is the frozen plugin contract for F0.
 
+This is the runtime-neutral, in-process plugin contract (surface 1 in
+[`architecture.md`](architecture.md)). It is separate from the product layer's
+managed-runtime CLI protocol (`product_driver.py`), which drives one installed
+runtime through that runtime's own command line and is not a plugin.
+
 ## Selecting a plugin
 
 Plugins are selected explicitly by id through `PluginRegistry`:

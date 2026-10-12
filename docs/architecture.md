@@ -49,6 +49,27 @@ Because these are separate, a runtime cannot grant itself authority, and an
 authority check cannot reach into a runtime's internals. The CLI composes them
 rather than any module reaching across the boundary.
 
+## Two runtime integration surfaces
+
+There are two distinct ways CAO reaches a runtime, and they must not be
+confused:
+
+1. **The runtime-neutral plugin contract (F0).** `runtime.py` plus
+   `contracts.py` define the in-process `RuntimePlugin`/`RuntimeClient` API:
+   seven generic capabilities over generic identities, selected explicitly by
+   plugin id. A concrete runtime implements this under `src/cao/plugins/` and
+   is never imported by the core. This is the contract this document and
+   [`runtime-plugin.md`](runtime-plugin.md) describe.
+
+2. **The product managed-runtime CLI protocol (product lane).**
+   `product_driver.py` drives one installed, pinned managed runtime by running
+   its executable as a subprocess. The executable is supplied as data, but the
+   protocol it speaks is the managed runtime's own command line — currently
+   Herdr-shaped `workspace`/`tab`/`pane`/`agent` verbs with JSON result
+   envelopes. This surface is deliberately **not** a second plugin abstraction,
+   is not part of the F0 core contract, and does not weaken it: the core still
+   reaches runtimes only through `RuntimeClient`.
+
 ## Generic identities
 
 CAO owns the *roles* of identities, not their contents:

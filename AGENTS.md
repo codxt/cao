@@ -11,6 +11,20 @@ CAO is an open-source AgentOps control plane for agentic runtimes. The core is
 runtime neutral; runtimes integrate through plugins. Herdr is the designated first first-class runtime plugin. Its implementation
 belongs under `src/cao/plugins/herdr/`; generic core modules never import it.
 
+CAO has **two integration surfaces**, and they are not the same thing:
+
+- the **runtime-neutral core contract** (`contracts.py`, `runtime.py`): an
+  in-process `RuntimePlugin`/`RuntimeClient` API over generic capabilities and
+  generic ids, with explicit plugin selection. No core module names a concrete
+  runtime; only `src/cao/plugins/**` may.
+- the **product managed-runtime CLI protocol** (`product_driver.py` and the
+  bootstrap/doctor/task/daemon lane): a subprocess protocol over one installed,
+  pinned managed runtime's executable, using that runtime's own CLI verbs
+  (`workspace`, `tab`, `pane`, `agent`) and JSON result envelopes. The driver
+  keeps the executable as data, but the protocol is the managed runtime's
+  current (Herdr-shaped) command line. It is **not** a second plugin
+  abstraction and must not be presented as the runtime-neutral plugin contract.
+
 ## Non-negotiable rules
 
 - **Standard library only.** No runtime dependencies. The `-S` test run proves
