@@ -257,5 +257,72 @@ class RecursiveGuardTests(unittest.TestCase):
         self.assertNotIn("plugins/runtime_x/__init__.py", offenders)
 
 
+
+class PublicOssCompatibilityTests(unittest.TestCase):
+    """Regression checks for public interfaces kept within the governed scope."""
+
+    def test_engineering_suite_identity_accepts_legacy_family_only(self) -> None:
+        from cao import engineering_loop as engineering
+
+        baseline, candidate, suite = "a" * 40, "b" * 40, "c" * 64
+        manifest = {"suite_sha256": suite, "min_gain": 0.1}
+        report = {
+            "schema": engineering.METRIC_SCHEMA,
+            "status": "SOURCE_REPORTED_IMPROVEMENT",
+            "baseline_sha": baseline,
+            "candidate_sha": candidate,
+            "suite_sha256": suite,
+            "objective_gain": 0.25,
+            "source_only": True,
+            "canonical_operating_proof": False,
+        }
+        self.assertEqual(engineering._comparison(report, manifest), (baseline, candidate))
+        legacy = dict(report, schema="example.eval.comparison.v1")
+        self.assertEqual(engineering._comparison(legacy, manifest), (baseline, candidate))
+        for schema in ("cao.engineering.evaluation.v2", "other.report.v1",
+                       "CAO.ENGINEERING.EVALUATION.V1", "..eval.comparison.v1"):
+            with self.subTest(schema=schema), self.assertRaises(engineering.EngineeringError):
+                engineering._comparison(dict(report, schema=schema), manifest)
+        with self.assertRaises(engineering.EngineeringError):
+            engineering._comparison(dict(report, suite_sha256="d" * 64), manifest)
+
+    def test_installed_console_entrypoint_is_product_cli(self) -> None:
+        text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('cao = "cao.product_cli:main"', text)
+
+    def test_foundation_commands_remain_reachable_through_product_cli(self) -> None:
+        import contextlib
+        import io
+        import json
+        import os
+        from unittest import mock
+        from cao import product_cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"XDG_CONFIG_HOME": str(Path(directory) / "config"),
+                   "XDG_STATE_HOME": str(Path(directory) / "state")}
+            with mock.patch.dict(os.environ, env):
+                with contextlib.redirect_stdout(out := io.StringIO()):
+                    code = product_cli.main(["plugins", "list", "--json"])
+                self.assertEqual(code, product_cli.EXIT_OK)
+                self.assertEqual(json.loads(out.getvalue())["schema"],
+                                 "cao.cli.plugins.v0")
+
+                with contextlib.redirect_stdout(out := io.StringIO()):
+                    code = product_cli.main(["run", "list"])
+                self.assertEqual(code, product_cli.EXIT_UNAVAILABLE)
+                listing = json.loads(out.getvalue())
+                self.assertEqual(listing["schema"], "cao.cli.unavailable.v0")
+                self.assertEqual(listing["command"], "list")
+
+                with contextlib.redirect_stdout(out := io.StringIO()):
+                    code = product_cli.main(["run"])
+                self.assertEqual(code, product_cli.EXIT_UNAVAILABLE)
+                task = json.loads(out.getvalue())
+                self.assertEqual(task["schema"], "cao.product.unavailable.v0")
+                self.assertEqual(task["command"], "run")
+                self.assertEqual(task["error"]["code"], "NOT_IMPLEMENTED")
+
+
 if __name__ == "__main__":
     unittest.main()

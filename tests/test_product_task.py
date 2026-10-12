@@ -1004,6 +1004,118 @@ class CompletionAndStopTests(TaskCase):
             product_task.stop_task(env=self.env, registry_db=self.db)
 
 
+class BoundedOutputTests(TaskCase):
+    """A bounded capture keeps the completion receipt, not the splash screen."""
+
+    LIMIT = 120
+    RECEIPT = "CAO_TEAM_RESULT: 0123456789abcdef"
+
+    def bounded_config(self, limit=LIMIT):
+        return product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"max_output_chars": limit},
+        })
+
+    def scrollback(self, lines=40):
+        prefix = "".join(f"line {index:04d} of the analysis\n" for index in range(lines))
+        return prefix + self.RECEIPT + "\n"
+
+    def test_bound_keeps_head_and_tail_differently(self):
+        text = self.scrollback()
+        stored, bounds = product_task._bounded(text, self.LIMIT)
+        # A head-bound capture would keep the beginning and lose the receipt.
+        self.assertIn("line 0000 of the analysis", text[:self.LIMIT])
+        self.assertNotIn(self.RECEIPT, text[:self.LIMIT])
+        self.assertEqual(stored, text[-self.LIMIT:])
+        self.assertTrue(stored.endswith(self.RECEIPT + "\n"))
+        self.assertNotIn("line 0000 of the analysis", stored)
+        self.assertEqual(bounds["kept"], "tail")
+
+    def test_true_truncation_reports_the_dropped_prefix(self):
+        text = self.scrollback()
+        stored, bounds = product_task._bounded(text, self.LIMIT)
+        self.assertEqual(len(stored), self.LIMIT)
+        self.assertEqual(bounds["kept"], "tail")
+        self.assertEqual(bounds["limit"], self.LIMIT)
+        self.assertEqual(bounds["captured_chars"], self.LIMIT)
+        self.assertEqual(bounds["dropped_chars"], len(text) - self.LIMIT)
+
+    def test_unbounded_output_is_reported_complete(self):
+        stored, bounds = product_task._bounded("agent output", self.LIMIT)
+        self.assertEqual(stored, "agent output")
+        self.assertEqual(bounds["kept"], "all")
+        self.assertEqual(bounds["dropped_chars"], 0)
+
+    def test_bounded_read_retains_the_terminal_receipt(self):
+        driver = FakeDriver()
+        driver.read_text = self.scrollback()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Review this repository",
+            config=self.bounded_config(), env=self.env, registry_db=self.db,
+            wait_ms=0)
+        self.assertEqual(payload["status"], "running")
+        self.assertTrue(payload["output"].endswith(self.RECEIPT + "\n"))
+        self.assertTrue(payload["output_truncated"])
+        self.assertEqual(payload["output_bounds"]["kept"], "tail")
+        self.assertEqual(payload["output_bounds"]["dropped_chars"],
+                         len(driver.read_text) - self.LIMIT)
+
+    def test_unbounded_read_stores_the_verbatim_output(self):
+        payload = product_task.run_task(
+            driver=FakeDriver(), repo=str(self.repo),
+            prompt="Review this repository", config=self.config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertFalse(payload["output_truncated"])
+        self.assertEqual(payload["output"], "agent output")
+        self.assertEqual(payload["output_bounds"]["kept"], "all")
+
+    def test_shorter_later_read_never_erases_a_captured_receipt(self):
+        first = FakeDriver()
+        first.read_text = self.scrollback()
+        product_task.run_task(
+            driver=first, repo=str(self.repo), prompt="Review this repository",
+            config=self.bounded_config(), env=self.env, registry_db=self.db,
+            wait_ms=0)
+        # A resumed observation of the same task reads a shorter window.
+        second = FakeDriver()
+        second.read_text = "status bar only\n"
+        payload = product_task.run_task(
+            driver=second, repo=str(self.repo), prompt="Review this repository",
+            config=self.bounded_config(), env=self.env, registry_db=self.db,
+            wait_ms=0)
+        self.assertEqual(payload["status"], "running")
+        self.assertTrue(payload["output"].endswith(self.RECEIPT + "\n"))
+        self.assertEqual(payload["output_bounds"]["superseded_read_chars"],
+                         len(second.read_text))
+
+    def test_logs_view_limit_keeps_the_terminal_end(self):
+        driver = FakeDriver()
+        driver.read_text = self.scrollback()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Review this repository",
+            config=self.bounded_config(), env=self.env, registry_db=self.db,
+            wait_ms=0)
+        logs = product_task.read_logs(
+            payload["task_id"], env=self.env, limit=len(self.RECEIPT) + 1)
+        self.assertEqual(logs["output"], self.RECEIPT + "\n")
+        self.assertTrue(logs["truncated"])
+        bounds = logs["output_bounds"]
+        self.assertEqual(bounds["kept"], "tail")
+        self.assertEqual(bounds["view_dropped_chars"],
+                         self.LIMIT - len(self.RECEIPT) - 1)
+
+    def test_logs_of_an_unbounded_output_report_no_truncation(self):
+        payload = product_task.run_task(
+            driver=FakeDriver(), repo=str(self.repo),
+            prompt="Review this repository", config=self.config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        logs = product_task.read_logs(payload["task_id"], env=self.env)
+        self.assertEqual(logs["output"], "agent output")
+        self.assertFalse(logs["truncated"])
+        self.assertEqual(logs["output_bounds"]["dropped_chars"], 0)
+
+
 class FailClosedTests(TaskCase):
     def test_corrupt_task_record_raises(self) -> None:
         task_id = product_task.task_id_for(str(self.repo), "Review this repository")

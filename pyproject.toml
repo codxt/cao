@@ -24,7 +24,11 @@ classifiers = [
 ]
 
 [project.scripts]
-cao = "cao.cli:main"
+# The installed command must dispatch exactly what the source launcher `./cao`
+# dispatches, so an installed CAO never offers a different command surface from a
+# checkout. Groups this product CLI does not own are answered by the module that
+# owns them (see ``cao.product_cli.main``), keeping every documented command.
+cao = "cao.product_cli:main"
 
 # Runtime plugins register under the "cao.runtime_plugins" entry-point group.
 # No plugin ships as a built-in default: an entry point registers a plugin, and

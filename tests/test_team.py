@@ -1233,6 +1233,118 @@ class TeamTests(unittest.TestCase):
         self.tick(fake)
         self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
 
+    def test_correction_lineage_ignores_manifest_write_scope_order(self):
+        """A manifest may list the exact same paths in a different order.
+
+        The product task record and the Registry row both store the canonically
+        sorted form, so lineage verification must compare the normalized list:
+        ordering alone can never break an exact match, while a genuinely
+        different scope still fails.
+        """
+        repo = git_repo(self.root, name="reordered", files=("a.txt",))
+        bare = self.root / "origin.git"
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                       capture_output=True, env={**os.environ, **GIT_ENV})
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-C", str(repo), "-c", "commit.gpgsign=false", *arguments],
+                check=True, capture_output=True, text=True,
+                env={**os.environ, **GIT_ENV}).stdout.strip()
+
+        git("remote", "add", "origin", str(bare))
+        git("push", "-u", "origin", "main")
+        db = str(self.root / "reordered-ledger.sqlite3")
+        registry.connect(db).close()
+
+        class Runtime(FakeDriver):
+            def workspace_create(self, label, cwd=None):
+                ident = "w" + str(len(self.workspaces) + 1)
+                self.workspaces.append({
+                    "workspace_id": ident, "label": label,
+                    "active_tab_id": ident + ":t1"})
+                return {"workspace_id": ident, "tab_id": ident + ":t1",
+                        "pane_id": ident + ":p1"}
+
+            def pane_list(self, workspace_id):
+                pane = workspace_id + ":p1"
+                return [] if pane in self.closed_panes else [
+                    {"pane_id": pane, "workspace_id": workspace_id,
+                     "agent_status": "done"}]
+
+            def pane_get(self, pane_id):
+                if pane_id in self.closed_panes:
+                    from cao import product_driver
+                    raise product_driver.DriverNotFound("closed")
+                return {"pane_id": pane_id, "workspace_id": pane_id.split(":")[0]}
+
+            def agent_prompt(self, target, prompt, *, timeout_ms=None, wait=False):
+                if "Role: Implement precise edits" in prompt:
+                    (repo / "a.txt").write_text("first\n")
+                    (repo / "b.txt").write_text("staged\n")
+                    git("add", "--", "a.txt", "b.txt")
+                    git("commit", "-m", "initial")
+                    self.read_text = "committed"
+                import re
+                shown = re.search(r"CAO_TEAM_NONCE_V2: ([0-9a-f]{16})", prompt)
+                assert shown is not None
+                self.read_text += "\nCAO_TEAM_RESULT: " + shown.group(1)
+                return super().agent_prompt(
+                    target, prompt, timeout_ms=timeout_ms, wait=wait)
+
+        driver = Runtime()
+        # The manifest deliberately lists the reverse of the canonical order.
+        self.init(self.spec([
+            {**task("a", str(repo), reviewer="reviewer", corrections=1),
+             "write_scope": ["b.txt", "a.txt"]}
+        ]))
+        team.tick("squad", config=self.config, driver=driver, env=self.env,
+                  registry_db=db)
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["phase"],
+                         "review")
+        path = Path(team.team_path("squad", self.env))
+        record = json.loads(path.read_text())
+        record["slots"]["a"].update(phase="correction", round=1, status="pending")
+        path.write_text(json.dumps(record))
+        record = team._required("squad", self.env)
+        declared = record["spec"]["tasks"][0]
+        slot = record["slots"]["a"]
+        team._prepare_verified_correction(
+            record["spec"], declared, slot, driver=driver, env=self.env, db=db)
+        c = registry.connect_readonly(db)
+        try:
+            self.assertEqual(
+                [(x["disposition"], x["authority"]) for x in c.execute(
+                    "SELECT disposition,authority FROM dispositions")],
+                [("historical", "cao-automated-team:squad")])
+        finally:
+            c.close()
+        # Content still matters: a claimed scope that no longer matches the
+        # exact Registry row fails instead of being normalized into agreement.
+        old_id = team._execution_id("squad", "a", "work", 0)
+        conn = registry.connect(db)
+        try:
+            conn.execute(
+                "UPDATE works SET paths=? WHERE run_id=? AND work_key=?",
+                ("a.txt\nb.txt\nextra.txt", "cao-team-squad", old_id))
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(team.TeamError, "Registry row"):
+            team._prepare_verified_correction(
+                record["spec"], declared, slot, driver=driver, env=self.env, db=db)
+        forged = dict(product_state.read_task(old_id, self.env), scope=["a.txt"])
+        with mock.patch("cao.product_state.read_task", return_value=forged):
+            with self.assertRaisesRegex(team.TeamError, "verified task"):
+                team._prepare_verified_correction(
+                    record["spec"], declared, slot, driver=driver, env=self.env, db=db)
+        c = registry.connect_readonly(db)
+        try:
+            self.assertEqual(
+                c.execute("SELECT COUNT(*) FROM dispositions").fetchone()[0], 1)
+        finally:
+            c.close()
+
 
 if __name__ == "__main__":
     unittest.main()

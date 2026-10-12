@@ -2,6 +2,9 @@
 
 The operator approves the composition in a conversation or other chosen
 channel. The CLI records that confirmation, not an authenticated identity.
+A saved confirmation binds the immutable manifest together with the exact
+model/provider selection each task would actually dispatch, so a change that
+no dispatched agent would ever read cannot invalidate it.
 """
 from __future__ import annotations
 
@@ -33,25 +36,35 @@ def _digest(value: Any) -> str:
 
 
 def route_digest(config: Any) -> str:
+    """Digest of the raw configuration sections that can select a provider.
+
+    Retained for admissions recorded before the binding moved to the resolved
+    per-execution routes: a confirmation saved by an earlier release must keep
+    verifying against exactly the document it was recorded from.
+    """
+
     raw = config.raw if config is not None else {}
     return _digest({k: raw.get(k) for k in (
         "provider", "task", "agent_profiles", "registry_db", "runtime_id")})
 
 
-def confirmation(spec: Mapping[str, Any], config: Any) -> dict[str, str]:
+def confirmation(spec: Mapping[str, Any], config: Any,
+                 routes: Any = None) -> dict[str, str]:
     if policy(config)["mode"] != "chat" or not spec.get("initiative"):
         raise ApprovalError("chat-approved teams require a named initiative")
     return {
         "schema": SCHEMA,
         "method": "operator-declared",
         "spec_sha256": _digest(spec),
-        "routes_sha256": route_digest(config),
+        "routes_sha256": route_digest(config) if routes is None else _digest(routes),
     }
 
 
-def verify_saved(spec: Mapping[str, Any], config: Any, admission: Any) -> None:
+def verify_saved(spec: Mapping[str, Any], config: Any, admission: Any,
+                 routes: Any = None) -> None:
     if (type(admission) is not dict or
             set(admission) != {"schema", "method", "spec_sha256", "routes_sha256"}):
         raise ApprovalError("team confirmation record is invalid")
-    if confirmation(spec, config) != admission:
+    if (admission != confirmation(spec, config, routes)
+            and admission != confirmation(spec, config)):
         raise ApprovalError("approved team or model configuration changed")

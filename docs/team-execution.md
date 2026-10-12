@@ -235,6 +235,10 @@ implement unrestricted agent-to-agent conversation or agent-generated new
 permissions/scopes. Use the current task record, shared Registry and durable
 team checkpoint to recover an interrupted run without replaying work.
 
+A stale Registry claim is never released by age, by a lease or by CAO guessing
+its owner: an unknown or merely old claim keeps its ownership until an operator
+reconciles it, and team recovery never fabricates a release to get past it.
+
 ## Portable agent profiles (opt-in)
 
 CAO Teams supports runtime-neutral, per-role `agent_profile` references.
@@ -306,8 +310,28 @@ cao team start --id team-id
 
 The flag records the caller's declaration of chat approval. CAO cannot
 verify the conversation or authenticate a person; it uses no signing keys,
-identity service or approval files. The immutable team and selected model
-configuration are retained so later changes cannot silently alter dispatch.
+identity service or approval files. The immutable team and the exact
+model/provider selection each task would dispatch are retained so later
+changes cannot silently alter dispatch.
+
+That binding is the resolved selection an agent actually receives — the role
+model or agent profile of every task and phase — and not the surrounding
+configuration document, so a registry path, runtime name or profile no role
+uses cannot invalidate a team. It is re-verified before any eligible
+first effect, including a crash-recovered RUNNING intent with no acquired claim.
+Capacity-blocked slots are not falsely labeled as approval failures. A
+configuration change stops the team from starting more work — the
+held slot reports `TEAM_ADMISSION_CHANGED` — while tasks that are already
+running keep their exact execution identity and are still reconciled, released
+and reported. Restoring the approved effective route releases the held slot on
+the next tick. No command in this section is publication, deployment or release
+authority.
+
+A team recorded before chat approval was required can be re-approved on its
+identical immutable manifest with the same `cao team init --file team.json
+--approved`. Only a team that never dispatched anything — no execution
+identity, no Registry claim — qualifies, so no successor team is created for
+an unused manifest; a team that already ran keeps its existing recovery paths.
 
 Reuse a team for one initiative. A separately approved successor identifies
 its predecessor with `supersedes` and gives a short `change_reason`; the old

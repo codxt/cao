@@ -1,7 +1,12 @@
 """The product-facing CAO command line for a source install.
 
-``./cao`` dispatches here. The commands that the source bootstrap owns answer
-today:
+``./cao`` dispatches here, and so does the installed ``cao`` console script, so
+an installed CAO never offers a different command surface from a checkout. The
+read-only foundation groups (``plugins``, ``work``, ``worker``, ``run list``,
+``coordinator``, ``relay``, ``automation``) are answered by the module that owns
+them instead of becoming a usage error.
+
+The commands the source bootstrap owns answer today:
 
 ``doctor``
     Exact per-subsystem readiness evidence. Fail-closed: anything that cannot be
@@ -53,6 +58,12 @@ EXIT_UNAVAILABLE = 3
 
 STATUS_SCHEMA = "cao.product.status.v0"
 UNAVAILABLE_SCHEMA = "cao.product.unavailable.v0"
+
+#: The command groups this product CLI answers itself. Anything else is owned by
+#: the read-only foundation CLI, which also owns ``run list`` ledger inspection.
+_PRODUCT_GROUPS = frozenset(
+    {"doctor", "status", "daemon", "team", "improve", "run", "start", "stop", "logs"}
+)
 
 
 def _emit(payload: Mapping[str, Any]) -> None:
@@ -446,6 +457,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     if args_list and args_list[0] == "--json":
         args_list = args_list[1:]
+    # The installed ``cao`` command and the source launcher ``./cao`` must be
+    # the same command, so a group this product CLI does not own is answered by
+    # the foundation CLI that owns it instead of becoming a usage error.
+    if args_list[:1] == ["run"] and args_list[1:2] == ["list"]:
+        # ``run list`` is the foundation ledger inspection command; every other
+        # ``run`` form below is the product task command.
+        from . import cli as foundation_cli
+
+        return foundation_cli.main(args_list)
+    if (args_list and not args_list[0].startswith("-")
+            and args_list[0] not in _PRODUCT_GROUPS):
+        from . import cli as foundation_cli
+
+        return foundation_cli.main(args_list)
     # The task-running commands accept arbitrary arguments and then report an
     # explicit UNAVAILABLE; they are intercepted so a task argument that looks
     # like an option is never a usage error.
