@@ -1433,9 +1433,20 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                             if slot["round"] >= task["max_corrections"]:
                                 slot["status"], slot["error"] = "blocked", "REVIEW_BUDGET_EXHAUSTED"
                             else:
+                                # A review may itself be the one bounded READ
+                                # retry (retry_no=1). The new correction round
+                                # is a distinct identity with its own budget, so
+                                # retry_no resets to 0; otherwise the stored
+                                # checkpoint would fail its own validation, which
+                                # only admits retry_no=1 in work/review.
                                 slot["phase"], slot["round"] = "correction", slot["round"] + 1
                                 slot["status"] = "pending"
-                                slot["feedback"] = str(result.get("output") or "")[:5000]
+                                slot["retry_no"] = 0
+                                # A clipped capture keeps its findings and
+                                # verdict at the very end, so the correction
+                                # receives the newest 5000 characters, never the
+                                # oldest part of the retained window.
+                                slot["feedback"] = str(result.get("output") or "")[-5000:]
                                 slot["execution_id"], slot["prompt"] = None, None
                         else:
                             slot["status"], slot["error"] = "unknown", (
@@ -1443,7 +1454,9 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                                 else "REVIEW_OUTPUT_BOUND_UNVERIFIED")
                     else:
                         slot["head"] = released
-                        slot["output"] = str(result.get("output") or "")[:5000]
+                        # The terminal end of a clipped capture holds the
+                        # findings a dependent or later review actually needs.
+                        slot["output"] = str(result.get("output") or "")[-5000:]
                         slot["error"] = None
                         if task["reviewer"] is not None:
                             slot["phase"], slot["status"] = "review", "pending"

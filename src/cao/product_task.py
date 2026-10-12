@@ -664,7 +664,12 @@ def _observe(
         # Each read is a bounded window of a scrolling pane. A later read that
         # captured less must not erase a completion receipt an earlier read
         # already proved, so the longer capture is retained and the newer,
-        # shorter read is recorded as not stored.
+        # shorter read is recorded as not stored. Known limitation: the
+        # converse is not detected -- a shorter later read that newly contains
+        # the receipt cannot displace a receipt-less longer window, so the task
+        # holds UNKNOWN instead. Distinguishing them needs this task's own
+        # nonce, which generic capture deliberately does not know; see
+        # docs/team-execution.md.
         record["output_bounds"] = dict(
             record.get("output_bounds") or {},
             superseded_read_chars=len(text),

@@ -166,11 +166,29 @@ how many it captured. Such a bounded capture may decide a review **only** when
 all of these hold: the record itself says it kept the tail; the window is
 exactly sized and equals the stored text; the reviewed source HEAD still
 matches; and the exact verdict plus this task's own completion nonce are both
-present in what was kept. A head-only capture, an unsized window, a capture
-of unknown provenance, a missing or forged nonce, a wrong `CAO_REVIEWED_HEAD`
-and a repeated verdict all hold UNKNOWN with `REVIEW_OUTPUT_BOUND_UNVERIFIED`.
-The bounds are CAO's own recorded provenance, never a value supplied by the
-answer being judged.
+present in what was kept. A head-only window, an unsized window, a capture of
+unknown provenance, and a missing or forged nonce all hold UNKNOWN with
+`REVIEW_OUTPUT_BOUND_UNVERIFIED`, because the capture itself is not a provable
+tail. A provably bounded tail that still carries this task's nonce but yields
+no unambiguous verdict, names a different reviewed HEAD, or repeats the verdict
+holds UNKNOWN with `REVIEW_VERDICT_UNVERIFIED`. A verdict whose reviewed HEAD no
+longer matches the checkout holds BLOCKED with `REVIEW_HEAD_DRIFT`. The bounds
+are CAO's own recorded provenance, never a value supplied by the answer being
+judged.
+
+The findings and verdict sit at the **end** of a clipped capture, so correction
+feedback and every later handoff take the newest 5,000 characters of the kept
+text, never the oldest part of the retained window.
+
+Known limitation: `product_task` retains the longer of two observations so that
+a shorter later read can never erase a receipt an earlier read already proved.
+The converse is not detected: when an earlier longer read has no receipt and a
+later shorter read does, the shorter read is recorded as
+`superseded_read_chars` and the durable output keeps the earlier window. The
+task then holds UNKNOWN for operator inspection instead of accepting an
+unproven receipt. No generic rule preserves both directions without the task
+knowing its own completion nonce, so this trade-off is documented rather than
+silently weakened.
 
 Reviewer verdicts are workflow advisory, not deployment/publication/credential
 authority and not independent proof of correctness. Final acceptance still
@@ -253,8 +271,11 @@ such a retry still reviews the same accepted source revision, with the same
 work handoff and the same review findings, because those are retained. The
 failed attempt's record, receipt and nonce stay durable and untouched. The new
 attempt receives a new execution identity and its own copy-only nonce, so it
-can never adopt the stopped agent or its released claim. A WRITE attempt is
-never retryable in any phase, and a second retry is refused.
+can never adopt the stopped agent or its released claim. A retried review that
+still requests changes opens a new, separately identified correction round on
+the same accepted source revision; the correction is not a retry, and its
+stored round resets the one-time retry budget. A WRITE attempt is never
+retryable in any phase, and a second retry is refused.
 
 ### Bounded stalled task handling
 

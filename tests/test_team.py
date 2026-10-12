@@ -262,35 +262,57 @@ class TeamTests(unittest.TestCase):
             "long answer\n" + verdict + "\n" + receipt + "\n",
             kept="tail", dropped_chars=9000)
         self.assertEqual(accepted["status"], "COMPLETE")
-        # A head-only window, an unsized one, and a capture that lost the nonce
-        # can each never be read as a verified review.
-        for label, output, bounds in (
-            ("head only", "long answer\n" + verdict + "\n" + receipt + "\n",
-             {"kept": "head", "dropped_chars": 9000}),
-            ("unknown provenance", "long answer\n" + verdict + "\n" + receipt + "\n",
-             {"kept": "tail", "dropped_chars": 0}),
-            ("missing nonce", "long answer\n" + verdict + "\n",
-             {"kept": "tail", "dropped_chars": 9000}),
-            ("forged nonce", "long answer\n" + verdict + "\nCAO_TEAM_RESULT: "
-             + "f" * 16 + "\n", {"kept": "tail", "dropped_chars": 9000}),
-            ("unsized window", "long answer\n" + verdict + "\n" + receipt + "\n",
-             {"kept": "tail"}),
-            ("claimed size disagrees", "long answer\n" + verdict + "\n" + receipt + "\n",
-             {"kept": "tail", "dropped_chars": 9000, "captured_chars": 99999}),
-            ("no verdict", "long answer\n" + receipt + "\n",
-             {"kept": "tail", "dropped_chars": 9000}),
-            ("wrong reviewed head", "long answer\nCAO_REVIEW_VERDICT: APPROVED\n"
-             "CAO_REVIEWED_HEAD: " + B + "\n" + receipt + "\n",
-             {"kept": "tail", "dropped_chars": 9000}),
-            ("two verdicts", "long answer\n" + verdict + "\n"
-             "CAO_REVIEW_VERDICT: APPROVED\nCAO_REVIEWED_HEAD: " + A + "\n"
-             + receipt + "\n", {"kept": "tail", "dropped_chars": 9000}),
-        ):
+        # Every negative case runs under its own team identity, so the receipt
+        # is built from that attempt's actual execution nonce. Cases whose
+        # capture is not a provable tail fail the bound check; cases with a
+        # valid tail but a bad verdict reach, and are decided by, the
+        # verdict/head check. Both predicate families are asserted explicitly.
+        cases = (
+            ("head only",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "head", "dropped_chars": 9000},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("unknown provenance",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 0},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("missing nonce",
+             lambda r: "long answer\n" + verdict + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("forged nonce",
+             lambda r: "long answer\n" + verdict + "\nCAO_TEAM_RESULT: " + "f" * 16 + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("unsized window",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail"},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("claimed size disagrees",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000, "captured_chars": 99999},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("no verdict",
+             lambda r: "long answer\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_VERDICT_UNVERIFIED"),
+            ("wrong reviewed head",
+             lambda r: "long answer\nCAO_REVIEW_VERDICT: APPROVED\n"
+                       "CAO_REVIEWED_HEAD: " + B + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_VERDICT_UNVERIFIED"),
+            ("two verdicts",
+             lambda r: "long answer\n" + verdict + "\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_VERDICT_UNVERIFIED"),
+        )
+        for index, (label, build, bounds, expected) in enumerate(cases):
             with self.subTest(label=label):
-                ident = "b" + str(abs(hash(label)) % 10000)
+                ident = "b" + str(index)
                 self.init(self.spec(
                     [task("a", self.paths[0], reviewer="reviewer")], team_id=ident))
-                seen = []
+                output = build("CAO_TEAM_RESULT: " + team._result_challenge(
+                    team._execution_id(ident, "a", "review", 0)))
 
                 def fake(**kwargs):
                     if kwargs["phase"] != "review":
@@ -300,8 +322,7 @@ class TeamTests(unittest.TestCase):
                 self.tick(fake, team_id=ident)
                 held = self.tick(fake, team_id=ident, heads={self.paths[0]: A})
                 self.assertEqual(held["tasks"]["a"]["status"], "unknown")
-                self.assertEqual(held["tasks"]["a"]["error"],
-                                 "REVIEW_OUTPUT_BOUND_UNVERIFIED")
+                self.assertEqual(held["tasks"]["a"]["error"], expected)
 
     def test_bounded_review_of_another_head_still_blocks_on_drift(self):
         self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
@@ -341,6 +362,60 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(result["tasks"]["a"]["phase"], "correction")
         self.assertIn("Fix the retry path",
                       team._required("squad", self.env)["slots"]["a"]["feedback"])
+
+    def test_clipped_review_feedback_keeps_the_findings_end(self):
+        """A clipped tail's findings are at the end, not its first 5000 chars."""
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
+                                  corrections=1)]))
+        receipt = "CAO_TEAM_RESULT: " + team._result_challenge(
+            team._execution_id("squad", "a", "review", 0))
+        oldest = "OLDEST-CONTEXT-MARKER " + ("x" * 6000)
+        output = (oldest + "\nCAO_REVIEW_VERDICT: CHANGES_REQUESTED\n"
+                  "CAO_REVIEWED_HEAD: " + A + "\nNEWEST-FINDING fixes the retry path\n"
+                  + receipt + "\n")
+
+        def fake(**kwargs):
+            if kwargs["phase"] != "review":
+                return self.done()
+            return self.review_payload(output, kept="tail", dropped_chars=6000)
+
+        self.tick(fake)
+        result = self.tick(fake, heads={self.paths[0]: A})
+        self.assertEqual(result["tasks"]["a"]["phase"], "correction")
+        feedback = team._required("squad", self.env)["slots"]["a"]["feedback"]
+        self.assertIn("NEWEST-FINDING fixes the retry path", feedback)
+        self.assertNotIn("OLDEST-CONTEXT-MARKER", feedback)
+
+    def test_clipped_completed_output_hands_findings_end_to_dependents(self):
+        """A dependent receives the newest end of a clipped predecessor read."""
+        self.init(self.spec([
+            task("a", self.paths[0], mode="read"),
+            task("b", self.paths[1], mode="read", deps=["a"]),
+        ]))
+        oldest = "OLDEST-READ-MARKER " + ("y" * 6000)
+        output = oldest + "\nFINAL-CONCLUSION for the dependent\n"
+        calls = []
+
+        def fake(**kwargs):
+            calls.append((kwargs["task"]["id"], kwargs["prompt"]))
+            if kwargs["task"]["id"] == "a":
+                return {"status": "complete",
+                        "claim": {"released": True, "released_head": A},
+                        "output": output, "output_truncated": True,
+                        "output_bounds": {"kept": "tail", "limit": len(output),
+                                          "captured_chars": len(output),
+                                          "dropped_chars": 6000}}
+            return self.done()
+
+        self.tick(fake)
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
+                         "complete")
+        self.assertIn("FINAL-CONCLUSION for the dependent",
+                      team._required("squad", self.env)["slots"]["a"]["output"])
+        self.tick(fake)
+        handoff = next(prompt for name, prompt in calls if name == "b")
+        self.assertIn("FINAL-CONCLUSION for the dependent", handoff)
+        self.assertNotIn("OLDEST-READ-MARKER", handoff)
 
     def test_dependency_handoff_uses_only_completed_predecessors(self):
         spec = self.spec([
@@ -948,6 +1023,68 @@ class TeamTests(unittest.TestCase):
         # The retried review still names the same accepted HEAD it always did.
         self.assertIn("Review the actual repository against Git HEAD " + B,
                       dispatched[0]["prompt"])
+
+    def test_review_retry_change_request_starts_a_valid_correction_round(self):
+        """A retried review that still requests changes must not corrupt state.
+
+        The retry carries retry_no=1; the CHANGES_REQUESTED transition opens a
+        new correction round, which is a fresh identity with its own budget, so
+        retry_no must reset to 0 or the stored checkpoint fails its own
+        validation and ``cao team status`` raises.
+        """
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
+                                  corrections=1)]))
+        review_retry_id = team._execution_id("squad", "a", "review", 0, 1)
+        corrections = []
+
+        def fake(**kwargs):
+            if kwargs["phase"] == "work":
+                return self.done()
+            if kwargs["phase"] == "correction":
+                corrections.append(kwargs["execution_id"])
+                return {"status": "complete",
+                        "claim": {"released": True, "released_head": B},
+                        "output": "bounded correction committed"}
+            if kwargs["execution_id"] == review_retry_id:
+                return self.done(output="CAO_REVIEW_VERDICT: CHANGES_REQUESTED\n"
+                                       "CAO_REVIEWED_HEAD: " + A + "\nFix the retry path")
+            if kwargs["execution_id"] == team._execution_id("squad", "a", "review", 0):
+                return {"status": "unknown",
+                        "error": {"code": "TEAM_RESULT_UNVERIFIED"}}
+            return self.done(output="CAO_REVIEW_VERDICT: APPROVED\n"
+                                   "CAO_REVIEWED_HEAD: " + B)
+
+        self.tick(fake, heads={self.paths[0]: A})
+        self.tick(fake, heads={self.paths[0]: A})
+        old_id = team._execution_id("squad", "a", "review", 0)
+        team.set_desired("squad", "paused", env=self.env)
+        retried = self.retry_review_once("a", old_id)
+        self.assertEqual(retried["tasks"]["a"]["retry_no"], 1)
+        team.set_desired("squad", "running", env=self.env)
+        transitioned = self.tick(fake, heads={self.paths[0]: A})
+        opened = transitioned["tasks"]["a"]
+        self.assertEqual(opened["phase"], "correction")
+        self.assertEqual(opened["round"], 1)
+        self.assertEqual(opened["retry_no"], 0)
+        self.assertEqual(opened["status"], "pending")
+        # The checkpoint revalidates, so `cao team status` stays well-formed.
+        reloaded = team.status("squad", env=self.env)["tasks"]["a"]
+        self.assertEqual((reloaded["phase"], reloaded["retry_no"]), ("correction", 0))
+        stored = team._required("squad", self.env)["slots"]["a"]
+        self.assertIn("Fix the retry path", stored["feedback"])
+        self.assertEqual(stored["head"], A)
+        # A correction round is never a retryable READ; no WRITE retry exists.
+        team.set_desired("squad", "paused", env=self.env)
+        with self.assertRaises(team.TeamError):
+            team.retry_read("squad", "a", env=self.env)
+        team.set_desired("squad", "running", env=self.env)
+        # The correction dispatches normally under its own identity.
+        after = self.tick(fake, heads={self.paths[0]: A})
+        self.assertEqual(after["tasks"]["a"]["phase"], "review")
+        self.assertEqual(corrections,
+                         [team._execution_id("squad", "a", "correction", 1)])
+        self.tick(fake, heads={self.paths[0]: B})
+        self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
 
     def test_review_phase_retry_refuses_a_write_attempt(self):
         self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))

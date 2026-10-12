@@ -231,6 +231,24 @@ def _investigation_spec(watch: dict, case: dict, issue: dict) -> dict:
     }
 
 
+def _legacy_manifest_matches(prior_spec: Mapping[str, Any],
+                             spec: Mapping[str, Any]) -> bool:
+    """Whether a stored team is exactly the known pre-initiative form of spec.
+
+    A team checkpointed before chat approval existed declares the same team_id,
+    roles, task graph and prompt but no ``initiative``. Only that one absent
+    field is compatible: any other difference (a changed case, prompt, model,
+    scope or task graph) is a changed incident and still refuses. The stored
+    record is never rewritten, so the legacy hash stays exactly as issued and
+    the team keeps its own absent approval and its own pause state.
+    """
+
+    if prior_spec.get("initiative") is not None:
+        return False
+    legacy = {key: value for key, value in spec.items() if key != "initiative"}
+    return prior_spec == team.validate_spec(legacy)
+
+
 def _case_files(watch: dict) -> list[str]:
     inbox = watch["inbox_dir"]
     _open_dir(inbox)
@@ -320,23 +338,32 @@ def tick(watch_file: str, *, admit: bool = True) -> dict:
         spec = (_investigation_spec(watch, case, issue)
                 if decision == "INVESTIGATE" else None)
         previous = None
+        legacy = False
         if spec is not None and os.path.lexists(team.team_path(name)):
             prior = team._required(name, None)
-            if prior["spec_hash"] != team.fingerprint(team.validate_spec(spec)):
+            if prior["spec_hash"] == team.fingerprint(team.validate_spec(spec)):
+                previous = team.summary(prior)
+            elif _legacy_manifest_matches(prior["spec"], spec):
+                # A pre-upgrade team is the exact historical form of this
+                # incident. Report it unchanged: its manifest and hash are never
+                # rewritten, no approval is attached, and no second
+                # investigation is started.
+                legacy = True
+                previous = team.summary(prior)
+            else:
                 raise FeedbackError("case changed under an existing incident identity")
-            previous = team.summary(prior)
         correction_id = _team_id("fx", watch, case, issue["issue"])
         try:
             correction = team.status(correction_id)["status"]
         except team.TeamError:
             correction = None
         prepared.append((case, issue, decision, reason, name, outcome,
-                         spec, previous, correction_id, correction))
+                         spec, previous, legacy, correction_id, correction))
 
     statuses = []
     chat_admission_held = False
     for (case, issue, decision, reason, name, outcome, spec,
-         previous, correction_id, correction) in prepared:
+         previous, legacy, correction_id, correction) in prepared:
         current = previous
         admission_held = False
         if spec is not None and admit:
@@ -351,6 +378,11 @@ def tick(watch_file: str, *, admit: bool = True) -> dict:
                 admission_held = chat_admission_held = True
                 reason = ("chat team approval is required: admit this "
                           "investigation team explicitly before it can dispatch")
+            elif legacy:
+                # Observationally compatible only: the exact legacy manifest and
+                # hash stay as stored, no approval is attached, and an
+                # unintentionally paused team is never started by a scan.
+                current = previous
             else:
                 current = team.initialize(spec)
                 # A previously paused team belongs to its operator. Never

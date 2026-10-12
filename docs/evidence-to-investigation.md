@@ -306,6 +306,11 @@ approval policy. When `"team_approval": {"mode": "chat"}` is configured:
   Re-reading it re-declares nothing, never re-enables a watch the operator
   paused, and leaves the team's own approval and its `TEAM_ADMISSION_CHANGED`
   / `TEAM_APPROVAL_REQUIRED` holds in charge of any later configuration drift.
+* A team recorded **before** the initiative field existed is recognized by its
+  exact historical manifest and only reported. Its stored manifest and hash are
+  never rewritten and no approval is attached, so an upgrade neither silently
+  re-admits nor restarts an unapproved investigation; any other manifest
+  difference still refuses as a changed incident.
 * `cao improve authorize ...` is an explicit operator invocation, so in chat
   mode that invocation **is** the approval declaration for the correction team
   it admits, which reports `chat_approval_declared_by_this_invocation: true`.

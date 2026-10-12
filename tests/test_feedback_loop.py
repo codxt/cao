@@ -465,6 +465,51 @@ class FeedbackWatchTests(unittest.TestCase):
         self.assertFalse(report["observations"][0]["admission_held"])
         self.assertEqual(len(team.list_teams()), 1)
 
+    def test_legacy_pre_initiative_investigation_is_observed_not_refused(self):
+        self.enable_chat_approval()
+        watch = feedback.validate_watch(self.watch)
+        issue = feedback.improvement.assess(self.case)["issues"][0]
+        spec = feedback._investigation_spec(watch, self.case, issue)
+        # A team admitted by the pre-initiative release: the identical manifest
+        # and prompt, but no initiative and no approval.
+        legacy = team.validate_spec(
+            {key: value for key, value in spec.items() if key != "initiative"})
+        os.makedirs(team.team_dir(), exist_ok=True)
+        team._save({
+            "schema": team.STATE_SCHEMA, "team_id": legacy["team_id"],
+            "spec": legacy, "spec_hash": team.fingerprint(legacy),
+            "desired": "running", "tick_count": 3,
+            "slots": {t["id"]: {"phase": "work", "round": 0, "status": "pending",
+                                "execution_id": None, "prompt": None, "head": None,
+                                "feedback": None, "output": None, "error": None,
+                                "started_at": None, "progress_at": None,
+                                "progress_key": None}
+                      for t in legacy["tasks"]},
+        }, None)
+        # A periodic tick observes the exact historical manifest instead of
+        # raising, and admits no new team.
+        report = feedback.tick(str(self.watch_path))
+        self.assertEqual(report["status"], "RUNNING")
+        self.assertFalse(report["chat_admission_held"])
+        record = report["observations"][0]
+        self.assertEqual(record["team_id"], spec["team_id"])
+        self.assertEqual(record["team_status"], "PENDING")
+        # Manifest, hash and absent approval are preserved exactly: the upgrade
+        # never rewrites legacy state or silently re-admits it.
+        stored = team._required(spec["team_id"], None)
+        self.assertEqual(stored["spec"], legacy)
+        self.assertEqual(stored["spec_hash"], team.fingerprint(legacy))
+        self.assertNotIn("admission", stored)
+        self.assertEqual(len(team.list_teams()), 1)
+        # Only that exact known historical form is compatible; a changed
+        # incident under the same identity still refuses.
+        changed = copy.deepcopy(self.case)
+        changed["detected_at"] = "2026-01-01T07:00:00Z"
+        self.write_json(self.case_path, changed)
+        with self.assertRaises(feedback.FeedbackError):
+            feedback.tick(str(self.watch_path))
+        self.assertEqual(len(team.list_teams()), 1)
+
     def test_source_reported_outcome_requires_matching_cao_correction_sha(self):
         self._accept_read()
         self.watch["outcomes_dir"] = str(self.root / "outcomes")
