@@ -81,6 +81,86 @@ class ChatTeamTests(unittest.TestCase):
                          writer_snapshot=lambda _: (0, set()),
                          head_reader=lambda _: "a" * 40)
 
+    def test_recovered_unclaimed_read_intent_rechecks_chat_approval(self):
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        path = Path(team.team_path("alpha", self.env))
+        record = state.read_state(path)
+        intent = team._execution_id("alpha", "read", "work", 0)
+        record["slots"]["read"].update(
+            status="running", execution_id=intent, prompt="Saved prompt intent")
+        state.write_state(path, record)
+        self.raw["provider"]["id"] = "changed-provider"
+        self.configure()
+        with mock.patch.object(team, "_execute", return_value={"status": "running"}) as dispatch:
+            held = team.tick(
+                "alpha", config=self.config, driver=None, env=self.env,
+                writer_snapshot=lambda _: (0, set()),
+                head_reader=lambda _: "a" * 40)
+            dispatch.assert_not_called()
+        self.assertEqual(held["tasks"]["read"]["execution_id"], intent)
+        self.assertEqual(held["tasks"]["read"]["status"], "running")
+        self.assertEqual(held["tasks"]["read"]["error"], "TEAM_ADMISSION_CHANGED")
+        self.raw["provider"]["id"] = "test"
+        self.configure()
+        with mock.patch.object(team, "_execute", return_value={"status": "running"}) as dispatch:
+            resumed = team.tick(
+                "alpha", config=self.config, driver=None, env=self.env,
+                writer_snapshot=lambda _: (0, set()),
+                head_reader=lambda _: "a" * 40)
+            dispatch.assert_called_once()
+        self.assertEqual(resumed["tasks"]["read"]["execution_id"], intent)
+        self.assertIsNone(resumed["tasks"]["read"]["error"])
+
+    def test_recovered_unclaimed_write_intent_preserves_own_capacity(self):
+        self.spec["tasks"][0].update(mode="write", write_scope=["README.md"])
+        self.spec["max_writers"] = 1
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        path = Path(team.team_path("alpha", self.env))
+        record = state.read_state(path)
+        intent = team._execution_id("alpha", "read", "work", 0)
+        record["slots"]["read"].update(
+            status="running", execution_id=intent, prompt="Saved write intent")
+        state.write_state(path, record)
+        self.raw["provider"]["id"] = "changed-provider"
+        self.configure()
+        with mock.patch.object(team, "_execute", return_value={"status": "running"}) as dispatch:
+            held = team.tick(
+                "alpha", config=self.config, driver=None, env=self.env,
+                writer_snapshot=lambda _: (0, set()),
+                head_reader=lambda _: "a" * 40)
+            dispatch.assert_not_called()
+        self.assertEqual(held["tasks"]["read"]["execution_id"], intent)
+        self.assertEqual(held["tasks"]["read"]["error"], "TEAM_ADMISSION_CHANGED")
+        self.raw["provider"]["id"] = "test"
+        self.configure()
+        with mock.patch.object(team, "_execute", return_value={"status": "running"}) as dispatch:
+            resumed = team.tick(
+                "alpha", config=self.config, driver=None, env=self.env,
+                writer_snapshot=lambda _: (0, set()),
+                head_reader=lambda _: "a" * 40)
+            dispatch.assert_called_once()
+        self.assertEqual(resumed["tasks"]["read"]["execution_id"], intent)
+        self.assertIsNone(resumed["tasks"]["read"]["error"])
+
+    def test_effective_routes_verified_once_per_dispatch_tick(self):
+        self.spec["tasks"].append(
+            {"id": "other", "role": "reviewer",
+             "repo": str(self.root / "repo2"),
+             "mode": "read", "prompt": "Inspect second source"})
+        self.spec["max_parallel"] = 2
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        effects = []
+        with mock.patch.object(team, "_effective_routes",
+                               wraps=team._effective_routes) as resolve:
+            result = self.tick(effects)
+            resolve.assert_called_once()
+        self.assertEqual(len(effects), 2)
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+        self.assertEqual(result["tasks"]["other"]["status"], "running")
+
     def test_unrelated_configuration_change_does_not_invalidate_an_admitted_team(self):
         self.admit(approved=True)
         team.set_desired("alpha", "running", env=self.env)

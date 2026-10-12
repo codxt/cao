@@ -317,8 +317,10 @@ changes cannot silently alter dispatch.
 That binding is the resolved selection an agent actually receives — the role
 model or agent profile of every task and phase — and not the surrounding
 configuration document, so a registry path, runtime name or profile no role
-uses cannot invalidate a team. It is re-verified at each pending slot before its
-dispatch: a configuration change stops the team from starting more work — the
+uses cannot invalidate a team. It is re-verified before any eligible
+first effect, including a crash-recovered RUNNING intent with no acquired claim.
+Capacity-blocked slots are not falsely labeled as approval failures. A
+configuration change stops the team from starting more work — the
 held slot reports `TEAM_ADMISSION_CHANGED` — while tasks that are already
 running keep their exact execution identity and are still reconciled, released
 and reported. Restoring the approved effective route releases the held slot on

@@ -336,11 +336,12 @@ def _new_dispatch_possible(record: Mapping[str, Any]) -> bool:
 
 
 def _verify_admission(record: Mapping[str, Any],
-                      config: product_config.ProductConfig | None) -> None:
+                      config: product_config.ProductConfig | None, *,
+                      force: bool = False) -> None:
     """Re-verify a saved confirmation before any NEW dispatch.
 
-    Called from ``tick`` at the per-pending-slot dispatch site, before a slot
-    is flipped to running. A confirmation only ever gates work that has not
+    Called before a pending slot starts, and on crash recovery before the
+    first effect of an intent-only RUNNING slot (using force=True). A confirmation only ever gates work that has not
     started: an already-running task keeps its exact execution identity,
     prompt and claim, so a refused admission never raises out of the tick —
     it holds the pending slot with ``TEAM_ADMISSION_CHANGED`` and leaves every
@@ -349,7 +350,7 @@ def _verify_admission(record: Mapping[str, Any],
     freezing what already runs.
     """
     admission = record.get("admission")
-    if admission is None or not _new_dispatch_possible(record):
+    if admission is None or (not force and not _new_dispatch_possible(record)):
         return
     if config is None:
         raise TeamAdmissionError(
@@ -1066,6 +1067,25 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
             and slots[t["id"]]["phase"] != "review" and t["mode"] == "write"
             for t in spec["tasks"]
         )
+        # The immutable manifest and resolved routes do not change within a
+        # tick. Cache one admission decision for every candidate FIRST effect;
+        # reconciliation of executions that already own claims remains allowed.
+        admission_cache: bool | None = None
+
+        def first_effect_allowed() -> bool:
+            nonlocal admission_cache
+            if admission_cache is None:
+                if freeze_legacy_pending:
+                    admission_cache = False
+                else:
+                    try:
+                        _verify_admission(record, config, force=True)
+                    except TeamAdmissionError:
+                        admission_cache = False
+                    else:
+                        admission_cache = True
+            return admission_cache
+
         for task in running + pending:
             try:
                 slot = slots[task["id"]]
@@ -1077,17 +1097,6 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                         _save(record, env)
                         continue
                     if halted or not all(slots[d]["status"] == "complete" for d in task["depends_on"]):
-                        continue
-                    # Re-verify the saved confirmation at the dispatch site,
-                    # never for the whole tick: a refused admission holds only
-                    # this pending slot, while already-running tasks below keep
-                    # their exact execution identity, claim and pane and are
-                    # still reconciled and released.
-                    try:
-                        _verify_admission(record, config)
-                    except TeamAdmissionError:
-                        slot["error"] = "TEAM_ADMISSION_CHANGED"
-                        _save(record, env)
                         continue
                     if sum(s["status"] == "running" for s in slots.values()) >= spec["max_parallel"]:
                         continue
@@ -1130,6 +1139,16 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                         reserved_floor = n
                         if n >= spec["max_writers"] or same_checkout in working:
                             continue
+                    # Only a genuinely dispatchable task needs a routing
+                    # check. A capacity-blocked slot keeps its earlier error.
+                    if not first_effect_allowed():
+                        slot["error"] = (
+                            "TEAM_APPROVAL_REQUIRED" if freeze_legacy_pending
+                            else "TEAM_ADMISSION_CHANGED"
+                        )
+                        _save(record, env)
+                        continue
+                    if task["mode"] == "write" and slot["phase"] != "review":
                         reserved_floor += 1
                     try:
                         proposed_id = _execution_id(
@@ -1147,20 +1166,41 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     slot["status"] = "running"
                     slot["error"] = None
                     _save(record, env)  # effect intent persisted before worker start
-                elif (execute is None and task["mode"] == "write"
-                      and slot["phase"] != "review"):
-                    # Crash window: checkpoint says RUNNING, but the product task
-                    # may not yet own a claim. Re-admit before that first effect.
+                elif execute is None:
+                    # An intent-only RUNNING slot is not an agent. After a
+                    # crash the task may lack its first Registry claim; check
+                    # the APPROVED effective route before any new claim, pane
+                    # or prompt, including READ and review tasks. A task with
+                    # a saved claim always reconciles under its original ID.
                     backing = product_state.read_task(slot["execution_id"], env)
                     if not backing or not (backing.get("claim") or {}).get("claim_id"):
-                        try:
-                            n, working = occupancy(db)
-                        except TeamError:
-                            slot["error"] = "REGISTRY_OCCUPANCY_UNKNOWN"
+                        if not first_effect_allowed():
+                            slot["error"] = (
+                                "TEAM_APPROVAL_REQUIRED" if freeze_legacy_pending
+                                else "TEAM_ADMISSION_CHANGED"
+                            )
                             _save(record, env)
                             continue
-                        if n >= spec["max_writers"] or os.path.realpath(task["repo"]) in working:
-                            continue
+                        # Restored approval clears the prior hold; it does
+                        # not create a replacement execution identity.
+                        if slot.get("error") in (
+                            "TEAM_ADMISSION_CHANGED", "TEAM_APPROVAL_REQUIRED"
+                        ):
+                            slot["error"] = None
+                            _save(record, env)
+                        if task["mode"] == "write" and slot["phase"] != "review":
+                            try:
+                                n, working = occupancy(db)
+                            except TeamError:
+                                slot["error"] = "REGISTRY_OCCUPANCY_UNKNOWN"
+                                _save(record, env)
+                                continue
+                            # The RUNNING slot counted itself in the
+                            # reserved floor, but has no claim yet. Exclude
+                            # that one intent, retaining all other writers.
+                            if (max(n, reserved_floor - 1) >= spec["max_writers"]
+                                    or os.path.realpath(task["repo"]) in working):
+                                continue
                 try:
                     role = _role_config(config, spec, task, slot["phase"])
                     if (execute is None and slot["phase"] == "correction"
