@@ -924,7 +924,7 @@ class Daemon:
             try:
                 for update in team.tick_all(
                     config=self._config, driver=self._driver, env=self._env,
-                    registry_db=self._registry_db,
+                    registry_db=self._registry_db, clock=self._clock,
                 ):
                     effects.append({
                         "team_id": update["team_id"], "action": "team_reconcile",

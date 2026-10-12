@@ -774,6 +774,9 @@ class ReconciliationTests(DaemonCase):
             report = daemon.tick()
         legacy.assert_not_called()
         team_tick.assert_called_once()
+        # Teams observe liveness against the daemon's own clock, so the existing
+        # supervision loop is the only cadence the bound ever depends on.
+        self.assertIs(team_tick.call_args.kwargs["clock"], daemon._clock)
         self.assertTrue(report["ticked"])
         record = product_state.read_task(ident, self.env)
         self.assertEqual(record["status"], "running")

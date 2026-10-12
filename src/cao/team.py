@@ -16,17 +16,24 @@ import re
 import sqlite3
 import subprocess
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from typing import Any
 
-from . import agent_profiles, product_config, product_driver, product_state, product_task, registry, state, team_approval
+from . import (agent_profiles, evidence, product_config, product_driver,
+               product_state, product_task, registry, state, team_approval)
 
 SPEC_SCHEMA = "cao.team.v1"
 STATE_SCHEMA = "cao.team.state.v1"
 _ID = re.compile(r"[a-z][a-z0-9_-]{0,47}\Z")
 _HEAD = re.compile(r"[0-9a-f]{40}\Z")
+_STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+_PROGRESS = re.compile(r"(sha256:[0-9a-f]{64})?\Z")
 MAX_TASKS = 64
 MAX_WRITERS = 2
 MAX_PARALLEL = 8
+#: A task whose durable record reached one of these can no longer change, so it
+#: can never be reported as stalled.
+_TERMINAL_TASK_STATUSES = ("complete", "stopped")
 
 
 class TeamError(ValueError):
@@ -212,6 +219,7 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
         raise TeamError("malformed team tick counter")
     expected_fields = {"phase", "round", "status", "execution_id",
                        "prompt", "head", "feedback", "output", "error"}
+    liveness_fields = {"started_at", "progress_at", "progress_key"}
     for task in spec["tasks"]:
         slot = slots[task["id"]]
         if type(slot) is not dict:
@@ -220,9 +228,13 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
         round_no = slot.get("round")
         retry_no = slot.get("retry_no", 0)
         if (not expected_fields.issubset(slot)
-                or set(slot) - expected_fields - {"retry_no"}
+                or set(slot) - expected_fields - liveness_fields - {"retry_no"}
                 or type(retry_no) is not int or not 0 <= retry_no <= 1
-                or (retry_no and (task["mode"] != "read" or phase != "work"))
+                # Only a READ execution may be retried. A review is always run
+                # as a READ execution, so a review-phase retry is bounded by
+                # the reviewer's own durable READ task and claim instead.
+                or (retry_no and phase not in ("work", "review"))
+                or (retry_no and phase == "work" and task["mode"] != "read")
                 or phase not in ("work", "review", "correction")
                 or current not in ("pending", "running", "complete", "blocked", "unknown")
                 or type(round_no) is not int or not 0 <= round_no <= task["max_corrections"]):
@@ -247,6 +259,12 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
             raise TeamError("malformed task output")
         if slot.get("error") is not None and type(slot["error"]) is not str:
             raise TeamError("malformed task error")
+        for field in ("started_at", "progress_at"):
+            if slot.get(field) is not None and not _STAMP.fullmatch(slot[field]):
+                raise TeamError("malformed team task liveness timestamp")
+        key = slot.get("progress_key")
+        if key is not None and (type(key) is not str or not _PROGRESS.fullmatch(key)):
+            raise TeamError("malformed team task progress evidence")
         if current == "pending":
             if slot["execution_id"] is not None or slot["prompt"] is not None:
                 raise TeamError("pending task unexpectedly has a launched execution")
@@ -269,7 +287,9 @@ def summary(record: Mapping[str, Any]) -> dict[str, Any]:
     slots = {name: {"status": slot["status"], "phase": slot["phase"],
                     "round": slot["round"], "execution_id": slot["execution_id"],
                     "head": slot["head"], "error": slot["error"],
-                    "retry_no": slot.get("retry_no", 0)}
+                    "retry_no": slot.get("retry_no", 0),
+                    "started_at": slot.get("started_at"),
+                    "progress_at": slot.get("progress_at")}
              for name, slot in record["slots"].items()}
     statuses = [x["status"] for x in slots.values()]
     overall = ("COMPLETE" if all(s == "complete" for s in statuses)
@@ -391,8 +411,18 @@ def _check_initiative_lineage(spec: Mapping[str, Any],
         raise TeamError("initiative already has a team; approve exact predecessor")
     old = terminal[0]
     current = summary(old)
-    if (old["desired"] != "paused" or current["status"] not in ("COMPLETE", "BLOCKED")
+    dispatched = any(slot.get("execution_id") for slot in old["slots"].values())
+    # A paused team that never dispatched anything owns no work at all, so an
+    # explicitly approved successor may replace its unused manifest. The
+    # successor gets its own id, admission, run, execution identities and
+    # claims; the predecessor's manifest and record stay immutable on disk and
+    # the same manifest is still re-approved in place rather than replaced.
+    undispatched = (old["desired"] == "paused" and not dispatched
+                    and current["status"] == "PAUSED")
+    if (old["desired"] != "paused"
             or any(s["status"] == "running" for s in old["slots"].values())):
+        raise TeamError("predecessor must be paused and terminal before replacement")
+    if not undispatched and current["status"] not in ("COMPLETE", "BLOCKED"):
         raise TeamError("predecessor must be paused and terminal before replacement")
     # A blocked task can retain an execution ID after a failed receipt. Its
     # claim must be independently closed before a new team is admitted.
@@ -409,6 +439,10 @@ def _check_initiative_lineage(spec: Mapping[str, Any],
         raise TeamError("predecessor Registry evidence unavailable") from exc
     if active:
         raise TeamError("predecessor still owns active Registry claims")
+    if undispatched and _team_claim_count(env, previous_id):
+        # A team that never dispatched a task must have no claim of any
+        # outcome. Anything else is dispatched work wearing a cleared slot.
+        raise TeamError("predecessor holds Registry claims without dispatched work")
 
 
 def _team_claim_count(env: Mapping[str, str] | None, team_id: str) -> int:
@@ -494,7 +528,9 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
             "desired": "paused", "tick_count": 0,
             "slots": {t["id"]: {"phase": "work", "round": 0, "status": "pending",
                                 "execution_id": None, "prompt": None, "head": None,
-                                "feedback": None, "output": None, "error": None}
+                                "feedback": None, "output": None, "error": None,
+                                "started_at": None, "progress_at": None,
+                                "progress_key": None}
                       for t in selected["tasks"]},
         }
         if admission is not None:
@@ -552,13 +588,26 @@ def retry_read(team_id: str, task_id: str, *,
     The original agent must first be stopped through CAO's normal ownership
     gate. The original task, output and claim remain durable for inspection.
     This does not retry WRITE, reuse a stopped agent, or dispatch new work.
+
+    A READ review attempt -- including a review of a correction round -- is
+    eligible on the same terms. Such a retry still reviews the SAME accepted
+    source revision, so the accepted HEAD, the work handoff and the review
+    feedback are the historical evidence the new attempt reviews, while the
+    failed attempt's receipt, nonce and claim stay durable on their own record
+    and the new attempt gets a new execution identity and its own copy-only
+    terminal nonce.
     """
     with dispatch_lock(env):
         record = _required(team_id, env)
         slot = record["slots"].get(_ident(task_id))
         task = next((t for t in record["spec"]["tasks"] if t["id"] == task_id), None)
         if (record["desired"] != "paused" or task is None or slot is None
-                or task["mode"] != "read" or slot["phase"] != "work"
+                or slot["phase"] not in ("work", "review")
+                # A work attempt may only retry on a READ task. A review is
+                # dispatched as a READ execution even when its own manifest
+                # task writes, and that execution's durable record, claim and
+                # pane handback are verified below before anything is admitted.
+                or (slot["phase"] == "work" and task["mode"] != "read")
                 or slot["status"] != "unknown"
                 or slot.get("error") not in (
                     "TEAM_RESULT_UNVERIFIED", "TEAM_DURABLE_RESULT_UNVERIFIED")
@@ -604,8 +653,15 @@ def retry_read(team_id: str, task_id: str, *,
             raise TeamError("shared Registry has no matching released READ claim")
         # Preserve the old task. New attempts get a distinct execution ID
         # and a new copy-only terminal nonce on the next dispatched prompt.
-        slot.update(status="pending", execution_id=None, prompt=None, head=None,
-                    feedback=None, output=None, error=None, retry_no=1)
+        if slot["phase"] == "review":
+            # A review retry reviews the SAME accepted source revision, so the
+            # accepted HEAD, the work handoff and the review feedback all stay:
+            # clearing them would silently retarget the review at another HEAD.
+            slot.update(status="pending", execution_id=None, prompt=None,
+                        error=None, retry_no=1)
+        else:
+            slot.update(status="pending", execution_id=None, prompt=None, head=None,
+                        feedback=None, output=None, error=None, retry_no=1)
         _save(record, env)
         return summary(record)
 
@@ -707,6 +763,32 @@ def _receipt_present(output: Any, receipt: str) -> bool:
     if not isinstance(output, str):
         return False
     return bool(re.search(r"(?m)^[ \t]{0,4}" + re.escape(receipt) + r"$", output))
+
+
+def _bounded_tail_verified(output: Any, bounds: Any, receipt: str) -> bool:
+    """Admit a bounded capture only when it provably kept the terminal proof.
+
+    A runtime read is a scrolling window, so a long review answer can be stored
+    as its terminal suffix. That suffix is admissible only when the durable
+    task record itself states that it kept the tail, states exactly how much of
+    the beginning it dropped, and the stored text is exactly that captured
+    window -- and the task's own completion nonce is still inside it. A
+    head-only capture, an unsized window or a document of unknown provenance
+    therefore can never be read as a verified review, and the exact verdict and
+    reviewed HEAD are still parsed out of the retained text afterwards.
+    """
+
+    if not isinstance(output, str) or not isinstance(bounds, Mapping):
+        return False
+    if (bounds.get("kept") != "tail"
+            or type(bounds.get("limit")) is not int
+            or type(bounds.get("captured_chars")) is not int
+            or type(bounds.get("dropped_chars")) is not int
+            or bounds["limit"] <= 0 or bounds["dropped_chars"] <= 0
+            or bounds["captured_chars"] != bounds["limit"]
+            or bounds["captured_chars"] != len(output)):
+        return False
+    return _receipt_present(output, receipt)
 
 
 def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
@@ -955,6 +1037,84 @@ def _prepare_verified_correction(
         conn.close()
 
 
+def _progress_key(backing: Any) -> str:
+    """A durable fingerprint of what one task execution observably produced.
+
+    Only durable state counts: the task's own status, its bounded captured
+    output, whether its CAO-owned pane was closed and what was last observed.
+    A bookkeeping timestamp is deliberately excluded, so a tick that merely
+    rewrites a record is never mistaken for the agent making progress.
+    """
+
+    if not isinstance(backing, Mapping):
+        return ""
+    observation = backing.get("observation")
+    return evidence.fingerprint([
+        str(backing.get("status") or ""),
+        backing.get("output") if isinstance(backing.get("output"), str) else "",
+        str(backing.get("pane_closed") or ""),
+        (str(observation.get("status") or "")
+         if isinstance(observation, Mapping) else ""),
+    ])
+
+
+def _worker_unreachable(driver: Any, backing: Any) -> bool:
+    """Whether the durable record proves this task's worker can no longer act.
+
+    A long authorized computation is not a stall: a worker the runtime still
+    reports as present keeps its bound even while it produces no new output,
+    however long model thinking takes. Only a worker that is absent, or whose
+    liveness cannot be read at all, leaves the task unable to progress.
+    Nothing is guessed from a name alone.
+    """
+
+    checkpoint = (backing or {}).get("checkpoint") or {}
+    agent = checkpoint.get("agent_name")
+    if not isinstance(agent, str) or not agent:
+        return False
+    if driver is None:
+        return True
+    try:
+        driver.agent_get(agent)
+    except (product_driver.DriverNotFound, product_driver.DriverError):
+        return True
+    return False
+
+
+def _age_ms(stamp: str, now: str) -> int:
+    """Milliseconds between two CAO UTC second-resolution stamps."""
+
+    start = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+    end = datetime.strptime(now, "%Y-%m-%dT%H:%M:%SZ")
+    return int((end - start).total_seconds() * 1000)
+
+
+def _stall_reason(backing: Any, slot: Mapping[str, Any], *,
+                  config: product_config.ProductConfig, driver: Any,
+                  clock: Callable[[], Any] | None) -> str | None:
+    """Report a team task that can no longer make observable progress.
+
+    Nothing here releases a claim, replaces an agent or re-prompts one: the
+    exact existing execution identity, prompt and claim are all retained and
+    reported UNKNOWN with an actionable reason for an operator to inspect and
+    resume through the existing recovery commands.
+    """
+
+    if not isinstance(backing, Mapping):
+        return None
+    if str(backing.get("status") or "") in _TERMINAL_TASK_STATUSES:
+        return None
+    progress = slot.get("progress_at") or slot.get("started_at")
+    if not isinstance(progress, str) or not _STAMP.fullmatch(progress):
+        return None
+    if _age_ms(progress, evidence.utc_now(clock)) < product_config.team_stall_timeout_ms(
+            config):
+        return None
+    if not _worker_unreachable(driver, backing):
+        return None
+    return "TEAM_TASK_STALLED"
+
+
 def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
              phase: str, config: product_config.ProductConfig, driver: Any,
              env: Mapping[str, str] | None, wait_ms: int, registry_db: str) -> dict[str, Any]:
@@ -1041,7 +1201,8 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
          registry_db: str | None = None,
          execute: Callable[..., Mapping[str, Any]] | None = None,
          writer_snapshot: Callable[[str], tuple[int, set[str]]] | None = None,
-         head_reader: Callable[[str], str | None] | None = None) -> dict[str, Any]:
+         head_reader: Callable[[str], str | None] | None = None,
+         clock: Callable[[], Any] | None = None) -> dict[str, Any]:
     """Advance ready agents at most once per durable execution identity."""
     db = registry_db or product_config.registry_db_path(env)
     runner, occupancy, head = execute or _execute, writer_snapshot or _active_writes, head_reader or _git_head
@@ -1165,6 +1326,12 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     slot["prompt"] = proposed_prompt
                     slot["status"] = "running"
                     slot["error"] = None
+                    # Durable liveness bookkeeping starts with the dispatch
+                    # itself: the bound measures real progress, not age.
+                    stamp = evidence.utc_now(clock)
+                    slot["started_at"] = stamp
+                    slot["progress_at"] = stamp
+                    slot["progress_key"] = None
                     _save(record, env)  # effect intent persisted before worker start
                 elif execute is None:
                     # An intent-only RUNNING slot is not an agent. After a
@@ -1201,6 +1368,20 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                             if (max(n, reserved_floor - 1) >= spec["max_writers"]
                                     or os.path.realpath(task["repo"]) in working):
                                 continue
+                    if slot["status"] == "running":
+                        # A task whose durable evidence stopped moving and whose
+                        # own worker is gone is reported, never silently
+                        # re-prompted and never released. An injected runner
+                        # owns its own lifecycle, so this observes only the
+                        # real runtime path.
+                        stalled = _stall_reason(
+                            product_state.read_task(slot["execution_id"], env),
+                            slot, config=config, driver=driver, clock=clock)
+                        if stalled is not None:
+                            slot["status"], slot["error"] = "unknown", stalled
+                            halted = True
+                            _save(record, env)
+                            continue
                 try:
                     role = _role_config(config, spec, task, slot["phase"])
                     if (execute is None and slot["phase"] == "correction"
@@ -1232,8 +1413,18 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     if not isinstance(released, str) or not _HEAD.fullmatch(released) or not (result.get("claim") or {}).get("released"):
                         slot["status"], slot["error"] = "unknown", "TASK_RELEASE_UNVERIFIED"
                     elif slot["phase"] == "review":
-                        verdict = (None if result.get("output_truncated")
-                                   else _review_verdict(result.get("output"), slot["head"]))
+                        text = result.get("output")
+                        truncated = bool(result.get("output_truncated"))
+                        # A bounded capture may decide a review ONLY when it
+                        # provably kept the terminal suffix carrying the task's
+                        # own nonce; the exact verdict and reviewed HEAD are
+                        # still parsed from the retained text, and head drift is
+                        # still refused below.
+                        bounded = (not truncated or _bounded_tail_verified(
+                            text, result.get("output_bounds"),
+                            _receipt_for(slot["execution_id"], slot["prompt"])))
+                        verdict = (_review_verdict(text, slot["head"])
+                                   if bounded else None)
                         if head(task["repo"]) != slot["head"]:
                             slot["status"], slot["error"] = "blocked", "REVIEW_HEAD_DRIFT"
                         elif verdict == "APPROVED":
@@ -1242,15 +1433,30 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                             if slot["round"] >= task["max_corrections"]:
                                 slot["status"], slot["error"] = "blocked", "REVIEW_BUDGET_EXHAUSTED"
                             else:
+                                # A review may itself be the one bounded READ
+                                # retry (retry_no=1). The new correction round
+                                # is a distinct identity with its own budget, so
+                                # retry_no resets to 0; otherwise the stored
+                                # checkpoint would fail its own validation, which
+                                # only admits retry_no=1 in work/review.
                                 slot["phase"], slot["round"] = "correction", slot["round"] + 1
                                 slot["status"] = "pending"
-                                slot["feedback"] = str(result.get("output") or "")[:5000]
+                                slot["retry_no"] = 0
+                                # A clipped capture keeps its findings and
+                                # verdict at the very end, so the correction
+                                # receives the newest 5000 characters, never the
+                                # oldest part of the retained window.
+                                slot["feedback"] = str(result.get("output") or "")[-5000:]
                                 slot["execution_id"], slot["prompt"] = None, None
                         else:
-                            slot["status"], slot["error"] = "unknown", "REVIEW_VERDICT_UNVERIFIED"
+                            slot["status"], slot["error"] = "unknown", (
+                                "REVIEW_VERDICT_UNVERIFIED" if bounded
+                                else "REVIEW_OUTPUT_BOUND_UNVERIFIED")
                     else:
                         slot["head"] = released
-                        slot["output"] = str(result.get("output") or "")[:5000]
+                        # The terminal end of a clipped capture holds the
+                        # findings a dependent or later review actually needs.
+                        slot["output"] = str(result.get("output") or "")[-5000:]
                         slot["error"] = None
                         if task["reviewer"] is not None:
                             slot["phase"], slot["status"] = "review", "pending"
@@ -1266,6 +1472,15 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     error = result.get("error")
                     code = error.get("code") if isinstance(error, Mapping) else None
                     slot["status"], slot["error"] = "unknown", _error_code(code, "TASK_STATUS_UNVERIFIED")
+                if slot["status"] == "running":
+                    # Record only observable progress, so the liveness bound
+                    # above can tell a long authorized computation from a task
+                    # whose durable evidence has stopped moving.
+                    key = _progress_key(
+                        product_state.read_task(slot["execution_id"], env))
+                    if key != slot.get("progress_key"):
+                        slot["progress_key"] = key
+                        slot["progress_at"] = evidence.utc_now(clock)
                 if slot["status"] in ("blocked", "unknown"):
                     halted = True
                 _save(record, env)
@@ -1284,7 +1499,8 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
 
 def tick_all(*, config: product_config.ProductConfig, driver: Any,
              env: Mapping[str, str] | None = None,
-             registry_db: str | None = None) -> list[dict[str, Any]]:
+             registry_db: str | None = None,
+             clock: Callable[[], Any] | None = None) -> list[dict[str, Any]]:
     """Daemon adapter; never creates teams or starts a paused team."""
     output = []
     for info in list_teams(env=env):
@@ -1297,7 +1513,7 @@ def tick_all(*, config: product_config.ProductConfig, driver: Any,
             continue
         try:
             output.append(tick(info["team_id"], config=config, driver=driver,
-                               env=env, registry_db=registry_db))
+                               env=env, registry_db=registry_db, clock=clock))
         except Exception as exc:
             # One unhandled team failure cannot prevent another team from
             # reconciling its already-running tasks and releasing its claims.

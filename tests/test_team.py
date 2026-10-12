@@ -6,10 +6,12 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from cao import product_config, product_daemon, product_state, registry, team
+from cao import (product_config, product_daemon, product_state, product_task,
+                 registry, team)
 from tests.test_product_task import FakeDriver, GIT_ENV, git_repo
 from cao.state import StateError
 
@@ -221,6 +223,199 @@ class TeamTests(unittest.TestCase):
             return self.done()
         self.tick(fake)
         self.assertEqual(self.tick(fake)["status"], "BLOCKED")
+
+    def review_payload(self, output, **bounds):
+        """A bounded review capture exactly as product_task stores one."""
+        captured = len(output)
+        return {
+            "status": "complete", "claim": {"released": True, "released_head": A},
+            "output": output, "output_truncated": True,
+            "output_bounds": {"limit": captured, "captured_chars": captured,
+                              **bounds},
+        }
+
+    def verdict_review(self, output, **bounds):
+        """Dispatch work once, then deliver one bounded review capture."""
+        seen = []
+
+        def fake(**kwargs):
+            seen.append(kwargs["phase"])
+            if kwargs["phase"] != "review":
+                return self.done()
+            payload = self.review_payload(output, **bounds)
+            return payload
+
+        self.tick(fake)
+        return self.tick(fake, heads={self.paths[0]: A})
+
+    def test_bounded_review_needs_a_sized_tail_that_kept_the_nonce(self):
+        """Only a provably bounded tail may decide a review.
+
+        The nonce is bound to this execution and never appears in the sent
+        prompt, so a capture without it is not this task's verified answer.
+        """
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+        receipt = "CAO_TEAM_RESULT: " + team._result_challenge(
+            team._execution_id("squad", "a", "review", 0))
+        verdict = "CAO_REVIEW_VERDICT: APPROVED\nCAO_REVIEWED_HEAD: " + A
+        accepted = self.verdict_review(
+            "long answer\n" + verdict + "\n" + receipt + "\n",
+            kept="tail", dropped_chars=9000)
+        self.assertEqual(accepted["status"], "COMPLETE")
+        # Every negative case runs under its own team identity, so the receipt
+        # is built from that attempt's actual execution nonce. Cases whose
+        # capture is not a provable tail fail the bound check; cases with a
+        # valid tail but a bad verdict reach, and are decided by, the
+        # verdict/head check. Both predicate families are asserted explicitly.
+        cases = (
+            ("head only",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "head", "dropped_chars": 9000},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("unknown provenance",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 0},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("missing nonce",
+             lambda r: "long answer\n" + verdict + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("forged nonce",
+             lambda r: "long answer\n" + verdict + "\nCAO_TEAM_RESULT: " + "f" * 16 + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("unsized window",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail"},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("claimed size disagrees",
+             lambda r: "long answer\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000, "captured_chars": 99999},
+             "REVIEW_OUTPUT_BOUND_UNVERIFIED"),
+            ("no verdict",
+             lambda r: "long answer\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_VERDICT_UNVERIFIED"),
+            ("wrong reviewed head",
+             lambda r: "long answer\nCAO_REVIEW_VERDICT: APPROVED\n"
+                       "CAO_REVIEWED_HEAD: " + B + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_VERDICT_UNVERIFIED"),
+            ("two verdicts",
+             lambda r: "long answer\n" + verdict + "\n" + verdict + "\n" + r + "\n",
+             {"kept": "tail", "dropped_chars": 9000},
+             "REVIEW_VERDICT_UNVERIFIED"),
+        )
+        for index, (label, build, bounds, expected) in enumerate(cases):
+            with self.subTest(label=label):
+                ident = "b" + str(index)
+                self.init(self.spec(
+                    [task("a", self.paths[0], reviewer="reviewer")], team_id=ident))
+                output = build("CAO_TEAM_RESULT: " + team._result_challenge(
+                    team._execution_id(ident, "a", "review", 0)))
+
+                def fake(**kwargs):
+                    if kwargs["phase"] != "review":
+                        return self.done()
+                    return self.review_payload(output, **bounds)
+
+                self.tick(fake, team_id=ident)
+                held = self.tick(fake, team_id=ident, heads={self.paths[0]: A})
+                self.assertEqual(held["tasks"]["a"]["status"], "unknown")
+                self.assertEqual(held["tasks"]["a"]["error"], expected)
+
+    def test_bounded_review_of_another_head_still_blocks_on_drift(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+        receipt = "CAO_TEAM_RESULT: " + team._result_challenge(
+            team._execution_id("squad", "a", "review", 0))
+        output = ("long answer\nCAO_REVIEW_VERDICT: APPROVED\nCAO_REVIEWED_HEAD: "
+                  + A + "\n" + receipt + "\n")
+
+        def fake(**kwargs):
+            if kwargs["phase"] != "review":
+                return self.done()
+            return self.review_payload(output, kept="tail", dropped_chars=9000)
+
+        self.tick(fake)
+        drifted = self.tick(fake, heads={self.paths[0]: B})
+        self.assertEqual(drifted["tasks"]["a"]["status"], "blocked")
+        self.assertEqual(drifted["tasks"]["a"]["error"], "REVIEW_HEAD_DRIFT")
+
+    def test_bounded_review_requests_correction_from_the_kept_suffix(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
+                                  corrections=1)]))
+        receipt = "CAO_TEAM_RESULT: " + team._result_challenge(
+            team._execution_id("squad", "a", "review", 0))
+        output = ("findings\nCAO_REVIEW_VERDICT: CHANGES_REQUESTED\n"
+                  "CAO_REVIEWED_HEAD: " + A + "\nFix the retry path\n"
+                  + receipt + "\n")
+        captured = []
+
+        def fake(**kwargs):
+            if kwargs["phase"] != "review":
+                return self.done()
+            captured.append(kwargs["execution_id"])
+            return self.review_payload(output, kept="tail", dropped_chars=9000)
+
+        self.tick(fake)
+        result = self.tick(fake, heads={self.paths[0]: A})
+        self.assertEqual(result["tasks"]["a"]["phase"], "correction")
+        self.assertIn("Fix the retry path",
+                      team._required("squad", self.env)["slots"]["a"]["feedback"])
+
+    def test_clipped_review_feedback_keeps_the_findings_end(self):
+        """A clipped tail's findings are at the end, not its first 5000 chars."""
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
+                                  corrections=1)]))
+        receipt = "CAO_TEAM_RESULT: " + team._result_challenge(
+            team._execution_id("squad", "a", "review", 0))
+        oldest = "OLDEST-CONTEXT-MARKER " + ("x" * 6000)
+        output = (oldest + "\nCAO_REVIEW_VERDICT: CHANGES_REQUESTED\n"
+                  "CAO_REVIEWED_HEAD: " + A + "\nNEWEST-FINDING fixes the retry path\n"
+                  + receipt + "\n")
+
+        def fake(**kwargs):
+            if kwargs["phase"] != "review":
+                return self.done()
+            return self.review_payload(output, kept="tail", dropped_chars=6000)
+
+        self.tick(fake)
+        result = self.tick(fake, heads={self.paths[0]: A})
+        self.assertEqual(result["tasks"]["a"]["phase"], "correction")
+        feedback = team._required("squad", self.env)["slots"]["a"]["feedback"]
+        self.assertIn("NEWEST-FINDING fixes the retry path", feedback)
+        self.assertNotIn("OLDEST-CONTEXT-MARKER", feedback)
+
+    def test_clipped_completed_output_hands_findings_end_to_dependents(self):
+        """A dependent receives the newest end of a clipped predecessor read."""
+        self.init(self.spec([
+            task("a", self.paths[0], mode="read"),
+            task("b", self.paths[1], mode="read", deps=["a"]),
+        ]))
+        oldest = "OLDEST-READ-MARKER " + ("y" * 6000)
+        output = oldest + "\nFINAL-CONCLUSION for the dependent\n"
+        calls = []
+
+        def fake(**kwargs):
+            calls.append((kwargs["task"]["id"], kwargs["prompt"]))
+            if kwargs["task"]["id"] == "a":
+                return {"status": "complete",
+                        "claim": {"released": True, "released_head": A},
+                        "output": output, "output_truncated": True,
+                        "output_bounds": {"kept": "tail", "limit": len(output),
+                                          "captured_chars": len(output),
+                                          "dropped_chars": 6000}}
+            return self.done()
+
+        self.tick(fake)
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
+                         "complete")
+        self.assertIn("FINAL-CONCLUSION for the dependent",
+                      team._required("squad", self.env)["slots"]["a"]["output"])
+        self.tick(fake)
+        handoff = next(prompt for name, prompt in calls if name == "b")
+        self.assertIn("FINAL-CONCLUSION for the dependent", handoff)
+        self.assertNotIn("OLDEST-READ-MARKER", handoff)
 
     def test_dependency_handoff_uses_only_completed_predecessors(self):
         spec = self.spec([
@@ -704,6 +899,255 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
                          "unknown")
 
+    def review_retry_refusal(self, execution_id):
+        """The verified stopped + abandon-released READ evidence a retry needs."""
+        return {
+            "task_id": execution_id, "run_id": "cao-team-squad",
+            "work_key": execution_id, "repo": self.paths[0], "mode": "READ",
+            "scope": [], "status": "stopped",
+            "checkpoint": {"pane_id": "w1:p1"}, "pane_closed": "w1:p1",
+            "claim": {"claim_id": 42, "status": "RELEASED", "released": True,
+                      "outcome": "abandon"},
+        }
+
+    def released_read_row(self):
+        return {"run_id": "cao-team-squad", "work_key": "any-review",
+                "owner": "cao-product", "mode": "READ",
+                "released_at": "2026-01-01T01:00:00Z", "outcome": "abandon"}
+
+    def retry_review_once(self, task_id, execution_id, backing=None):
+        row = self.released_read_row()
+        row["work_key"] = execution_id
+        database = mock.Mock()
+        database.execute.return_value.fetchone.return_value = row
+        with mock.patch("cao.product_state.read_task",
+                        return_value=backing or self.review_retry_refusal(
+                            execution_id)), \
+                mock.patch("cao.registry.connect_readonly", return_value=database):
+            return team.retry_read("squad", task_id, env=self.env)
+
+    def test_review_phase_read_receipt_failure_allows_one_explicit_retry(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+        prompts = []
+
+        def fake(**kwargs):
+            prompts.append(kwargs)
+            if kwargs["phase"] == "review":
+                return {"status": "unknown",
+                        "error": {"code": "TEAM_RESULT_UNVERIFIED"}}
+            return self.done()
+
+        self.tick(fake)
+        failed = self.tick(fake)
+        self.assertEqual(failed["tasks"]["a"]["phase"], "review")
+        self.assertEqual(failed["tasks"]["a"]["status"], "unknown")
+        self.assertEqual(failed["tasks"]["a"]["error"], "TEAM_RESULT_UNVERIFIED")
+        old_id = failed["tasks"]["a"]["execution_id"]
+        self.assertEqual(old_id, team._execution_id("squad", "a", "review", 0))
+        team.set_desired("squad", "paused", env=self.env)
+        retried = self.retry_review_once("a", old_id)
+        self.assertEqual(retried["tasks"]["a"]["status"], "pending")
+        self.assertEqual(retried["tasks"]["a"]["retry_no"], 1)
+        # The same accepted source revision, handoff and findings are retained.
+        record = team._required("squad", self.env)["slots"]["a"]
+        self.assertEqual(record["phase"], "review")
+        self.assertEqual(record["head"], A)
+        self.assertEqual(record["output"], "completed")
+        self.assertIsNone(record["execution_id"])
+        # One retry only, and the historical receipt stays durable.
+        with self.assertRaises(team.TeamError):
+            self.retry_review_once("a", old_id)
+        dispatched = []
+        team.set_desired("squad", "running", env=self.env)
+        self.tick(lambda **kw: (dispatched.append(kw) or {"status": "running"}))
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["phase"], "review")
+        self.assertEqual(dispatched[0]["execution_id"],
+                         team._execution_id("squad", "a", "review", 0, 1))
+        self.assertNotEqual(dispatched[0]["execution_id"], old_id)
+        self.assertIn("CAO_TEAM_NONCE_V2:", dispatched[0]["prompt"])
+        # The new attempt's nonce differs and its exact receipt line is absent
+        # from the prompt, so a prompt echo can never impersonate success.
+        new_id = dispatched[0]["execution_id"]
+        self.assertNotEqual(team._result_challenge(new_id),
+                            team._result_challenge(old_id))
+        self.assertNotIn("CAO_TEAM_RESULT: " + team._result_challenge(new_id),
+                         dispatched[0]["prompt"])
+        self.assertIn("Review the actual repository against Git HEAD " + A,
+                      dispatched[0]["prompt"])
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["head"], A)
+
+    def test_review_phase_retry_after_a_correction_reviews_the_same_accepted_head(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
+                                  corrections=1)]))
+        reviews = []
+
+        def fake(**kwargs):
+            if kwargs["phase"] == "work":
+                return self.done()
+            if kwargs["phase"] == "correction":
+                return {"status": "complete",
+                        "claim": {"released": True, "released_head": B}}
+            if not reviews:
+                reviews.append(kwargs["execution_id"])
+                return self.done(output="CAO_REVIEW_VERDICT: CHANGES_REQUESTED\n"
+                                       "CAO_REVIEWED_HEAD: " + A + "\nfix X")
+            if len(reviews) == 1:
+                reviews.append(kwargs["execution_id"])
+                return {"status": "unknown",
+                        "error": {"code": "TEAM_DURABLE_RESULT_UNVERIFIED"}}
+            return self.done(output="CAO_REVIEW_VERDICT: APPROVED\n"
+                                   "CAO_REVIEWED_HEAD: " + B)
+
+        self.tick(fake, heads={self.paths[0]: A})
+        self.tick(fake, heads={self.paths[0]: A})
+        self.tick(fake, heads={self.paths[0]: B})
+        failed = self.tick(fake, heads={self.paths[0]: B})
+        self.assertEqual(failed["tasks"]["a"]["phase"], "review")
+        self.assertEqual(failed["tasks"]["a"]["round"], 1)
+        self.assertEqual(failed["tasks"]["a"]["error"], "TEAM_DURABLE_RESULT_UNVERIFIED")
+        old_id = failed["tasks"]["a"]["execution_id"]
+        self.assertEqual(old_id, team._execution_id("squad", "a", "review", 1))
+        team.set_desired("squad", "paused", env=self.env)
+        retried = self.retry_review_once("a", old_id)
+        self.assertEqual(retried["tasks"]["a"]["retry_no"], 1)
+        self.assertEqual(retried["tasks"]["a"]["head"], B)
+        self.assertEqual(retried["tasks"]["a"]["round"], 1)
+        dispatched = []
+        team.set_desired("squad", "running", env=self.env)
+        self.tick(lambda **kw: (dispatched.append(kw) or {"status": "running"}),
+                  heads={self.paths[0]: B})
+        self.assertEqual(dispatched[0]["execution_id"],
+                         team._execution_id("squad", "a", "review", 1, 1))
+        self.assertNotEqual(dispatched[0]["execution_id"], old_id)
+        # The retried review still names the same accepted HEAD it always did.
+        self.assertIn("Review the actual repository against Git HEAD " + B,
+                      dispatched[0]["prompt"])
+
+    def test_review_retry_change_request_starts_a_valid_correction_round(self):
+        """A retried review that still requests changes must not corrupt state.
+
+        The retry carries retry_no=1; the CHANGES_REQUESTED transition opens a
+        new correction round, which is a fresh identity with its own budget, so
+        retry_no must reset to 0 or the stored checkpoint fails its own
+        validation and ``cao team status`` raises.
+        """
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
+                                  corrections=1)]))
+        review_retry_id = team._execution_id("squad", "a", "review", 0, 1)
+        corrections = []
+
+        def fake(**kwargs):
+            if kwargs["phase"] == "work":
+                return self.done()
+            if kwargs["phase"] == "correction":
+                corrections.append(kwargs["execution_id"])
+                return {"status": "complete",
+                        "claim": {"released": True, "released_head": B},
+                        "output": "bounded correction committed"}
+            if kwargs["execution_id"] == review_retry_id:
+                return self.done(output="CAO_REVIEW_VERDICT: CHANGES_REQUESTED\n"
+                                       "CAO_REVIEWED_HEAD: " + A + "\nFix the retry path")
+            if kwargs["execution_id"] == team._execution_id("squad", "a", "review", 0):
+                return {"status": "unknown",
+                        "error": {"code": "TEAM_RESULT_UNVERIFIED"}}
+            return self.done(output="CAO_REVIEW_VERDICT: APPROVED\n"
+                                   "CAO_REVIEWED_HEAD: " + B)
+
+        self.tick(fake, heads={self.paths[0]: A})
+        self.tick(fake, heads={self.paths[0]: A})
+        old_id = team._execution_id("squad", "a", "review", 0)
+        team.set_desired("squad", "paused", env=self.env)
+        retried = self.retry_review_once("a", old_id)
+        self.assertEqual(retried["tasks"]["a"]["retry_no"], 1)
+        team.set_desired("squad", "running", env=self.env)
+        transitioned = self.tick(fake, heads={self.paths[0]: A})
+        opened = transitioned["tasks"]["a"]
+        self.assertEqual(opened["phase"], "correction")
+        self.assertEqual(opened["round"], 1)
+        self.assertEqual(opened["retry_no"], 0)
+        self.assertEqual(opened["status"], "pending")
+        # The checkpoint revalidates, so `cao team status` stays well-formed.
+        reloaded = team.status("squad", env=self.env)["tasks"]["a"]
+        self.assertEqual((reloaded["phase"], reloaded["retry_no"]), ("correction", 0))
+        stored = team._required("squad", self.env)["slots"]["a"]
+        self.assertIn("Fix the retry path", stored["feedback"])
+        self.assertEqual(stored["head"], A)
+        # A correction round is never a retryable READ; no WRITE retry exists.
+        team.set_desired("squad", "paused", env=self.env)
+        with self.assertRaises(team.TeamError):
+            team.retry_read("squad", "a", env=self.env)
+        team.set_desired("squad", "running", env=self.env)
+        # The correction dispatches normally under its own identity.
+        after = self.tick(fake, heads={self.paths[0]: A})
+        self.assertEqual(after["tasks"]["a"]["phase"], "review")
+        self.assertEqual(corrections,
+                         [team._execution_id("squad", "a", "correction", 1)])
+        self.tick(fake, heads={self.paths[0]: B})
+        self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
+
+    def test_review_phase_retry_refuses_a_write_attempt(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+
+        def fail_review(**kwargs):
+            if kwargs["phase"] == "review":
+                return {"status": "unknown",
+                        "error": {"code": "TEAM_RESULT_UNVERIFIED"}}
+            return {"status": "unknown", "error": {"code": "PROVIDER_DOWN"}}
+
+        # The WRITE work attempt is never retryable, in any state.
+        self.tick(fail_review)
+        self.tick(fail_review)
+        team.set_desired("squad", "paused", env=self.env)
+        with self.assertRaises(team.TeamError):
+            team.retry_read("squad", "a", env=self.env)
+        # A WRITE task record can never stand in for the READ review attempt.
+        work_id = team._execution_id("squad", "a", "work", 0)
+        write_backing = self.review_retry_refusal(work_id)
+        write_backing["mode"] = "WRITE"
+        with self.assertRaises(team.TeamError):
+            self.retry_review_once("a", work_id, backing=write_backing)
+
+    def test_review_phase_retry_refuses_unverified_stop_or_wrong_ledger(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+
+        def fake(**kwargs):
+            if kwargs["phase"] == "review":
+                return {"status": "unknown",
+                        "error": {"code": "TEAM_RESULT_UNVERIFIED"}}
+            return self.done()
+
+        self.tick(fake)
+        failed = self.tick(fake)
+        old_id = failed["tasks"]["a"]["execution_id"]
+        team.set_desired("squad", "paused", env=self.env)
+        # Not stopped, or the CAO pane never handed back.
+        for stale in ({**self.review_retry_refusal(old_id), "status": "running"},
+                      {**self.review_retry_refusal(old_id), "pane_closed": None},
+                      {**self.review_retry_refusal(old_id),
+                       "claim": {"claim_id": 42, "status": "RESUMED",
+                                 "released": False}}):
+            with mock.patch("cao.product_state.read_task", return_value=stale):
+                with self.assertRaises(team.TeamError):
+                    team.retry_read("squad", "a", env=self.env)
+        # A ledger row that is not this team's released READ claim.
+        for wrong in ({"owner": "another-owner"}, {"mode": "WRITE"},
+                      {"outcome": "complete"}, {"released_at": None},
+                      {"work_key": "another-work"}):
+            row = dict(self.released_read_row())
+            row.update(wrong)
+            row["work_key"] = wrong.get("work_key", old_id)
+            database = mock.Mock()
+            database.execute.return_value.fetchone.return_value = row
+            with mock.patch("cao.product_state.read_task",
+                            return_value=self.review_retry_refusal(old_id)), \
+                    mock.patch("cao.registry.connect_readonly", return_value=database):
+                with self.assertRaises(team.TeamError):
+                    team.retry_read("squad", "a", env=self.env)
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
+                         "unknown")
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["retry_no"], 0)
+
     def test_review_and_writer_same_checkout_cannot_overlap(self):
         initial = task("reviewed", self.paths[0], reviewer="reviewer")
         another = task("other", self.paths[0])
@@ -919,6 +1363,380 @@ class TeamTests(unittest.TestCase):
         self.assertEqual([x["mode"] for x in claims], ["WRITE", "READ"])
         self.assertTrue(all(x["released_at"] for x in claims))
 
+    def test_real_long_review_answer_keeps_verdict_and_nonce_and_completes(self):
+        # The actual product_task path: a review answer longer than the task's
+        # bounded capture. product_task keeps the terminal suffix and states
+        # truthfully how much it dropped, so the exact verdict, reviewed HEAD
+        # and this execution's nonce all survive and the review is decided.
+        repo = git_repo(self.root, name="verbose-review", files=("a.txt",))
+        bare = self.root / "verbose.git"
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env={**os.environ, **GIT_ENV})
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-C", str(repo), "-c", "commit.gpgsign=false", *arguments],
+                check=True, capture_output=True, text=True,
+                env={**os.environ, **GIT_ENV}).stdout.strip()
+
+        git("remote", "add", "origin", str(bare))
+        git("push", "-u", "origin", "main")
+        db = str(self.root / "verbose-registry.sqlite3")
+        registry.connect(db).close()
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "id": "test", "model": "opencode/default"},
+            "task": {"agent_kind": "opencode", "max_output_chars": 1200},
+        })
+
+        class VerboseHerdr(FakeDriver):
+            def workspace_create(self, label, cwd=None):
+                self._note("workspace_create", label, cwd)
+                ident = "w" + str(len(self.workspaces) + 1)
+                self.workspaces.append({
+                    "workspace_id": ident, "label": label,
+                    "active_tab_id": ident + ":t1",
+                })
+                return {"workspace_id": ident, "tab_id": ident + ":t1",
+                        "pane_id": ident + ":p1"}
+
+            def pane_list(self, workspace_id):
+                pane = workspace_id + ":p1"
+                return [] if pane in self.closed_panes else [{
+                    "pane_id": pane, "workspace_id": workspace_id,
+                    "agent_status": "done",
+                }]
+
+            def pane_get(self, pane_id):
+                if pane_id in self.closed_panes:
+                    from cao import product_driver
+                    raise product_driver.DriverNotFound("closed")
+                return {"pane_id": pane_id,
+                        "workspace_id": pane_id.split(":")[0]}
+
+            def agent_prompt(self, target, text, *, timeout_ms=None, wait=False):
+                if "Role: Implement precise edits" in text:
+                    (repo / "a.txt").write_text("changed\n")
+                    git("add", "--", "a.txt")
+                    git("commit", "-m", "team writer")
+                    self.read_text = "Committed scoped change"
+                else:
+                    self.read_text = (
+                        "".join(f"inspected src/module_{i:04d}.py line by line\n"
+                                for i in range(120))
+                        + "CAO_REVIEW_VERDICT: APPROVED\nCAO_REVIEWED_HEAD: "
+                        + git("rev-parse", "HEAD"))
+                challenge = team._result_challenge(
+                    team._execution_id("squad", "feature",
+                                       "review" if "Independently review" in text
+                                       else "work", 0))
+                self.read_text += "\nCAO_TEAM_RESULT: " + challenge
+                return super().agent_prompt(
+                    target, text, timeout_ms=timeout_ms, wait=wait)
+
+        driver = VerboseHerdr()
+        self.init(self.spec([
+            {**task("feature", str(repo), reviewer="reviewer", corrections=1),
+             "write_scope": ["a.txt"]}
+        ]))
+        first = team.tick("squad", config=config, driver=driver,
+                          env=self.env, registry_db=db)
+        self.assertEqual(first["tasks"]["feature"]["phase"], "review", first)
+        review_id = team._execution_id("squad", "feature", "review", 0)
+        second = team.tick("squad", config=config, driver=driver,
+                           env=self.env, registry_db=db)
+        self.assertEqual(second["status"], "COMPLETE")
+        record = product_state.read_task(review_id, self.env)
+        self.assertTrue(record["output_truncated"])
+        self.assertEqual(record["output_bounds"]["kept"], "tail")
+        self.assertGreater(record["output_bounds"]["dropped_chars"], 0)
+        self.assertEqual(record["output_bounds"]["captured_chars"],
+                         len(record["output"]))
+        self.assertTrue(team._receipt_present(
+            record["output"],
+            "CAO_TEAM_RESULT: " + team._result_challenge(review_id)))
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["feature"]["head"],
+                         git("rev-parse", "HEAD"))
+
+    def test_real_long_review_without_the_nonce_cannot_complete(self):
+        # Same real path, but the captured tail does not carry this execution's
+        # nonce, so the bounded answer is never a verified review.
+        repo = git_repo(self.root, name="silent-review", files=("a.txt",))
+        bare = self.root / "silent.git"
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env={**os.environ, **GIT_ENV})
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-C", str(repo), "-c", "commit.gpgsign=false", *arguments],
+                check=True, capture_output=True, text=True,
+                env={**os.environ, **GIT_ENV}).stdout.strip()
+
+        git("remote", "add", "origin", str(bare))
+        git("push", "-u", "origin", "main")
+        db = str(self.root / "silent-registry.sqlite3")
+        registry.connect(db).close()
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "id": "test", "model": "opencode/default"},
+            "task": {"agent_kind": "opencode", "max_output_chars": 400},
+        })
+
+        class SilentHerdr(FakeDriver):
+            def workspace_create(self, label, cwd=None):
+                self._note("workspace_create", label, cwd)
+                ident = "w" + str(len(self.workspaces) + 1)
+                self.workspaces.append({
+                    "workspace_id": ident, "label": label,
+                    "active_tab_id": ident + ":t1"})
+                return {"workspace_id": ident, "tab_id": ident + ":t1",
+                        "pane_id": ident + ":p1"}
+
+            def pane_list(self, workspace_id):
+                pane = workspace_id + ":p1"
+                return [] if pane in self.closed_panes else [{
+                    "pane_id": pane, "workspace_id": workspace_id,
+                    "agent_status": "done"}]
+
+            def pane_get(self, pane_id):
+                if pane_id in self.closed_panes:
+                    from cao import product_driver
+                    raise product_driver.DriverNotFound("closed")
+                return {"pane_id": pane_id,
+                        "workspace_id": pane_id.split(":")[0]}
+
+            def agent_prompt(self, target, text, *, timeout_ms=None, wait=False):
+                if "Role: Implement precise edits" in text:
+                    (repo / "a.txt").write_text("changed\n")
+                    git("add", "--", "a.txt")
+                    git("commit", "-m", "team writer")
+                    self.read_text = "Committed scoped change"
+                else:
+                    # The verdict and HEAD scroll out of the bounded window and
+                    # the worker never emits its completion receipt.
+                    self.read_text = (
+                        "CAO_REVIEW_VERDICT: APPROVED\nCAO_REVIEWED_HEAD: "
+                        + git("rev-parse", "HEAD") + "\n"
+                        + "".join(f"more analysis {i:04d}\n" for i in range(60)))
+                return super().agent_prompt(
+                    target, text, timeout_ms=timeout_ms, wait=wait)
+
+        driver = SilentHerdr()
+        self.init(self.spec([
+            {**task("feature", str(repo), reviewer="reviewer", corrections=1),
+             "write_scope": ["a.txt"]}
+        ]))
+        team.tick("squad", config=config, driver=driver, env=self.env, registry_db=db)
+        held = team.tick("squad", config=config, driver=driver,
+                         env=self.env, registry_db=db)
+        self.assertEqual(held["tasks"]["feature"]["status"], "unknown")
+        self.assertIn(held["tasks"]["feature"]["error"],
+                      ("TEAM_RESULT_UNVERIFIED", "REVIEW_OUTPUT_BOUND_UNVERIFIED",
+                       "TEAM_DURABLE_RESULT_UNVERIFIED"))
+        self.assertNotEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
+        c = registry.connect_readonly(db)
+        try:
+            rows = c.execute("SELECT released_at FROM claims WHERE mode='READ'").fetchall()
+        finally:
+            c.close()
+        self.assertTrue(all(row["released_at"] for row in rows))
+
+    START = "2026-01-01T00:00:00Z"
+
+    def at(self, seconds):
+        """A clock-controlled absolute moment, second resolution like CAO."""
+        moment = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=seconds)
+        return lambda: moment
+
+    def stalled_task_harness(self, *, present=False, output="partial work"):
+        """A dispatched READ task whose claim exists and whose worker may be gone.
+
+        Durable start and progress stamps are pinned so the liveness bound is
+        measured against the supplied clock, never against wall time.
+        """
+        self.init(self.spec([task("a", self.paths[0], mode="read")], max_writers=0))
+        team.tick("squad", config=self.config, driver=None, env=self.env,
+                  execute=lambda **kw: {"status": "running"},
+                  writer_snapshot=lambda _: (0, set()))
+        execution_id = team.status("squad", env=self.env)["tasks"]["a"]["execution_id"]
+        db = str(self.root / "stall-registry.sqlite3")
+        registry.connect(db).close()
+        conn = registry.connect(db)
+        try:
+            registry.propose(conn, "cao-team-squad", execution_id,
+                             self.paths[0], components=["review"])
+            registry.claim(conn, registry.ClaimSpec(
+                run_id="cao-team-squad", work_key=execution_id,
+                owner=product_task.OWNER, mode="READ", issue=""), None)
+        finally:
+            conn.close()
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA, "task_id": execution_id,
+            "run_id": "cao-team-squad", "work_key": execution_id,
+            "repo": self.paths[0], "prompt": "Analyze source", "mode": "READ",
+            "scope": [], "agent_kind": "opencode", "agent_args": [],
+            "workspace_label": "cao-review-" + execution_id,
+            "status": "running",
+            "checkpoint": {"workspace_id": "w1", "pane_id": "w1:p1",
+                           "agent_name": "cao-worker", "agent_started": True,
+                           "prompt_issued": True, "prompt_ack": "accepted"},
+            "created_at": self.START, "updated_at": self.START,
+            "claim": {"claim_id": 1, "status": "CLAIMED", "mode": "READ"},
+            "output": output, "output_truncated": False, "output_bounds": None,
+            "observation": None, "error": None, "refusal": None,
+        }, self.env)
+        path = Path(team.team_path("squad", self.env))
+        record = json.loads(path.read_text())
+        record["slots"]["a"].update(started_at=self.START, progress_at=self.START,
+                                    progress_key=team._progress_key(
+                                        product_state.read_task(execution_id, self.env)))
+        path.write_text(json.dumps(record))
+        driver = FakeDriver()
+        driver.agent_present = present
+        return execution_id, db, driver
+
+    def liveness_tick(self, db, driver, seconds, *, config=None):
+        """One real-runtime tick that observes but never re-dispatches work."""
+        with mock.patch.object(team, "_execute", return_value={"status": "running"}):
+            return team.tick("squad", config=config or self.config, driver=driver,
+                             env=self.env, registry_db=db, clock=self.at(seconds))
+
+    def open_claims(self, db):
+        conn = registry.connect_readonly(db)
+        try:
+            return conn.execute("SELECT claim_id, released_at FROM claims").fetchall()
+        finally:
+            conn.close()
+
+    def test_long_authorized_computation_is_not_reported_as_a_stall(self):
+        execution_id, db, driver = self.stalled_task_harness(present=True)
+        # Far beyond the bound, but the runtime still reports the worker, so
+        # this is a long authorized computation and not a stall.
+        held = self.liveness_tick(db, driver, 10 ** 6)
+        self.assertEqual(held["tasks"]["a"]["status"], "running")
+        self.assertIsNone(held["tasks"]["a"]["error"])
+        self.assertEqual(held["tasks"]["a"]["execution_id"], execution_id)
+        self.assertEqual(held["tasks"]["a"]["started_at"], self.START)
+        self.assertEqual(len(self.open_claims(db)), 1)
+
+    def test_unreachable_worker_without_observable_progress_is_reported(self):
+        execution_id, db, driver = self.stalled_task_harness(present=False)
+        prompt = team._required("squad", self.env)["slots"]["a"]["prompt"]
+        # Still inside the bound: nothing is reported and nothing is released.
+        early = self.liveness_tick(db, driver, 600)
+        self.assertEqual(early["tasks"]["a"]["status"], "running")
+        self.assertIsNone(self.open_claims(db)[0]["released_at"])
+        stalled = self.liveness_tick(db, driver, 7_200)
+        self.assertEqual(stalled["tasks"]["a"]["status"], "unknown")
+        self.assertEqual(stalled["tasks"]["a"]["error"], "TEAM_TASK_STALLED")
+        # The exact existing execution identity, prompt and claim are retained:
+        # never released, never replaced, never re-prompted.
+        self.assertEqual(stalled["tasks"]["a"]["execution_id"], execution_id)
+        record = team._required("squad", self.env)["slots"]["a"]
+        self.assertEqual(record["prompt"], prompt)
+        self.assertTrue(prompt)
+        self.assertEqual(len(self.open_claims(db)), 1)
+        self.assertIsNone(self.open_claims(db)[0]["released_at"])
+        self.assertFalse(driver.names().count("agent_prompt"))
+        self.assertFalse(driver.names().count("agent_start"))
+        # It holds rather than churning: the same identity, never a new one.
+        again = self.liveness_tick(db, driver, 8_000)
+        self.assertEqual(again["tasks"]["a"]["status"], "unknown")
+        self.assertEqual(again["tasks"]["a"]["execution_id"], execution_id)
+
+    def test_observable_progress_resets_the_liveness_bound(self):
+        execution_id, db, driver = self.stalled_task_harness(present=False)
+
+        def stamp(seconds):
+            return team.evidence.utc_now(self.at(seconds))
+
+        first = self.liveness_tick(db, driver, 0)
+        self.assertEqual(first["tasks"]["a"]["progress_at"], self.START)
+        # A changed durable capture is observable progress.
+        product_state.update_task(execution_id, {"output": "more evidence"}, self.env)
+        second = self.liveness_tick(db, driver, 3_600)
+        self.assertEqual(second["tasks"]["a"]["progress_at"], stamp(3_600))
+        self.assertEqual(second["tasks"]["a"]["status"], "running")
+        # Well past the bound measured from the dispatch, but inside the bound
+        # measured from the last observable progress: not a stall.
+        third = self.liveness_tick(db, driver, 9_000)
+        self.assertEqual(third["tasks"]["a"]["status"], "running")
+        self.assertEqual(third["tasks"]["a"]["progress_at"], stamp(3_600))
+        product_state.update_task(execution_id, {"output": "final evidence"}, self.env)
+        fourth = self.liveness_tick(db, driver, 10_000)
+        self.assertEqual(fourth["tasks"]["a"]["progress_at"], stamp(10_000))
+        self.assertEqual(fourth["tasks"]["a"]["status"], "running")
+        # A tick never grants itself progress: the bound is always measured
+        # from the last durable observation, so evidence discovered during the
+        # same tick cannot quietly reset a bound that had already expired.
+        fifth = self.liveness_tick(db, driver, 12 * 3_600)
+        self.assertEqual(fifth["tasks"]["a"]["status"], "unknown")
+        self.assertEqual(fifth["tasks"]["a"]["error"], "TEAM_TASK_STALLED")
+        self.assertEqual(fifth["tasks"]["a"]["progress_at"], stamp(10_000))
+
+    def test_configured_stall_bound_is_validated_and_honoured(self):
+        self.assertEqual(product_config.team_stall_timeout_ms(None),
+                         product_config.DEFAULT_TEAM_STALL_TIMEOUT_MS)
+        configured = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "task": {"team_stall_timeout_ms": 90_000}})
+        self.assertEqual(product_config.team_stall_timeout_ms(configured), 90_000)
+        for bad in (0, -1, True, "60000", 10 ** 9):
+            with self.subTest(bad=bad):
+                broken = product_config.validate_config({
+                    "schema": product_config.SCHEMA,
+                    "task": {"team_stall_timeout_ms": bad}})
+                with self.assertRaises(product_config.ProductConfigError):
+                    product_config.team_stall_timeout_ms(broken)
+        brief = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "id": "test", "model": "opencode/default"},
+            "task": {"agent_kind": "opencode", "team_stall_timeout_ms": 60_000}})
+        _, db, driver = self.stalled_task_harness(present=False)
+        self.assertEqual(
+            self.liveness_tick(db, driver, 30, config=brief)["tasks"]["a"]["status"],
+            "running")
+        self.assertEqual(
+            self.liveness_tick(db, driver, 90, config=brief)["tasks"]["a"]["error"],
+            "TEAM_TASK_STALLED")
+
+    def test_missing_liveness_stamps_are_never_treated_as_a_stall(self):
+        # A record checkpointed before this release carries no stamps at all.
+        # It must never be reported stalled on the strength of a missing value.
+        _, db, driver = self.stalled_task_harness(present=False)
+        path = Path(team.team_path("squad", self.env))
+        record = json.loads(path.read_text())
+        for field in ("started_at", "progress_at", "progress_key"):
+            record["slots"]["a"].pop(field, None)
+        path.write_text(json.dumps(record))
+        # A pre-release record still validates and reports no liveness evidence.
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["started_at"],
+                         None)
+        held = self.liveness_tick(db, driver, 10 ** 7)
+        self.assertEqual(held["tasks"]["a"]["status"], "running")
+        self.assertIsNone(held["tasks"]["a"]["error"])
+        # A terminal task record can never be reported as stalled at all.
+        product_state.update_task(record["slots"]["a"]["execution_id"],
+                                  {"status": "stopped"}, self.env)
+        done = self.liveness_tick(db, driver, 10 ** 7)
+        self.assertEqual(done["tasks"]["a"]["status"], "running")
+        self.assertIsNone(done["tasks"]["a"]["error"])
+
+    def test_malformed_liveness_state_is_never_reinterpreted(self):
+        self.init(self.spec([task("a", self.paths[0], mode="read")]))
+        path = Path(team.team_path("squad", self.env))
+        for field, value in (("started_at", "not-a-stamp"),
+                             ("progress_at", "2026-13-45T99:99:99Z"),
+                             ("progress_key", ["not", "a", "fingerprint"])):
+            with self.subTest(field=field):
+                record = json.loads(path.read_text())
+                record["slots"]["a"][field] = value
+                path.write_text(json.dumps(record))
+                with self.assertRaises(team.TeamError):
+                    team.status("squad", env=self.env)
+
     def test_colliding_hyphenated_team_task_names_never_reuse_execution(self):
         ids = [
             team._execution_id("a-b", "c", "work", 0),
@@ -953,9 +1771,11 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(team.status("squad", env=self.env)["status"], "BLOCKED")
         self.assertEqual(team.status("squad", env=self.env)["tasks"]["b"]["status"], "running")
         original = team.tick
-        def adapted(team_id, *, config, driver, env=None, registry_db=None):
+        def adapted(team_id, *, config, driver, env=None, registry_db=None,
+                    clock=None):
             return original(team_id, config=config, driver=driver, env=env,
-                            execute=fake, writer_snapshot=lambda _: (0, set()))
+                            execute=fake, writer_snapshot=lambda _: (0, set()),
+                            clock=clock)
         with mock.patch("cao.team.tick", side_effect=adapted) as called:
             outcome = team.tick_all(config=self.config, driver=None, env=self.env)
         called.assert_called_once()

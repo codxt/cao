@@ -27,7 +27,7 @@ def main(arguments: Sequence[str]) -> int:
     recovery = subs.add_parser("resume", help="resume an inspected UNKNOWN task without a new execution ID")
     recovery.add_argument("--id", required=True)
     recovery.add_argument("--task", required=True)
-    retry = subs.add_parser("retry-read", help="admit a fresh READ attempt after an invalid receipt and verified stop")
+    retry = subs.add_parser("retry-read", help="admit a fresh READ attempt (work or review) after an invalid receipt and verified stop")
     retry.add_argument("--id", required=True)
     retry.add_argument("--task", required=True)
     subs.add_parser("list", help="inspect all stored teams")

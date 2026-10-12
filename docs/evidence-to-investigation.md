@@ -290,6 +290,40 @@ or more cases than the manifest's bounded per-tick capacity causes a hold
 rather than inventing zero signals. The case identity is stable; publish a
 new incident ID for genuinely new detection runs.
 
+### Chat team approval and the watch
+
+The watch resolves the same CAO configuration a team initialization loads, so
+a periodic scan and an operator command can never disagree about the team
+approval policy. When `"team_approval": {"mode": "chat"}` is configured:
+
+* An **unattended** watch tick never declares the operator's confirmation. For
+  an investigation team that does not exist yet it reports `HOLD` with
+  `admission_held: true`, the actionable reason `chat team approval is
+  required: ...`, and the stable `team_id` an operator can admit. No team
+  record, no claim and no agent is created, so no duplicate identity can
+  appear. `--dry-run` remains read-only.
+* An investigation team the operator **already admitted** is only reported.
+  Re-reading it re-declares nothing, never re-enables a watch the operator
+  paused, and leaves the team's own approval and its `TEAM_ADMISSION_CHANGED`
+  / `TEAM_APPROVAL_REQUIRED` holds in charge of any later configuration drift.
+* A team recorded **before** the initiative field existed is recognized by its
+  exact historical manifest and only reported. Its stored manifest and hash are
+  never rewritten and no approval is attached, so an upgrade neither silently
+  re-admits nor restarts an unapproved investigation; any other manifest
+  difference still refuses as a changed incident.
+* `cao improve authorize ...` is an explicit operator invocation, so in chat
+  mode that invocation **is** the approval declaration for the correction team
+  it admits, which reports `chat_approval_declared_by_this_invocation: true`.
+  A repeated invocation only reads the existing team back, so it never
+  re-declares approval or overrides an operator pause. It still authenticates
+  no person and grants no publication or deployment authority; secure the
+  command with separate host permissions and external authority.
+* Both the investigation and correction teams declare their own stable
+  identity as their named initiative, which is what makes an explicit
+  chat-approval admission possible at all. A correction supersedes no team and
+  borrows no identity; its WRITE authority still comes only from the operator's
+  invocation plus the shared Registry gate.
+
 After actual external authorization, the accountable operator can start a
 bounded correction with:
 

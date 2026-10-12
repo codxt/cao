@@ -364,6 +364,152 @@ class FeedbackWatchTests(unittest.TestCase):
         self.assertEqual(issue["outcome"]["status"], "SOURCE_REPORTED_IMPROVEMENT")
         self.assertFalse(issue["outcome"]["accepted_as_canonical_operating_proof"])
 
+    def enable_chat_approval(self):
+        path = Path(product_config.config_path({
+            "XDG_CONFIG_HOME": str(self.root / "config")}))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        product_config.write_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "opencode-go/model-a"},
+            "team_approval": {"mode": "chat"},
+        }, path)
+
+    def admit_investigation(self):
+        """The operator's explicit admission of the held READ investigation."""
+        held = feedback.tick(str(self.watch_path))["observations"][0]
+        watch = feedback.validate_watch(self.watch)
+        issue = feedback.improvement.assess(self.case)["issues"][0]
+        admitted = team.initialize(feedback._investigation_spec(watch, self.case, issue),
+                                   env=None, approved=True)
+        return held, admitted
+
+    def test_unattended_watch_holds_instead_of_bypassing_chat_approval(self):
+        self.enable_chat_approval()
+        report = feedback.tick(str(self.watch_path))
+        self.assertEqual(report["status"], "HOLD")
+        self.assertTrue(report["chat_admission_held"])
+        record = report["observations"][0]
+        self.assertEqual(record["decision"], "INVESTIGATE")
+        self.assertTrue(record["admission_held"])
+        self.assertIn("chat team approval is required", record["reason"])
+        # No team was created, so no duplicate identity can ever appear.
+        self.assertIsNone(record["team_status"])
+        self.assertEqual(team.list_teams(), [])
+        # A dry run stays read-only and creates nothing.
+        again = feedback.tick(str(self.watch_path), admit=False)
+        self.assertEqual(again["status"], "INSPECTED")
+        self.assertFalse(again["observations"][0]["admission_held"])
+        self.assertEqual(team.list_teams(), [])
+        # An operator admission is the only way the watch proceeds.
+        held, admitted = self.admit_investigation()
+        self.assertEqual(admitted["team_id"], held["team_id"])
+        self.assertEqual(admitted["approval"]["method"], "operator-declared")
+        admitted = team.set_desired(admitted["team_id"], "running")
+        self.assertEqual(admitted["desired"], "running")
+        self.assertEqual(feedback.tick(str(self.watch_path))["status"], "RUNNING")
+        self.assertFalse(feedback.tick(str(self.watch_path))["chat_admission_held"])
+        self.assertEqual(len(team.list_teams()), 1)
+
+    def test_operator_invoked_correction_declares_chat_approval_without_identity(self):
+        self.enable_chat_approval()
+        _, admitted = self.admit_investigation()
+        team.set_desired(admitted["team_id"], "running")
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "opencode-go/model-a"},
+            "team_approval": {"mode": "chat"},
+        })
+        team.tick(admitted["team_id"], config=config, driver=None,
+                  execute=lambda **kw: {
+                      "status": "complete",
+                      "claim": {"released": True, "released_head": self.head},
+                      "output": "Source inspection and bounded cause context",
+                      "output_truncated": False,
+                  },
+                  head_reader=lambda _: self.head)
+        self.assertEqual(team.status(admitted["team_id"], env=None)["status"], "COMPLETE")
+        work = self.root / "fix"
+        git("worktree", "add", "-b", "fix/incident", str(work), cwd=self.repo)
+        result = feedback.authorize_correction(
+            str(self.watch_path), str(self.case_path), str(self._cause_file()),
+            str(work), "opencode-go/code", "opencode-go/review")
+        self.assertTrue(result["chat_approval_declared_by_this_invocation"])
+        # Invoking the command is the declaration; it authenticates no person
+        # and grants no publication or deployment authority.
+        self.assertTrue(result["operator_invocation_not_identity_proof"])
+        self.assertFalse(result["publication_authorized"])
+        self.assertFalse(result["deployment_authorized"])
+        record = team.status(result["team_id"], env=None)
+        self.assertEqual(record["approval"]["method"], "operator-declared")
+        self.assertEqual(record["desired"], "running")
+        self.assertEqual(team._required(result["team_id"], env=None)["spec"][
+            "initiative"], result["team_id"])
+        # The unattended watch reports the admitted READ investigation without
+        # re-declaring anything, and creates no second team.
+        watch_report = feedback.tick(str(self.watch_path))
+        self.assertFalse(watch_report["chat_admission_held"])
+        self.assertEqual(watch_report["observations"][0]["team_status"], "COMPLETE")
+        self.assertEqual(len(team.list_teams()), 2)
+        # A repeated invocation stays idempotent and never overrides a pause.
+        team.set_desired(result["team_id"], "paused")
+        again = feedback.authorize_correction(
+            str(self.watch_path), str(self.case_path), str(self._cause_file()),
+            str(work), "opencode-go/code", "opencode-go/review")
+        self.assertEqual(again["team_id"], result["team_id"])
+        self.assertEqual(team.status(result["team_id"], env=None)["desired"], "paused")
+
+    def test_legacy_policy_is_unchanged_by_the_chat_admission_hold(self):
+        report = feedback.tick(str(self.watch_path))
+        self.assertEqual(report["status"], "RUNNING")
+        self.assertFalse(report["chat_admission_held"])
+        self.assertFalse(report["observations"][0]["admission_held"])
+        self.assertEqual(len(team.list_teams()), 1)
+
+    def test_legacy_pre_initiative_investigation_is_observed_not_refused(self):
+        self.enable_chat_approval()
+        watch = feedback.validate_watch(self.watch)
+        issue = feedback.improvement.assess(self.case)["issues"][0]
+        spec = feedback._investigation_spec(watch, self.case, issue)
+        # A team admitted by the pre-initiative release: the identical manifest
+        # and prompt, but no initiative and no approval.
+        legacy = team.validate_spec(
+            {key: value for key, value in spec.items() if key != "initiative"})
+        os.makedirs(team.team_dir(), exist_ok=True)
+        team._save({
+            "schema": team.STATE_SCHEMA, "team_id": legacy["team_id"],
+            "spec": legacy, "spec_hash": team.fingerprint(legacy),
+            "desired": "running", "tick_count": 3,
+            "slots": {t["id"]: {"phase": "work", "round": 0, "status": "pending",
+                                "execution_id": None, "prompt": None, "head": None,
+                                "feedback": None, "output": None, "error": None,
+                                "started_at": None, "progress_at": None,
+                                "progress_key": None}
+                      for t in legacy["tasks"]},
+        }, None)
+        # A periodic tick observes the exact historical manifest instead of
+        # raising, and admits no new team.
+        report = feedback.tick(str(self.watch_path))
+        self.assertEqual(report["status"], "RUNNING")
+        self.assertFalse(report["chat_admission_held"])
+        record = report["observations"][0]
+        self.assertEqual(record["team_id"], spec["team_id"])
+        self.assertEqual(record["team_status"], "PENDING")
+        # Manifest, hash and absent approval are preserved exactly: the upgrade
+        # never rewrites legacy state or silently re-admits it.
+        stored = team._required(spec["team_id"], None)
+        self.assertEqual(stored["spec"], legacy)
+        self.assertEqual(stored["spec_hash"], team.fingerprint(legacy))
+        self.assertNotIn("admission", stored)
+        self.assertEqual(len(team.list_teams()), 1)
+        # Only that exact known historical form is compatible; a changed
+        # incident under the same identity still refuses.
+        changed = copy.deepcopy(self.case)
+        changed["detected_at"] = "2026-01-01T07:00:00Z"
+        self.write_json(self.case_path, changed)
+        with self.assertRaises(feedback.FeedbackError):
+            feedback.tick(str(self.watch_path))
+        self.assertEqual(len(team.list_teams()), 1)
+
     def test_source_reported_outcome_requires_matching_cao_correction_sha(self):
         self._accept_read()
         self.watch["outcomes_dir"] = str(self.root / "outcomes")

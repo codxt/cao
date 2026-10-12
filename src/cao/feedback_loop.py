@@ -16,7 +16,7 @@ import subprocess
 from urllib.parse import urlsplit
 from typing import Any, Mapping
 
-from . import evidence, improvement, product_config, team
+from . import evidence, improvement, product_config, team, team_approval
 
 SCHEMA = "cao.feedback.watch.v1"
 MAX_CASES = 12
@@ -29,6 +29,17 @@ _UPSTREAM = {"calls", "connects_to", "depends_on", "routes_to"}
 
 class FeedbackError(ValueError):
     code = "FEEDBACK_UNAVAILABLE"
+
+
+def _chat_approval_required() -> bool:
+    """Whether this installation requires an explicit operator team admission.
+
+    The watch resolves the same configuration a team initialization loads, so
+    an unattended scan and an operator command can never disagree about the
+    policy. Absent configuration keeps the legacy mode.
+    """
+
+    return team_approval.policy(product_config.load_config())["mode"] == "chat"
 
 
 def _path(path: Any, what: str) -> str:
@@ -200,8 +211,14 @@ def _investigation_spec(watch: dict, case: dict, issue: dict) -> dict:
     )
     if len(prompt) > MAX_PROMPT:
         raise FeedbackError("incident context exceeds one bounded investigation prompt")
+    team_id = _team_id("fb", watch, case, issue["issue"])
     return {
-        "schema": team.SPEC_SCHEMA, "team_id": _team_id("fb", watch, case, issue["issue"]),
+        "schema": team.SPEC_SCHEMA, "team_id": team_id,
+        # A chat-approved team is only admissible under a named initiative, and
+        # the identity is already stable across changed evidence. The watch
+        # therefore declares the same stable identity as the initiative, so an
+        # operator can admit exactly this investigation and nothing else.
+        "initiative": team_id,
         "max_parallel": 1, "max_writers": 0,
         "roles": {"investigator": {
             "instruction": "One accountable incident investigator; source-bound diagnosis and reporting.",
@@ -212,6 +229,24 @@ def _investigation_spec(watch: dict, case: dict, issue: dict) -> dict:
             "prompt": prompt, "mode": "read", "write_scope": [], "depends_on": [],
         }],
     }
+
+
+def _legacy_manifest_matches(prior_spec: Mapping[str, Any],
+                             spec: Mapping[str, Any]) -> bool:
+    """Whether a stored team is exactly the known pre-initiative form of spec.
+
+    A team checkpointed before chat approval existed declares the same team_id,
+    roles, task graph and prompt but no ``initiative``. Only that one absent
+    field is compatible: any other difference (a changed case, prompt, model,
+    scope or task graph) is a changed incident and still refuses. The stored
+    record is never rewritten, so the legacy hash stays exactly as issued and
+    the team keeps its own absent approval and its own pause state.
+    """
+
+    if prior_spec.get("initiative") is not None:
+        return False
+    legacy = {key: value for key, value in spec.items() if key != "initiative"}
+    return prior_spec == team.validate_spec(legacy)
 
 
 def _case_files(watch: dict) -> list[str]:
@@ -303,29 +338,57 @@ def tick(watch_file: str, *, admit: bool = True) -> dict:
         spec = (_investigation_spec(watch, case, issue)
                 if decision == "INVESTIGATE" else None)
         previous = None
+        legacy = False
         if spec is not None and os.path.lexists(team.team_path(name)):
             prior = team._required(name, None)
-            if prior["spec_hash"] != team.fingerprint(team.validate_spec(spec)):
+            if prior["spec_hash"] == team.fingerprint(team.validate_spec(spec)):
+                previous = team.summary(prior)
+            elif _legacy_manifest_matches(prior["spec"], spec):
+                # A pre-upgrade team is the exact historical form of this
+                # incident. Report it unchanged: its manifest and hash are never
+                # rewritten, no approval is attached, and no second
+                # investigation is started.
+                legacy = True
+                previous = team.summary(prior)
+            else:
                 raise FeedbackError("case changed under an existing incident identity")
-            previous = team.summary(prior)
         correction_id = _team_id("fx", watch, case, issue["issue"])
         try:
             correction = team.status(correction_id)["status"]
         except team.TeamError:
             correction = None
         prepared.append((case, issue, decision, reason, name, outcome,
-                         spec, previous, correction_id, correction))
+                         spec, previous, legacy, correction_id, correction))
 
     statuses = []
+    chat_admission_held = False
     for (case, issue, decision, reason, name, outcome, spec,
-         previous, correction_id, correction) in prepared:
+         previous, legacy, correction_id, correction) in prepared:
         current = previous
+        admission_held = False
         if spec is not None and admit:
-            current = team.initialize(spec)
-            # A previously paused team belongs to its operator. Never
-            # reactivate an intentionally paused task on a periodic scan.
-            if previous is None and current["desired"] == "paused":
-                current = team.set_desired(name, "running")
+            if _chat_approval_required() and previous is None:
+                # An unattended periodic scan cannot declare the operator's
+                # chat confirmation, so it HOLDS the admission with an
+                # actionable reason instead of bypassing the configured policy,
+                # silently enabling a watch the operator disabled, or creating a
+                # team it could never start. A team the operator already
+                # admitted is only reported below: re-reading it re-declares
+                # nothing, and it keeps its own approval and pause.
+                admission_held = chat_admission_held = True
+                reason = ("chat team approval is required: admit this "
+                          "investigation team explicitly before it can dispatch")
+            elif legacy:
+                # Observationally compatible only: the exact legacy manifest and
+                # hash stay as stored, no approval is attached, and an
+                # unintentionally paused team is never started by a scan.
+                current = previous
+            else:
+                current = team.initialize(spec)
+                # A previously paused team belongs to its operator. Never
+                # reactivate an intentionally paused task on a periodic scan.
+                if previous is None and current["desired"] == "paused":
+                    current = team.set_desired(name, "running")
         statuses.append({
             "correction_team_id": correction_id,
             "correction_team_status": correction,
@@ -333,6 +396,7 @@ def tick(watch_file: str, *, admit: bool = True) -> dict:
             "issue": issue["issue"], "assessment": issue["status"],
             "decision": decision, "reason": reason, "team_id": name,
             "team_status": (current or {}).get("status"), "outcome": outcome,
+            "admission_held": admission_held,
             "queries": _questions(case, issue),
             "potential_impact": _impact(case, issue["resources"]),
         })
@@ -340,6 +404,7 @@ def tick(watch_file: str, *, admit: bool = True) -> dict:
         "schema": "cao.feedback.tick.v1",
         "status": "HOLD" if any(
             item["decision"] == "HOLD"
+            or item["admission_held"]
             or (item["outcome"] is not None
                 and item["outcome"]["status"] != "SOURCE_REPORTED_IMPROVEMENT")
             or item["team_status"] in ("BLOCKED", "PAUSED", "CORRUPT")
@@ -351,6 +416,7 @@ def tick(watch_file: str, *, admit: bool = True) -> dict:
                       for item in statuses)
                   else "NO_NEW_CASES" if not statuses else "INSPECTED",
         "watch_id": watch["watch_id"], "observations": statuses,
+        "chat_admission_held": chat_admission_held,
         "learning_proposals": learning, "submitted_to_registry": False,
         "write_authority": False, "publish_authority": False, "deployment_authority": False,
     }
@@ -427,8 +493,14 @@ def authorize_correction(watch_file: str, case_file: str, cause_file: str,
     )
     if len(prompt) > MAX_PROMPT:
         raise FeedbackError("correction prompt exceeds bound")
+    correction_team_id = _team_id("fx", watch, case, issue["issue"])
     spec = {
-        "schema": team.SPEC_SCHEMA, "team_id": _team_id("fx", watch, case, issue["issue"]),
+        "schema": team.SPEC_SCHEMA, "team_id": correction_team_id,
+        # A chat-approved team is only admissible under a named initiative.
+        # This correction is its own accountable initiative: it supersedes no
+        # team, borrows no identity, and its WRITE authority still comes only
+        # from the operator's explicit invocation plus the Registry gate.
+        "initiative": correction_team_id,
         "max_parallel": 1, "max_writers": 1,
         "roles": {
             "investigator": {"instruction": "Own investigation through bounded code correction.", "model": model},
@@ -442,9 +514,14 @@ def authorize_correction(watch_file: str, case_file: str, cause_file: str,
         }],
     }
     # An existing operator pause remains authoritative on repeated commands.
-    # Team initialization is immutable and creates no Registry claim.
+    # Team initialization is immutable and creates no Registry claim. Invoking
+    # this explicit operator command IS the chat approval declaration where the
+    # installation requires one; it still authenticates no person and grants no
+    # publication or deployment authority. An already-admitted team is only
+    # read back, so a repeated command re-declares nothing.
     existed = os.path.lexists(team.team_path(spec["team_id"]))
-    result = team.initialize(spec)
+    chat = _chat_approval_required()
+    result = team.initialize(spec, approved=chat and not existed)
     if not existed and result["desired"] == "paused":
         result = team.set_desired(spec["team_id"], "running")
     return {
@@ -452,6 +529,7 @@ def authorize_correction(watch_file: str, case_file: str, cause_file: str,
         "team_id": spec["team_id"], "case_fingerprint": evidence.fingerprint(case),
         "write_scope": draft["suggested_write_scope"], "declared_repo": draft["repo"],
         "operator_invocation_not_identity_proof": True,
+        "chat_approval_declared_by_this_invocation": chat and not existed,
         "registry_claim_pending": True, "publication_authorized": False,
         "deployment_authorized": False,
     }
