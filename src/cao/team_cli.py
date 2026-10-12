@@ -51,7 +51,12 @@ def _argv_model(arguments: object) -> tuple[str | None, int, bool]:
         elif argument == "--model":
             mentions += 1
             previous = arguments[index - 1] if index else None
-            if type(previous) is str and previous.startswith("-"):
+            # ``--standalone`` is a value-less switch CAO's own dispatch emits
+            # immediately before its ``--model`` selection, so it never
+            # consumes the switch; every other preceding flag may own the
+            # ``--model`` token as its value and stays ambiguous.
+            if (type(previous) is str and previous.startswith("-")
+                    and previous != "--standalone"):
                 trap = True
             value = (_safe_token(arguments[index + 1])
                      if index + 1 < len(arguments) else None)
@@ -71,11 +76,11 @@ def _effective_model(provider_model: str | None, value: str | None,
 
     if mentions == 0:
         return provider_model
-    if mentions > 1 or value is None:
+    if mentions > 1 or value is None or trap:
         return None
     if provider_model is not None:
         return provider_model if provider_model == value else None
-    return None if trap else value
+    return value
 
 
 def _route(entry: Mapping[str, object]) -> dict[str, object]:

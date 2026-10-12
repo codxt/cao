@@ -221,6 +221,24 @@ class ChatTeamTests(unittest.TestCase):
         self.assertEqual(route["model_status"], "unresolved")
         self.assertNotIn("hunter2-secret", json.dumps(plan))
 
+    def test_plan_trapped_model_matching_a_provider_model_is_unresolved(self):
+        # --model is the value of the preceding flag, so the parse is ambiguous
+        # even when the trapped text equals the provider model. A coincidental
+        # match must not be reported as one resolved selection.
+        self.raw["provider"] = {"cli": "claude", "id": "account",
+                                "model": "sonnet"}
+        self.raw["task"] = {"agent_args": ["--append-system-prompt",
+                                           "--model", "sonnet"]}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["provider"]["model"], "sonnet")
+        self.assertIsNone(route["model"])
+        self.assertEqual(route["model_status"], "unresolved")
+        self.assertNotIn("agent_args", json.dumps(plan))
+
     def test_plan_unresolved_model_arguments_are_not_hidden_by_a_provider_model(self):
         self.raw["provider"] = {"cli": "claude", "id": "account",
                                 "model": "claude/aaa"}
