@@ -210,6 +210,48 @@ class FailClosedTransportTests(_CliFixture):
         with self.assertRaises(intake_bridge.UnsupportedTransport):
             intake_bridge.admit_stream(_Exploding(), transport="custom-mcp")
 
+    def test_cli_refuses_bad_transport_before_opening_the_file(self) -> None:
+        missing = Path(self._temp.name) / "does-not-exist.json"
+        for transport, code in (
+            ("custom-mcp", intake_bridge.UnsupportedTransport.code),
+            ("github-issue", intake_bridge.DeferredTransport.code),
+        ):
+            with self.subTest(transport=transport):
+                _code, payload = self._run(
+                    ["intake", "pull", "--transport", transport,
+                     "--file", str(missing)]
+                )
+                # The transport is refused, not the missing file.
+                self.assertEqual(payload["error"]["code"], code)
+
+    def test_cli_refuses_bad_transport_before_consuming_stdin(self) -> None:
+        class _Tripwire:
+            def __init__(self) -> None:
+                self.read_called = False
+
+            def read(self, _size: int = -1) -> bytes:
+                self.read_called = True
+                return b""
+
+        class _TripwireStdin:
+            def __init__(self) -> None:
+                self.buffer = _Tripwire()
+
+        fake = _TripwireStdin()
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch("sys.stdin", fake):
+                with contextlib.redirect_stdout(stream):
+                    code = intake_cli.main(
+                        ["pull", "--transport", "custom-mcp"]
+                    )
+        self.assertEqual(code, intake_cli.EXIT_UNAVAILABLE)
+        self.assertFalse(fake.buffer.read_called)
+        self.assertEqual(
+            json.loads(stream.getvalue())["error"]["code"],
+            intake_bridge.UnsupportedTransport.code,
+        )
+
 
 class BoundedInputTests(_CliFixture):
     def test_oversized_stdin_is_refused(self) -> None:

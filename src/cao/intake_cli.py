@@ -109,6 +109,10 @@ def _cmd_pull(args: argparse.Namespace) -> int:
             "(see 'cao intake transports')",
         )
     try:
+        # The transport is validated *before* any input is touched, so an
+        # unsupported or deferred transport is refused without opening the
+        # file or consuming stdin.
+        intake_bridge.check_transport(transport)
         if getattr(args, "file", None):
             document = intake.load_submission_file(args.file)
             result = intake_bridge.admit_document(document, transport=transport)

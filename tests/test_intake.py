@@ -224,6 +224,63 @@ class SecretHandlingTests(_StateFixture):
         self.assertNotIn("body", view)
         self.assertNotIn("private body", json.dumps(view))
 
+    def test_bearer_value_is_fully_redacted_without_a_suffix(self) -> None:
+        token = "abc123def456ghi789jkl"
+        body = f"Authorization: Bearer {token}\n"
+        stored = intake.read_submission(
+            intake.submit(_doc(body=body), env=self.env)["submission"][
+                "submission_id"
+            ],
+            self.env,
+        )
+        self.assertNotIn(token, stored["body"])
+        self.assertNotIn("abc123", stored["body"])
+        self.assertIn("[REDACTED]", stored["body"])
+
+    def test_authorization_with_non_bearer_scheme_is_redacted(self) -> None:
+        credential = "dXNlcjpwYXNzd29yZA=="
+        body = f"Authorization: Basic {credential}\n"
+        stored = intake.read_submission(
+            intake.submit(_doc(body=body), env=self.env)["submission"][
+                "submission_id"
+            ],
+            self.env,
+        )
+        self.assertNotIn(credential, stored["body"])
+
+    def test_quoted_assignment_is_redacted_whole(self) -> None:
+        body = 'password="hunter two with spaces"\nsecret: \'a b c d\'\n'
+        stored = intake.read_submission(
+            intake.submit(_doc(body=body), env=self.env)["submission"][
+                "submission_id"
+            ],
+            self.env,
+        )
+        self.assertNotIn("hunter", stored["body"])
+        self.assertNotIn("two with spaces", stored["body"])
+        self.assertNotIn("a b c d", stored["body"])
+
+    def test_json_style_credential_assignment_is_redacted(self) -> None:
+        body = '{"authorization":"Basic dXNlcjpwYXNz","note":"ok"}'
+        stored = intake.read_submission(
+            intake.submit(_doc(body=body), env=self.env)["submission"][
+                "submission_id"
+            ],
+            self.env,
+        )
+        self.assertNotIn("dXNlcjpwYXNz", stored["body"])
+
+    def test_credential_shaped_item_id_is_refused(self) -> None:
+        for item_id in (
+            "password=hunter2",
+            "token:ghp_" + "b" * 36,
+            "sk-" + "a" * 24,
+            "Bearer abc123def456",
+        ):
+            with self.subTest(item_id=item_id):
+                with self.assertRaises(intake.IntakeInvalid):
+                    intake.submit(_doc(item_id=item_id), env=self.env)
+
 
 class StrictInputTests(_StateFixture):
     def _load(self, name: str, payload) -> dict:
@@ -328,6 +385,218 @@ class EvidenceRefTests(_StateFixture):
             result["submission"]["submission_id"], self.env
         )
         self.assertEqual(stored["evidence_refs"], refs)
+
+
+class StoredRecordTamperTests(_StateFixture):
+    """F1: a stored record is re-derived from its bytes before every read.
+
+    Tampering the body, the id, an evidence ref or the schema fails closed;
+    show, list and the duplicate path all verify the same bindings.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        result = intake.submit(_doc(body="original"), env=self.env)
+        self.sid = result["submission"]["submission_id"]
+        self.path = Path(intake.submission_path(self.sid, self.env))
+
+    def _record(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _write(self, record) -> None:
+        self.path.write_text(json.dumps(record), encoding="utf-8")
+
+    def test_tampered_body_fails_closed_on_show_and_list(self) -> None:
+        record = self._record()
+        record["body"] = "tampered"
+        self._write(record)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.list_submissions(self.env)
+
+    def test_tampered_item_id_fails_closed(self) -> None:
+        record = self._record()
+        record["item_id"] = "different-item"
+        self._write(record)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+
+    def test_tampered_evidence_ref_fails_closed(self) -> None:
+        record = self._record()
+        record["evidence_refs"] = [{"ref": "urn:example:injected"}]
+        self._write(record)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.list_submissions(self.env)
+
+    def test_tampered_schema_fails_closed(self) -> None:
+        record = self._record()
+        record["schema"] = "cao.intake.submission.v99"
+        self._write(record)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+
+    def test_duplicate_path_recomputes_fingerprint(self) -> None:
+        record = self._record()
+        record["body"] = "tampered"
+        self._write(record)
+        # The same item with different content reaches the duplicate path; it
+        # must verify the stored record rather than trust its fingerprint.
+        with self.assertRaises(intake.IntakeStateError):
+            intake.submit(_doc(body="other"), env=self.env)
+
+    def test_duplicate_json_key_in_record_fails_closed(self) -> None:
+        self.path.write_text(
+            '{"schema": "%s", "schema": "%s"}'
+            % (intake.SUBMISSION_SCHEMA, intake.SUBMISSION_SCHEMA),
+            encoding="utf-8",
+        )
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+
+    def test_non_finite_number_in_record_fails_closed(self) -> None:
+        self.path.write_text('{"n": NaN}', encoding="utf-8")
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+
+    def test_oversized_record_fails_closed(self) -> None:
+        self.path.write_bytes(b"x" * (intake.MAX_RECORD_BYTES + 1))
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+
+
+class PrivatePathSafetyTests(_StateFixture):
+    """F3: records and directories are protected from symlinks, non-regular
+    files, unsafe modes and foreign targets, while legitimate private state
+    stays usable."""
+
+    def test_record_symlink_fails_closed(self) -> None:
+        result = intake.submit(_doc(), env=self.env)
+        sid = result["submission"]["submission_id"]
+        path = Path(intake.submission_path(sid, self.env))
+        target = Path(self._temp.name) / "elsewhere.json"
+        target.write_text("{}", encoding="utf-8")
+        path.unlink()
+        os.symlink(target, path)
+        with self.assertRaises(intake.IntakeError):
+            intake.read_submission(sid, self.env)
+
+    def test_record_with_unsafe_mode_fails_closed(self) -> None:
+        result = intake.submit(_doc(), env=self.env)
+        sid = result["submission"]["submission_id"]
+        path = Path(intake.submission_path(sid, self.env))
+        os.chmod(path, 0o644)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(sid, self.env)
+
+    def test_record_replaced_by_directory_fails_closed(self) -> None:
+        result = intake.submit(_doc(), env=self.env)
+        sid = result["submission"]["submission_id"]
+        path = Path(intake.submission_path(sid, self.env))
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(sid, self.env)
+
+    def test_intake_dir_symlink_fails_closed(self) -> None:
+        foreign = Path(self._temp.name) / "foreign"
+        foreign.mkdir()
+        cao = Path(self.env["XDG_STATE_HOME"]) / "cao"
+        cao.mkdir(parents=True)
+        os.symlink(foreign, cao / "intake")
+        with self.assertRaises(intake.IntakeError):
+            intake.submit(_doc(), env=self.env)
+
+    def test_symlinked_parent_is_refused_and_not_chmod_ed(self) -> None:
+        foreign = Path(self._temp.name) / "foreign"
+        foreign.mkdir()
+        os.chmod(foreign, 0o755)
+        state_home = Path(self.env["XDG_STATE_HOME"])
+        state_home.mkdir(parents=True)
+        os.symlink(foreign, state_home / "cao")
+        with self.assertRaises(intake.IntakeError):
+            intake.submit(_doc(), env=self.env)
+        # The foreign target was never chmod'ed through the link.
+        self.assertEqual(stat.S_IMODE(foreign.stat().st_mode), 0o755)
+
+    def test_legitimate_private_state_remains_usable(self) -> None:
+        result = intake.submit(_doc(body="usable"), env=self.env)
+        sid = result["submission"]["submission_id"]
+        self.assertEqual(intake.read_submission(sid, self.env)["body"], "usable")
+        self.assertEqual(len(intake.list_submissions(self.env)), 1)
+        self.assertEqual(
+            stat.S_IMODE(Path(intake.submission_path(sid, self.env)).stat().st_mode),
+            0o600,
+        )
+        self.assertEqual(
+            stat.S_IMODE(Path(intake.intake_dir(self.env)).stat().st_mode), 0o700
+        )
+
+
+class ListAbsenceTests(_StateFixture):
+    """F4: ``list`` returns ``[]`` only for a genuinely absent directory."""
+
+    def test_absent_directory_returns_empty(self) -> None:
+        self.assertEqual(intake.list_submissions(self.env), [])
+
+    def test_directory_path_that_is_a_file_raises(self) -> None:
+        state_home = Path(self.env["XDG_STATE_HOME"])
+        state_home.mkdir(parents=True)
+        (state_home / "cao").write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(intake.IntakeError):
+            intake.list_submissions(self.env)
+
+    def test_directory_that_is_a_symlink_raises(self) -> None:
+        foreign = Path(self._temp.name) / "foreign"
+        (foreign / "intake").mkdir(parents=True)
+        cao = Path(self.env["XDG_STATE_HOME"]) / "cao"
+        cao.mkdir(parents=True)
+        os.symlink(foreign / "intake", cao / "intake")
+        with self.assertRaises(intake.IntakeError):
+            intake.list_submissions(self.env)
+
+    def test_directory_with_unsafe_mode_raises(self) -> None:
+        intake.submit(_doc(), env=self.env)
+        os.chmod(intake.intake_dir(self.env), 0o755)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.list_submissions(self.env)
+
+
+class DurabilityTests(_StateFixture):
+    """F6: a write is fsynced through the containing directory before it is
+    acknowledged; a failure never falsely acknowledges and an honest retry
+    reconciles the record."""
+
+    def test_directory_fsync_failure_never_acknowledges_and_retry_reconciles(
+        self,
+    ) -> None:
+        real_fsync_dir = intake._fsync_dir
+        state = {"first": True}
+
+        def flaky(directory: str) -> None:
+            if state["first"]:
+                state["first"] = False
+                raise OSError("simulated directory fsync failure")
+            real_fsync_dir(directory)
+
+        with mock.patch.object(intake, "_fsync_dir", side_effect=flaky):
+            with self.assertRaises(intake.IntakeUnavailable):
+                intake.submit(_doc(), env=self.env)
+
+        # The name was linked but never acknowledged. The honest retry finds it
+        # and reconciles to one durable record.
+        retry = intake.submit(_doc(), env=self.env)
+        self.assertEqual(retry["status"], "DUPLICATE")
+        self.assertEqual(len(intake.list_submissions(self.env)), 1)
+
+    def test_record_fsync_failure_leaves_no_record_and_retry_admits(self) -> None:
+        with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
+            with self.assertRaises(intake.IntakeUnavailable):
+                intake.submit(_doc(), env=self.env)
+        # Nothing was linked, so a retry is an honest first admission.
+        retry = intake.submit(_doc(), env=self.env)
+        self.assertEqual(retry["status"], "ADMITTED")
+        self.assertEqual(len(intake.list_submissions(self.env)), 1)
 
 
 class CliTests(_StateFixture):

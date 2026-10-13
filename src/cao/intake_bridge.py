@@ -52,6 +52,7 @@ __all__ = [
     "UnsupportedTransport",
     "DeferredTransport",
     "bridge_contract",
+    "check_transport",
     "admit_document",
     "admit_stream",
 ]
@@ -118,7 +119,14 @@ def bridge_contract() -> dict[str, Any]:
     }
 
 
-def _require_transport(transport: Any) -> str:
+def check_transport(transport: Any) -> str:
+    """Validate a named inbound transport without touching any input.
+
+    The one public gate a caller uses *before* opening a file or consuming a
+    stream: an unsupported or deferred transport is refused here, so a refused
+    request never reads input and never writes a record.
+    """
+
     if not isinstance(transport, str) or not transport:
         raise UnsupportedTransport("no inbound transport was named")
     if transport in DEFERRED_TRANSPORTS:
@@ -129,6 +137,9 @@ def _require_transport(transport: Any) -> str:
             f"the marketplace transport {TRANSPORT_MARKETPLACE!r}"
         )
     return transport
+
+
+_require_transport = check_transport
 
 
 def _acknowledge(acknowledgement: Mapping[str, Any], transport: str) -> dict[str, Any]:

@@ -33,13 +33,29 @@ a Work Registry claim:
   named by the durable submission id (64 lowercase hex characters).
 - The submission id is `sha256(item_id)`: the same item is the same durable id
   across processes and restarts. There is no in-memory cache.
-- Directories are `0700` and files `0600`. `makedirs` only modes the leaf, so
-  the CAO state root above the intake directory is hardened to `0700` as well.
+- Directories are `0700` and files `0600`. Only the leaf is created by
+  `makedirs`, so the CAO state root above the intake directory is hardened to
+  `0700` explicitly as well.
 - A record is written to a private temp file, fsynced, then hard-linked into
-  place. `os.link` is atomic and fails closed on an existing path, so two
-  concurrent submitters can neither overwrite each other nor duplicate a record.
-- Reads and writes go through `cao.state`: a corrupt, malformed or
-  unknown-schema record **raises** and is never rounded up to an empty result.
+  place and the containing directory fsynced **before** the admission is
+  acknowledged. `os.link` is atomic and fails closed on an existing path, so
+  two concurrent submitters can neither overwrite each other nor duplicate a
+  record. A failure after the link is never acknowledged; an honest retry finds
+  the record and reconciles it as a duplicate.
+- Records are read through a strict, bounded reader that refuses duplicate JSON
+  keys and non-finite numbers, and that re-derives the id and content
+  fingerprint from the stored bytes. `submission_id` must equal
+  `sha256(item_id)`, and the canonical fingerprint is recomputed over the stored
+  body, id, title, source and evidence refs on **every** `show`, `list` and
+  duplicate check. A corrupt, tampered, malformed or unknown-schema record
+  **raises** and is never rounded up to an empty result or a valid record.
+- The private directory and each record are opened with `O_NOFOLLOW`,
+  descriptor-relative, and `fstat`-checked: a symlink, a non-regular file, a
+  file with unsafe permissions, or a path owned by another user fails closed.
+  Only a real, owned `0700` directory is ever chmod'ed; a symlinked or foreign
+  path is refused rather than followed. An absent intake directory is the only
+  case that legitimately lists as empty — an existing symlink, non-directory or
+  unreadable path raises.
 
 ### Idempotency, duplicates and conflicts
 
@@ -58,6 +74,14 @@ private keys, `password:`/`token:` assignments, `Bearer` tokens) are replaced
 with `[REDACTED]`, and the record records whether any redaction happened
 (`body_redacted`). Only public-safe metadata is reported by `list`; a body is
 never reported by `list`.
+
+Redaction consumes the **whole** credential value, never a prefix that could
+leave the secret behind as a suffix: a `Bearer` token is redacted before any
+assignment rule can see it, so `Authorization: Bearer <token>` becomes
+`Authorization: [REDACTED]` and never `Authorization: [REDACTED] <token>`.
+Quoted values (`password="an inner space"`, JSON `"token": "..."`) are replaced
+whole. An `item_id` that is itself credential-shaped is refused as
+`INTAKE_INVALID` rather than redacted into a different durable identity.
 
 ## CLI: local submission
 
@@ -147,7 +171,7 @@ service.
 | Field | Required | Bound |
 |---|---|---|
 | `schema` | yes | must be `cao.intake.request.v1` |
-| `item_id` | yes | printable, space-free, <= 200 chars |
+| `item_id` | yes | printable, space-free, not credential-shaped, <= 200 chars |
 | `body` | yes | <= 128 KiB chars |
 | `title` | no | <= 300 chars |
 | `source` | no | <= 200 chars (default `operator`) |
@@ -165,8 +189,9 @@ violation is an explicit `INTAKE_INVALID`, never a partial admission.
 | Unregistered transport (e.g. a custom MCP or a webhook) | exit `3`, `UNSUPPORTED_TRANSPORT` |
 | Known but deferred transport | exit `3`, `TRANSPORT_DEFERRED` |
 
-The transport is checked **before** the input is read, so a refused transport
-consumes nothing and writes nothing.
+The transport is checked **before** the input is touched: an unsupported or
+deferred transport is refused before the `--file` path is opened and before
+stdin is consumed, so a refused transport reads nothing and writes nothing.
 
 ## Deferred: private GitHub Issue adapter
 
@@ -194,7 +219,11 @@ transport rather than silently missing; no half-working adapter is registered.
 ## Tests
 
 `tests/test_intake.py` (admission, idempotency, conflict, corruption,
-concurrency, redaction, strict input, CLI) and `tests/test_intake_bridge.py`
-(end-to-end stdin admission, retries and reconciliation, collision, injection
-inertness, fail-closed unsupported/deferred transports) are the runnable check.
-Every value is synthetic; nothing is shipped and no private payload is used.
+concurrency, redaction, strict input, CLI, stored-record tamper detection,
+private-path safety, list-absence handling and fsync durability) and
+`tests/test_intake_bridge.py` (end-to-end stdin admission, retries and
+reconciliation, collision, injection inertness, fail-closed
+unsupported/deferred transports and transport-before-input ordering) are the
+runnable check. `tests/test_boundaries.py` additionally guards that intake never
+routes a durable record through the permissive state reader. Every value is
+synthetic; nothing is shipped and no private payload is used.

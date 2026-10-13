@@ -16,9 +16,13 @@ Load-bearing rules:
 * Storage is one file per submission under ``$XDG_STATE_HOME/cao/intake``,
   written through a private temp file and an atomic, exclusive ``link`` so two
   concurrent submitters cannot overwrite or duplicate each other. Directories
-  are ``0700`` and files ``0600``.
-* Records are read through :mod:`cao.state`: an unreadable or malformed record
-  raises and is never rounded up to an empty result. An unknown schema raises.
+  are ``0700`` and files ``0600``. A written record is fsynced, then linked into
+  place and the containing directory fsynced before an admission is
+  acknowledged, so an acknowledgement never precedes durability.
+* Records are read through a strict, bounded reader that refuses duplicate
+  JSON keys and non-finite numbers, and re-derives the id and content
+  fingerprint from the stored bytes. An unreadable, tampered or malformed
+  record raises and is never rounded up to an empty result or a valid record.
 * Submission bodies are untrusted, opaque data. They are stored verbatim
   (after secret redaction) and are never parsed as directives. Only public-safe
   metadata -- ids, timestamps, fingerprints -- is reported by ``list``.
@@ -39,7 +43,6 @@ from typing import Any
 
 from .evidence import fingerprint, utc_now
 from .product_state import state_dir
-from .state import StateError, read_state
 
 __all__ = [
     "REQUEST_SCHEMA",
@@ -48,6 +51,7 @@ __all__ = [
     "INTAKE_STATE_ADMITTED",
     "RECORD_TYPE",
     "MAX_SUBMISSION_BYTES",
+    "MAX_RECORD_BYTES",
     "MAX_BODY_CHARS",
     "MAX_ITEM_ID",
     "MAX_TITLE",
@@ -84,6 +88,11 @@ RECORD_TYPE = "intake_submission"
 INTAKE_STATE_ADMITTED = "ADMITTED"
 
 MAX_SUBMISSION_BYTES = 256 * 1024
+#: A stored record re-encodes the bounded body with ``ensure_ascii``, which can
+#: expand non-ASCII input up to ~3x, so the durable record is bounded more
+#: generously than the submission. The bound is fixed and never derived from
+#: untrusted input, and a record over it fails closed rather than being read.
+MAX_RECORD_BYTES = 1024 * 1024
 MAX_BODY_CHARS = 128 * 1024
 MAX_ITEM_ID = 200
 MAX_TITLE = 300
@@ -148,6 +157,19 @@ class IntakeConflict(IntakeError):
 # Secret redaction (never persist an obvious credential)
 # ---------------------------------------------------------------------------
 
+#: Assignment keys whose value is a credential. ``"?`` after the key accepts a
+#: JSON-style quoted key (``"token": "..."``) as well as a bare one.
+_SECRET_KEY = (
+    r"(password|passwd|pwd|secret|token|api[_-]?key|"
+    r"access[_-]?key|private[_-]?key|authorization|client[_-]?secret)"
+)
+
+#: Order is load-bearing. Known provider tokens and the private-key block are
+#: replaced first. ``Bearer`` is replaced *before* the generic assignment rule,
+#: so an ``Authorization: Bearer <token>`` line can never be reduced to
+#: ``Authorization: [REDACTED] <token>`` with the credential left as a suffix.
+#: A quoted value is replaced whole (so an inner space cannot leak a suffix),
+#: and a bare value is consumed to the end of its line, comma or semicolon.
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED]"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED]"),
@@ -161,20 +183,27 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "[REDACTED PRIVATE KEY]",
     ),
+    (re.compile(r"(?i)\bBearer\s+[^\s,;\"']{3,}"), "Bearer [REDACTED]"),
     (
         re.compile(
-            r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|"
-            r"access[_-]?key|private[_-]?key|authorization|client[_-]?secret)\b"
-            r"(\s*[:=]\s*)([^\s,;]{4,})"
+            rf"(?i)\b{_SECRET_KEY}\b(\"?\s*[:=]\s*)"
+            r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
         ),
         r"\1\2[REDACTED]",
     ),
-    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer [REDACTED]"),
+    (
+        re.compile(rf"(?i)\b{_SECRET_KEY}\b(\"?\s*[:=]\s*)([^\r\n,;]{{1,}})"),
+        r"\1\2[REDACTED]",
+    ),
 )
 
 
 def redact_secrets(text: str) -> tuple[str, bool]:
-    """Return ``(redacted_text, changed)`` with obvious secrets removed."""
+    """Return ``(redacted_text, changed)`` with obvious secrets removed.
+
+    Complete credential values are consumed, never split: a ``Bearer`` token is
+    redacted before any assignment rule can leave it behind as a suffix.
+    """
 
     changed = False
     for pattern, replacement in _REDACTIONS:
@@ -182,6 +211,15 @@ def redact_secrets(text: str) -> tuple[str, bool]:
         if count:
             changed = True
     return text, changed
+
+
+def looks_like_credential(text: str) -> bool:
+    """Whether ``text`` contains anything the redactor would have to redact."""
+
+    if not isinstance(text, str):
+        return False
+    _, changed = redact_secrets(text)
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +359,11 @@ def _identity(value: Any, field: str, limit: int) -> str:
     text = _bounded_str(value, field, limit, allow_empty=False)
     if not text.isprintable() or any(ch.isspace() for ch in text):
         raise IntakeInvalid(f"{field} must be a printable, space-free identity")
+    if field == "item_id" and looks_like_credential(text):
+        # The item id is a durable, public-safe identity that names the record.
+        # A credential-shaped id would leak a secret through every listing, so
+        # it is refused rather than silently redacted into a different id.
+        raise IntakeInvalid("item_id must not be credential-shaped")
     return text
 
 
@@ -455,31 +498,95 @@ def submission_path(
     return os.path.join(intake_dir(env), _record_id(submission_id) + ".json")
 
 
-def _ensure_private_dir(directory: str) -> None:
+def _dir_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _harden_owned_dir(directory: str) -> None:
+    """Require ``directory`` to be a real ``0700`` directory owned by this user.
+
+    The directory is opened with ``O_NOFOLLOW``/``O_DIRECTORY`` and hardened
+    through the descriptor, so a symlink or a non-directory cannot be followed
+    and a directory owned by someone else is never chmod'ed through.
+    """
+
     try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        os.chmod(directory, 0o700)
-        # ``os.makedirs`` applies ``mode`` only to the leaf it creates, so the
-        # CAO state root the intake directory sits under can be left
-        # group-readable. Harden that parent too: it is CAO's own state root,
-        # and a private intake dir under a readable parent is still a leak of
-        # the submission ids in its listing.
-        parent = os.path.dirname(directory)
-        if parent:
-            os.chmod(parent, 0o700)
+        fd = os.open(directory, _dir_open_flags())
     except OSError as exc:
         raise IntakeUnavailable(
             f"intake directory is not usable ({type(exc).__name__})"
         ) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise IntakeUnavailable("intake directory is not a real directory")
+        if info.st_uid != os.getuid():
+            raise IntakeUnavailable("intake directory is not owned by this user")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"intake directory is not usable ({type(exc).__name__})"
+        ) from exc
+    finally:
+        os.close(fd)
+
+
+def _ensure_private_dir(directory: str) -> None:
+    """Create and harden the private intake directory and its CAO state parent.
+
+    ``os.makedirs`` applies ``mode`` only to the leaf it creates, so the CAO
+    state root above the intake directory is created and hardened too: a
+    private intake dir under a readable parent still leaks the submission ids in
+    its listing. Both directories are validated as real, owned ``0700``
+    directories, so a symlinked or foreign path is refused rather than followed.
+    """
+
+    parent = os.path.dirname(directory)
+    if parent:
+        try:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise IntakeUnavailable(
+                f"intake directory is not usable ({type(exc).__name__})"
+            ) from exc
+        _harden_owned_dir(parent)
+    try:
+        os.mkdir(directory, mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"intake directory is not usable ({type(exc).__name__})"
+        ) from exc
+    _harden_owned_dir(directory)
+
+
+def _fsync_dir(directory: str) -> None:
+    """Fsync a directory so a just-linked name survives a crash."""
+
+    fd = os.open(directory, _dir_open_flags())
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _atomic_create(path: str, text: str) -> bool:
     """Create ``path`` with ``text`` atomically, or report it already exists.
 
     The content is written and fsynced to a private ``0600`` temp file first,
-    then hard-linked into place. ``os.link`` is atomic and fails closed on an
-    existing path, so two concurrent submitters can never overwrite each other
-    and a partial write is never visible at ``path``.
+    then hard-linked into place and the containing directory fsynced.
+    ``os.link`` is atomic and fails closed on an existing path, so two
+    concurrent submitters can never overwrite each other and a partial write is
+    never visible at ``path``. The directory fsync happens before this returns
+    ``True``, so the caller only acknowledges an admission after the name is
+    durable; a failure here raises, and an honest retry finds the record and
+    reconciles it as a duplicate.
     """
 
     directory = os.path.dirname(path)
@@ -494,6 +601,7 @@ def _atomic_create(path: str, text: str) -> bool:
             os.link(temp, path)
         except FileExistsError:
             return False
+        _fsync_dir(directory)
     except OSError as exc:
         raise IntakeUnavailable(
             f"intake record could not be written ({type(exc).__name__})"
@@ -506,7 +614,155 @@ def _atomic_create(path: str, text: str) -> bool:
     return True
 
 
+def _open_dir_or_none(directory: str) -> int | None:
+    """Open the intake directory read-only with no-follow, or ``None`` if absent.
+
+    A symlink, a non-directory, a foreign-owned directory or an unreadable path
+    raises; only a genuinely absent path returns ``None``, so a caller never
+    mistakes invalid state for first-run absence.
+    """
+
+    try:
+        fd = os.open(directory, _dir_open_flags())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"intake directory cannot be opened ({type(exc).__name__})"
+        ) from exc
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise IntakeStateError("intake path is not a directory")
+    if info.st_uid != os.getuid():
+        os.close(fd)
+        raise IntakeStateError("intake directory is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.close(fd)
+        raise IntakeStateError("intake directory has unsafe permissions")
+    return fd
+
+
+def _open_record_at(dir_fd: int, name: str) -> int | None:
+    """Open one stored record read-only, no-follow, relative to ``dir_fd``.
+
+    The opened file is fstat-checked: it must be a regular file, owned by this
+    user and mode ``0600``. A symlink, a device, a foreign file or an unsafe
+    mode fails closed. ``None`` means the name is genuinely absent.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"stored submission cannot be opened ({type(exc).__name__})"
+        ) from exc
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        raise IntakeStateError("stored submission is not a regular file")
+    if info.st_uid != os.getuid():
+        os.close(fd)
+        raise IntakeStateError("stored submission is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        os.close(fd)
+        raise IntakeStateError("stored submission has unsafe permissions")
+    if info.st_size > MAX_RECORD_BYTES:
+        os.close(fd)
+        raise IntakeStateError("stored submission exceeds the record bound")
+    return fd
+
+
+def _read_bounded_fd(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError as exc:
+            raise IntakeStateError(
+                f"stored submission cannot be read ({type(exc).__name__})"
+            ) from exc
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_RECORD_BYTES:
+            raise IntakeStateError("stored submission exceeds the record bound")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _parse_record_bytes(raw: bytes) -> dict[str, Any]:
+    """Parse stored record bytes with the same strictness as a submission.
+
+    Duplicate keys, non-finite numbers and non-object roots are refused; the
+    bytes must be valid UTF-8. Every failure is :class:`IntakeStateError`.
+    """
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise IntakeStateError("stored submission is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+    except IntakeInvalid as exc:
+        raise IntakeStateError("stored submission is not strict JSON") from exc
+    except ValueError as exc:
+        raise IntakeStateError("stored submission is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise IntakeStateError("stored submission is not a JSON object")
+    return data
+
+
+def _read_record_data_at(dir_fd: int, name: str) -> dict[str, Any] | None:
+    fd = _open_record_at(dir_fd, name)
+    if fd is None:
+        return None
+    try:
+        raw = _read_bounded_fd(fd)
+    finally:
+        os.close(fd)
+    return _parse_record_bytes(raw)
+
+
+def _read_record(
+    directory: str, name: str, expected_id: str
+) -> dict[str, Any] | None:
+    """Read and verify one stored record, or ``None`` when it is absent."""
+
+    dir_fd = _open_dir_or_none(directory)
+    if dir_fd is None:
+        return None
+    try:
+        data = _read_record_data_at(dir_fd, name)
+    finally:
+        os.close(dir_fd)
+    if data is None:
+        return None
+    return _record_from_state(data, expected_id)
+
+
 def _record_from_state(data: Any, expected_id: str) -> dict[str, Any]:
+    """Verify one stored record against its file name and its own content.
+
+    Beyond shape and schema, two bindings are re-derived from the stored bytes
+    and must hold, so tampering any field fails closed:
+
+    * ``submission_id`` must equal ``sha256(item_id)`` -- the id binds the item
+      it names; and
+    * the canonical content ``fingerprint`` is recomputed over the stored
+      ``item_id``, ``title``, ``source``, ``body`` and ``evidence_refs`` and
+      must equal the stored one -- a changed body, id or evidence ref cannot be
+      presented as the record it claims to be.
+    """
+
     if not isinstance(data, Mapping):
         raise IntakeStateError("stored submission is not a JSON object")
     if data.get("schema") != SUBMISSION_SCHEMA:
@@ -515,26 +771,48 @@ def _record_from_state(data: Any, expected_id: str) -> dict[str, Any]:
         raise IntakeStateError("stored submission has an unexpected shape")
     if data.get("record_type") != RECORD_TYPE:
         raise IntakeStateError("stored record is not an intake submission")
-    if data.get("submission_id") != expected_id:
-        raise IntakeStateError("stored submission id does not match its file")
     if data.get("state") != INTAKE_STATE_ADMITTED:
         raise IntakeStateError("stored submission has an unknown state")
     try:
-        _identity(data.get("item_id"), "item_id", MAX_ITEM_ID)
-        _bounded_str(data.get("body"), "body", MAX_BODY_CHARS, allow_empty=True)
-        _bounded_str(data.get("title"), "title", MAX_TITLE, allow_empty=True)
-        _bounded_str(data.get("source"), "source", MAX_SOURCE, allow_empty=True)
-        _bounded_str(data.get("admitted_at"), "admitted_at", 64, allow_empty=False)
-        _bounded_str(
+        declared_id = _record_id(data.get("submission_id"))
+        item_id = _identity(data.get("item_id"), "item_id", MAX_ITEM_ID)
+        body = _bounded_str(data.get("body"), "body", MAX_BODY_CHARS,
+                            allow_empty=True)
+        title = _bounded_str(data.get("title"), "title", MAX_TITLE,
+                             allow_empty=True)
+        source = _bounded_str(data.get("source"), "source", MAX_SOURCE,
+                              allow_empty=True)
+        _bounded_str(data.get("admitted_at"), "admitted_at", 64,
+                     allow_empty=False)
+        stored_fingerprint = _bounded_str(
             data.get("fingerprint"), "fingerprint", 128, allow_empty=False
         )
     except IntakeInvalid as exc:
         raise IntakeStateError("stored submission is malformed") from exc
+    if declared_id != expected_id:
+        raise IntakeStateError("stored submission id does not match its file")
+    if submission_id_for(item_id) != declared_id:
+        raise IntakeStateError("stored submission id does not bind its item id")
     if not isinstance(data.get("body_redacted"), bool):
         raise IntakeStateError("stored submission body_redacted is not a boolean")
     refs = data.get("evidence_refs")
     if not isinstance(refs, list):
         raise IntakeStateError("stored submission evidence_refs must be a list")
+    try:
+        refs = _evidence_refs(refs)
+    except IntakeInvalid as exc:
+        raise IntakeStateError("stored submission evidence_refs is malformed") from exc
+    content = {
+        "item_id": item_id,
+        "title": title,
+        "source": source,
+        "body": body,
+        "evidence_refs": refs,
+    }
+    if fingerprint(content) != stored_fingerprint:
+        raise IntakeStateError(
+            "stored submission content does not match its fingerprint"
+        )
     return dict(data)
 
 
@@ -579,23 +857,22 @@ def submit(
     """
 
     record = normalize_submission(document, clock=clock)
-    path = submission_path(record["submission_id"], env)
+    submission_id = record["submission_id"]
+    path = submission_path(submission_id, env)
     payload = json.dumps(
         record, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False
     )
     if _atomic_create(path, payload):
-        readback = read_state(path)
+        readback = _read_record(
+            intake_dir(env), submission_id + ".json", submission_id
+        )
         if readback != record:
             raise IntakeStateError("intake record failed its read-back check")
         return _admission("ADMITTED", record)
 
-    try:
-        existing = read_state(path)
-    except StateError as exc:
-        raise IntakeStateError(
-            f"existing intake record is unreadable ({type(exc).__name__})"
-        ) from exc
-    stored = _record_from_state(existing, record["submission_id"])
+    stored = _read_record(intake_dir(env), submission_id + ".json", submission_id)
+    if stored is None:
+        raise IntakeUnavailable("existing intake record disappeared before read")
     if stored["fingerprint"] == record["fingerprint"]:
         return _admission("DUPLICATE", stored)
     raise IntakeConflict(
@@ -608,35 +885,37 @@ def list_submissions(
 ) -> list[dict[str, Any]]:
     """Public-safe metadata for every stored submission, oldest first.
 
-    A corrupt record raises rather than being skipped or read as absent.
+    An absent intake directory is an empty list. An existing but invalid path
+    -- a symlink, a non-directory or a foreign-owned directory -- raises, and a
+    corrupt record raises rather than being skipped or read as absent.
     """
 
     directory = intake_dir(env)
-    if not os.path.isdir(directory):
+    dir_fd = _open_dir_or_none(directory)
+    if dir_fd is None:
         return []
-    views: list[dict[str, Any]] = []
     try:
-        names: Sequence[str] = sorted(os.listdir(directory))
-    except OSError as exc:
-        raise IntakeUnavailable(
-            f"intake directory cannot be listed ({type(exc).__name__})"
-        ) from exc
-    for name in names:
-        if name.startswith(".") or not name.endswith(".json"):
-            continue
-        submission_id = name[: -len(".json")]
-        if len(submission_id) != 64 or any(ch not in _HEX for ch in submission_id):
-            raise IntakeStateError("intake directory holds an unexpected file")
-        path = os.path.join(directory, name)
         try:
-            data = read_state(path)
-        except StateError as exc:
-            raise IntakeStateError(
-                f"stored submission is unreadable ({type(exc).__name__})"
+            names: Sequence[str] = sorted(os.listdir(dir_fd))
+        except OSError as exc:
+            raise IntakeUnavailable(
+                f"intake directory cannot be listed ({type(exc).__name__})"
             ) from exc
-        if data is None:
-            continue
-        views.append(public_view(_record_from_state(data, submission_id)))
+        views: list[dict[str, Any]] = []
+        for name in names:
+            if name.startswith(".") or not name.endswith(".json"):
+                continue
+            submission_id = name[: -len(".json")]
+            if len(submission_id) != 64 or any(
+                ch not in _HEX for ch in submission_id
+            ):
+                raise IntakeStateError("intake directory holds an unexpected file")
+            data = _read_record_data_at(dir_fd, name)
+            if data is None:
+                continue
+            views.append(public_view(_record_from_state(data, submission_id)))
+    finally:
+        os.close(dir_fd)
     views.sort(key=lambda view: (view["admitted_at"], view["submission_id"]))
     return views
 
@@ -648,12 +927,7 @@ def read_submission(
     """Read one full submission record, or fail closed."""
 
     sid = _record_id(submission_id)
-    try:
-        data = read_state(submission_path(sid, env))
-    except StateError as exc:
-        raise IntakeStateError(
-            f"stored submission is unreadable ({type(exc).__name__})"
-        ) from exc
-    if data is None:
+    record = _read_record(intake_dir(env), sid + ".json", sid)
+    if record is None:
         raise IntakeUnavailable("no submission with that id")
-    return _record_from_state(data, sid)
+    return record

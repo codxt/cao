@@ -233,6 +233,24 @@ class ContractBoundaryTests(unittest.TestCase):
         self.assertEqual(PluginRegistry.discover(entry_points=[]).ids(), ())
 
 
+class IntakeStrictnessBoundaryTests(unittest.TestCase):
+    """F1 boundary: intake records are read through intake's own strict reader.
+
+    ``cao.state.read_state`` accepts duplicate JSON keys, so intake must not
+    route durable records through it. A regression to the permissive reader
+    would silently accept a tampered or ambiguous record.
+    """
+
+    def test_intake_does_not_import_the_permissive_state_reader(self) -> None:
+        imports = _imports(CAO_ROOT / "intake.py")
+        self.assertNotIn("state", imports)
+        self.assertNotIn("cao.state", imports)
+
+    def test_intake_source_has_no_permissive_state_fallback(self) -> None:
+        text = (CAO_ROOT / "intake.py").read_text(encoding="utf-8")
+        self.assertNotIn("read_state", text)
+
+
 class RecursiveGuardTests(unittest.TestCase):
     """Proof that the guards genuinely cover nested core modules.
 
