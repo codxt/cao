@@ -35,7 +35,12 @@ a Work Registry claim:
   across processes and restarts. There is no in-memory cache.
 - Directories are `0700` and files `0600`. Only the leaf is created by
   `makedirs`, so the CAO state root above the intake directory is hardened to
-  `0700` explicitly as well.
+  `0700` explicitly as well. Every directory actually created on first submit
+  (the CAO state root and the intake directory, and any missing ancestor) has
+  its **parent** directory fsynced, so a newly created name cannot be lost by a
+  crash before an admission is acknowledged. A directory that already exists is
+  left alone, so a submit that finds its directories already present performs no
+  ancestry sync at all.
 - A record is written to a private temp file, fsynced, then hard-linked into
   place and the containing directory fsynced **before** the admission is
   acknowledged. `os.link` is atomic and fails closed on an existing path, so
@@ -43,7 +48,16 @@ a Work Registry claim:
   record. A failure after the link is never acknowledged; an honest retry finds
   the record and reconciles it as a duplicate, and that duplicate path also
   syncs the directory (propagating a sync failure) so a link that is not yet
-  durable is never acknowledged.
+  durable is never acknowledged. A failure to sync any required created ancestry
+  likewise refuses the admission rather than acknowledging it.
+- The whole write is descriptor-relative. After the CAO state root and the
+  intake directory are validated, their descriptors are **pinned**: the temp
+  file is created, the record is hard-linked, the temp file is cleaned up and
+  the record is read back all relative to the validated intake descriptor, and
+  the containing directory is fsynced through that same descriptor. A same-user
+  process that swaps a path component for a symlink after validation therefore
+  cannot redirect a complete record into a substitute tree, and cannot make a
+  read-back agree with a record it never validated.
 - Records are read through a strict, bounded reader that refuses duplicate JSON
   keys and non-finite numbers, and that re-derives the id and content
   fingerprint from the stored bytes. `submission_id` must equal
@@ -234,7 +248,8 @@ transport rather than silently missing; no half-working adapter is registered.
 
 `tests/test_intake.py` (admission, idempotency, conflict, corruption,
 concurrency, redaction, strict input, CLI, stored-record tamper detection,
-private-path safety, list-absence handling and fsync durability) and
+private-path safety, list-absence handling, directory-ancestry durability and
+post-validation parent-substitution refusal) and
 `tests/test_intake_bridge.py` (end-to-end stdin admission, retries and
 reconciliation, collision, injection inertness, fail-closed
 unsupported/deferred transports and transport-before-input ordering) are the

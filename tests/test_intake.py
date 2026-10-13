@@ -831,6 +831,149 @@ class DurabilityTests(_StateFixture):
         self.assertEqual(len(intake.list_submissions(self.env)), 1)
 
 
+class AncestryDurabilityTests(_StateFixture):
+    """F1: every directory created on first submit has its parent entry fsynced
+    before an admission is acknowledged, and a failure to sync a required
+    ancestor never acknowledges durable success."""
+
+    def test_created_ancestry_is_fsynced_before_the_record_link(self) -> None:
+        # Pre-create the XDG state root so exactly the two CAO-owned directories
+        # (the CAO state dir and the intake dir) are created by the submit.
+        Path(self.env["XDG_STATE_HOME"]).mkdir(parents=True)
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_link = os.link
+
+        def fsync(fd: int) -> None:
+            kind = "dir-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync"
+            events.append(kind)
+            real_fsync(fd)
+
+        def link(src, dst, **kwargs):
+            events.append("link")
+            return real_link(src, dst, **kwargs)
+
+        with mock.patch("os.fsync", side_effect=fsync):
+            with mock.patch("os.link", side_effect=link):
+                result = intake.submit(_doc(), env=self.env)
+
+        self.assertEqual(result["status"], "ADMITTED")
+        link_at = events.index("link")
+        # Both newly created directories have their parent entry fsynced before
+        # the record is linked into place.
+        self.assertEqual(events[:link_at].count("dir-fsync"), 2)
+
+    def test_ancestry_fsync_failure_refuses_before_any_record(self) -> None:
+        real_fsync = os.fsync
+        state = {"fail": True}
+
+        def flaky(fd: int) -> None:
+            if state["fail"] and stat.S_ISDIR(os.fstat(fd).st_mode):
+                state["fail"] = False
+                raise OSError("simulated ancestry fsync failure")
+            real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=flaky):
+            with self.assertRaises(intake.IntakeUnavailable):
+                intake.submit(_doc(), env=self.env)
+
+        # The refusal hit an ancestry sync before the record was linked, so
+        # nothing was admitted: an unsynced ancestry never yields a durable
+        # acknowledgement.
+        self.assertEqual(intake.list_submissions(self.env), [])
+        retry = intake.submit(_doc(), env=self.env)
+        self.assertEqual(retry["status"], "ADMITTED")
+        self.assertEqual(len(intake.list_submissions(self.env)), 1)
+
+    def test_existing_ancestry_is_not_resynced(self) -> None:
+        intake.submit(_doc(), env=self.env)
+        real_fsync = os.fsync
+        dir_syncs = {"n": 0}
+
+        def counting(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                dir_syncs["n"] += 1
+            real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=counting):
+            duplicate = intake.submit(_doc(), env=self.env)
+
+        self.assertEqual(duplicate["status"], "DUPLICATE")
+        # Only the leaf directory is synced on the duplicate path; the already
+        # existing ancestry is not re-synced.
+        self.assertEqual(dir_syncs["n"], 1)
+
+
+class ParentSubstitutionTests(_StateFixture):
+    """F2: after a path has been validated, a same-user swap of a parent path
+    component must not redirect a record into a substitute tree. The write,
+    the link, the cleanup and the read-back all use the validated descriptor."""
+
+    def _substitute(self) -> Path:
+        substitute = Path(self._temp.name) / "substitute"
+        (substitute / "intake").mkdir(parents=True, exist_ok=True)
+        os.chmod(substitute, 0o700)
+        os.chmod(substitute / "intake", 0o700)
+        return substitute
+
+    def _submit_with_swap(self, swap) -> dict:
+        real_open = os.open
+        state = {"swapped": False}
+
+        def swapping_open(path, flags, *args, **kwargs):
+            # Swap the validated path component at the moment the private temp
+            # record is created -- after validation, before the write lands.
+            if (
+                not state["swapped"]
+                and ".intake-" in os.fspath(path)
+                and flags & os.O_CREAT
+            ):
+                state["swapped"] = True
+                swap()
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=swapping_open):
+            try:
+                result = intake.submit(_doc(body="private body"), env=self.env)
+            except intake.IntakeError as exc:
+                result = exc
+        self.assertTrue(state["swapped"], "the temp-file creation was not intercepted")
+        return result
+
+    def test_swapped_cao_parent_receives_no_record(self) -> None:
+        substitute = self._substitute()
+        cao = self.state_root
+        moved = Path(self._temp.name) / "cao-moved"
+
+        result = self._submit_with_swap(
+            lambda: (os.rename(cao, moved), os.symlink(substitute, cao))
+        )
+
+        # The substituted tree must never receive the record.
+        self.assertEqual(list(substitute.rglob("*.json")), [])
+        self.assertIsInstance(result, dict, f"submit failed: {result!r}")
+        self.assertEqual(result["status"], "ADMITTED")
+        sid = result["submission"]["submission_id"]
+        # The record lives in the directory that was actually validated, under
+        # its new name, and the admission is therefore real, not false.
+        self.assertTrue((moved / "intake" / (sid + ".json")).is_file())
+
+    def test_swapped_intake_leaf_receives_no_record(self) -> None:
+        substitute = self._substitute()
+        leaf = Path(intake.intake_dir(self.env))
+        moved = Path(self._temp.name) / "intake-moved"
+
+        result = self._submit_with_swap(
+            lambda: (os.rename(leaf, moved), os.symlink(substitute / "intake", leaf))
+        )
+
+        self.assertEqual(list(substitute.rglob("*.json")), [])
+        self.assertIsInstance(result, dict, f"submit failed: {result!r}")
+        self.assertEqual(result["status"], "ADMITTED")
+        sid = result["submission"]["submission_id"]
+        self.assertTrue((moved / (sid + ".json")).is_file())
+
+
 class CliTests(_StateFixture):
     def _run(self, argv: list[str]) -> tuple[int, dict]:
         stream = io.StringIO()

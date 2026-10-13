@@ -37,7 +37,6 @@ import json
 import os
 import re
 import stat
-import tempfile
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -514,12 +513,29 @@ def _dir_open_flags() -> int:
     )
 
 
-def _harden_owned_dir(directory: str) -> None:
-    """Require ``directory`` to be a real ``0700`` directory owned by this user.
+def _validate_owned_dir(fd: int, what: str) -> None:
+    """Require an open descriptor to be a real ``0700`` directory owned by us.
 
-    The directory is opened with ``O_NOFOLLOW``/``O_DIRECTORY`` and hardened
-    through the descriptor, so a symlink or a non-directory cannot be followed
-    and a directory owned by someone else is never chmod'ed through.
+    Validation is done through the descriptor, so a symlink or a non-directory
+    cannot be followed and a directory owned by someone else is never
+    chmod'ed through. A directory with the wrong mode is hardened in place.
+    """
+
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise IntakeUnavailable(f"{what} is not a real directory")
+    if info.st_uid != os.getuid():
+        raise IntakeUnavailable(f"{what} is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.fchmod(fd, 0o700)
+
+
+def _open_owned_dir(directory: str) -> int:
+    """Open ``directory`` no-follow and require an owned ``0700`` directory.
+
+    The descriptor is returned open: the caller pins it so every later
+    operation is relative to the validated directory, not a path that a
+    same-user process could swap after validation.
     """
 
     try:
@@ -529,99 +545,200 @@ def _harden_owned_dir(directory: str) -> None:
             f"intake directory is not usable ({type(exc).__name__})"
         ) from exc
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISDIR(info.st_mode):
-            raise IntakeUnavailable("intake directory is not a real directory")
-        if info.st_uid != os.getuid():
-            raise IntakeUnavailable("intake directory is not owned by this user")
-        if stat.S_IMODE(info.st_mode) != 0o700:
-            os.fchmod(fd, 0o700)
+        _validate_owned_dir(fd, "intake directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fsync_fd(fd: int) -> None:
+    """Fsync a descriptor; a durability failure is never swallowed."""
+
+    os.fsync(fd)
+
+
+def _fsync_dir(dir_fd: int) -> None:
+    """Fsync the pinned directory descriptor that received a just-linked record.
+
+    The descriptor is fsynced directly, so the directory that actually received
+    the name is the directory that is synced, never a path re-resolved after
+    validation.
+    """
+
+    _fsync_fd(dir_fd)
+
+
+def _fsync_parent_entry(directory: str) -> None:
+    """Fsync the directory holding ``directory`` so its name is durable."""
+
+    parent = os.path.dirname(directory) or "."
+    try:
+        fd = os.open(parent, _dir_open_flags())
     except OSError as exc:
         raise IntakeUnavailable(
-            f"intake directory is not usable ({type(exc).__name__})"
+            f"intake directory ancestry is not usable "
+            f"({type(exc).__name__})"
+        ) from exc
+    try:
+        _fsync_fd(fd)
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"intake directory ancestry is not durable ({type(exc).__name__})"
         ) from exc
     finally:
         os.close(fd)
 
 
-def _ensure_private_dir(directory: str) -> None:
-    """Create and harden the private intake directory and its CAO state parent.
+def _create_owned_dir_chain(directory: str) -> None:
+    """Create ``directory`` and its missing ancestors, making each name durable.
 
-    ``os.makedirs`` applies ``mode`` only to the leaf it creates, so the CAO
-    state root above the intake directory is created and hardened too: a
-    private intake dir under a readable parent still leaks the submission ids in
-    its listing. Both directories are validated as real, owned ``0700``
-    directories, so a symlinked or foreign path is refused rather than followed.
+    ``os.makedirs`` modes only the leaf it creates, so every component that is
+    actually created has its parent directory fsynced: a newly created name
+    cannot be lost by a crash before an admission is acknowledged. A component
+    that already exists is left alone, so a submit that finds its directories
+    already present performs no ancestry sync at all.
     """
 
-    parent = os.path.dirname(directory)
-    if parent:
+    missing: list[str] = []
+    current = directory
+    while current:
+        if os.path.isdir(current):
+            break
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        current = parent
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"intake directory is not usable ({type(exc).__name__})"
+        ) from exc
+    for created in reversed(missing):
+        _fsync_parent_entry(created)
+
+
+def _open_or_create_owned_dir_at(parent_fd: int, name: str) -> int:
+    """Open or create an owned ``0700`` directory relative to ``parent_fd``.
+
+    The open is descriptor-relative with ``O_NOFOLLOW``, so a component swapped
+    for a symlink after validation cannot be followed. When the directory is
+    created, its parent descriptor is fsynced before the caller writes anything
+    into it, so the new name is durable before an admission is acknowledged.
+    """
+
+    try:
+        fd = os.open(name, _dir_open_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        created = False
         try:
-            os.makedirs(parent, mode=0o700, exist_ok=True)
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
         except OSError as exc:
             raise IntakeUnavailable(
                 f"intake directory is not usable ({type(exc).__name__})"
             ) from exc
-        _harden_owned_dir(parent)
-    try:
-        os.mkdir(directory, mode=0o700)
-    except FileExistsError:
-        pass
+        if created:
+            try:
+                _fsync_fd(parent_fd)
+            except OSError as exc:
+                raise IntakeUnavailable(
+                    f"intake directory ancestry is not durable "
+                    f"({type(exc).__name__})"
+                ) from exc
+        try:
+            fd = os.open(name, _dir_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise IntakeUnavailable(
+                f"intake directory is not usable ({type(exc).__name__})"
+            ) from exc
     except OSError as exc:
         raise IntakeUnavailable(
             f"intake directory is not usable ({type(exc).__name__})"
         ) from exc
-    _harden_owned_dir(directory)
-
-
-def _fsync_dir(directory: str) -> None:
-    """Fsync a directory so a just-linked name survives a crash."""
-
-    fd = os.open(directory, _dir_open_flags())
     try:
-        os.fsync(fd)
-    finally:
+        _validate_owned_dir(fd, "intake directory")
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
 
 
-def _atomic_create(path: str, text: str) -> bool:
-    """Create ``path`` with ``text`` atomically, or report it already exists.
+def _open_intake_dir_creating(directory: str) -> int:
+    """Open the private intake directory, creating it and its CAO parent.
 
-    The content is written and fsynced to a private ``0600`` temp file first,
-    then hard-linked into place and the containing directory fsynced.
-    ``os.link`` is atomic and fails closed on an existing path, so two
-    concurrent submitters can never overwrite each other and a partial write is
-    never visible at ``path``. The directory fsync happens before this returns
-    ``True``, so the caller only acknowledges an admission after the name is
-    durable; a failure here raises, and an honest retry finds the record and
-    reconciles it as a duplicate.
+    Every missing component is created ``0700`` and every newly created
+    component's parent is fsynced before any record is acknowledged, so an
+    admission never precedes the durability of the directories it lives in. The
+    CAO state root and the intake directory are opened with ``O_NOFOLLOW`` and
+    required to be real, owned ``0700`` directories. The returned intake
+    descriptor is pinned and used for the record write, link and read-back, so a
+    same-user process that swaps a path component after validation cannot
+    redirect a complete record into a substitute tree.
     """
 
-    directory = os.path.dirname(path)
-    _ensure_private_dir(directory)
-    fd, temp = tempfile.mkstemp(prefix=".intake-", suffix=".tmp", dir=directory)
+    root = os.path.dirname(directory)
+    leaf = os.path.basename(directory)
+    if not root or not leaf:
+        raise IntakeUnavailable("intake directory has no CAO state root")
+    _create_owned_dir_chain(root)
+    root_fd = _open_owned_dir(root)
+    try:
+        leaf_fd = _open_or_create_owned_dir_at(root_fd, leaf)
+    finally:
+        os.close(root_fd)
+    return leaf_fd
+
+
+def _atomic_create_at(dir_fd: int, name: str, text: str) -> bool:
+    """Create ``name`` under pinned ``dir_fd`` with ``text``, atomically.
+
+    The content is written and fsynced to a private ``0600`` temp file created
+    relative to ``dir_fd``, then hard-linked into place relative to the same
+    descriptor and the descriptor fsynced. ``os.link`` is atomic and fails
+    closed on an existing name, so two concurrent submitters can never
+    overwrite each other and a partial write is never visible. The directory
+    fsync happens before this returns ``True``, so the caller only acknowledges
+    an admission after the name is durable; a failure here raises, and an honest
+    retry finds the record and reconciles it as a duplicate. Every operation is
+    relative to the already-validated descriptor, so a path swapped after
+    validation can never receive the record.
+    """
+
+    temp = ".intake-" + os.urandom(8).hex() + ".tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(temp, flags, 0o600, dir_fd=dir_fd)
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"intake record could not be written ({type(exc).__name__})"
+        ) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
-            os.fsync(handle.fileno())
+            _fsync_fd(handle.fileno())
         try:
-            os.link(temp, path)
+            os.link(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileExistsError:
             # The record already exists, so this is the duplicate/retry path.
             # The link that created it may still be un-durable, so the
             # containing directory is synced here too and a failure propagates
             # rather than acknowledging a duplicate that might not survive.
-            _fsync_dir(directory)
+            _fsync_dir(dir_fd)
             return False
-        _fsync_dir(directory)
+        _fsync_dir(dir_fd)
     except OSError as exc:
         raise IntakeUnavailable(
             f"intake record could not be written ({type(exc).__name__})"
         ) from exc
     finally:
         try:
-            os.unlink(temp)
+            os.unlink(temp, dir_fd=dir_fd)
         except OSError:
             pass
     return True
@@ -912,21 +1029,29 @@ def submit(
 
     record = normalize_submission(document, clock=clock)
     submission_id = record["submission_id"]
-    path = submission_path(submission_id, env)
+    name = submission_id + ".json"
     payload = json.dumps(
         record, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False
     )
-    if _atomic_create(path, payload):
-        readback = _read_record(
-            intake_dir(env), submission_id + ".json", submission_id
-        )
-        if readback != record:
+    # One validated descriptor carries the whole write: the record is created,
+    # linked and read back relative to it, so a path component swapped after
+    # validation can neither receive the record nor make the read-back agree.
+    dir_fd = _open_intake_dir_creating(intake_dir(env))
+    try:
+        created = _atomic_create_at(dir_fd, name, payload)
+        data = _read_record_data_at(dir_fd, name)
+    finally:
+        os.close(dir_fd)
+    if created:
+        if data is None:
+            raise IntakeStateError("intake record failed its read-back check")
+        stored = _record_from_state(data, submission_id)
+        if stored != record:
             raise IntakeStateError("intake record failed its read-back check")
         return _admission("ADMITTED", record)
-
-    stored = _read_record(intake_dir(env), submission_id + ".json", submission_id)
-    if stored is None:
+    if data is None:
         raise IntakeUnavailable("existing intake record disappeared before read")
+    stored = _record_from_state(data, submission_id)
     if stored["fingerprint"] == record["fingerprint"]:
         return _admission("DUPLICATE", stored)
     raise IntakeConflict(
