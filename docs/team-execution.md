@@ -198,9 +198,12 @@ security, operating state and authorization.
 ## Parallelism, privacy and authority
 
 max_parallel bounds active agents for one team (default 4, hard maximum 8).
-max_writers bounds total active WRITE claims observed in the same authoritative
-Work Registry (default and hard maximum 2). READ tasks consume no writer slots.
-Existing WRITE claims count; an EXCLUSIVE claim refuses team dispatch.
+max_writers bounds this team's **own** simultaneous WRITE slots (default and
+hard maximum 2), counting a durable WRITE intent from the moment it is
+dispatched, before its first Registry claim exists. READ tasks and reviews
+consume no writer slots. Foreign WRITE claims from other CAO teams or non-team
+claimers do **not** consume this team's writer cap; they are still honoured as
+checkout conflicts, and an EXCLUSIVE claim refuses team dispatch outright.
 The global CAO team lock serializes admissions; live Registry preflight and
 atomic claim still decide actual repository/path/branch permission. Separate
 Git worktrees are required for truly independent concurrent writers. Do not

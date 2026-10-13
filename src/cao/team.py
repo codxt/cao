@@ -1222,7 +1222,10 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
         halted = any(s["status"] in ("blocked", "unknown") for s in slots.values())
         running = [t for t in spec["tasks"] if slots[t["id"]]["status"] == "running"]
         pending = [t for t in spec["tasks"] if slots[t["id"]]["status"] == "pending"]
-        # An injected occupancy reader can be stale between consecutive starts.
+        # This team's own WRITE slots, counted from dispatch so a durable
+        # intent-only slot (dispatched, but with no claim yet) still consumes
+        # a writer slot. max_writers bounds THIS team; foreign Registry
+        # writers are honoured separately as checkout conflicts below.
         reserved_floor = sum(
             slots[t["id"]]["status"] == "running"
             and slots[t["id"]]["phase"] != "review" and t["mode"] == "write"
@@ -1291,14 +1294,15 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                         ):
                             continue
                         try:
-                            n, working = occupancy(db)
+                            _, working = occupancy(db)
                         except TeamError:
                             slot["error"] = "REGISTRY_OCCUPANCY_UNKNOWN"
                             _save(record, env)
                             continue
-                        n = max(n, reserved_floor)
-                        reserved_floor = n
-                        if n >= spec["max_writers"] or same_checkout in working:
+                        # Only this team's own WRITE slots consume its cap;
+                        # foreign writers remain a checkout conflict.
+                        if (reserved_floor >= spec["max_writers"]
+                                or same_checkout in working):
                             continue
                     # Only a genuinely dispatchable task needs a routing
                     # check. A capacity-blocked slot keeps its earlier error.
@@ -1357,15 +1361,16 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                             _save(record, env)
                         if task["mode"] == "write" and slot["phase"] != "review":
                             try:
-                                n, working = occupancy(db)
+                                _, working = occupancy(db)
                             except TeamError:
                                 slot["error"] = "REGISTRY_OCCUPANCY_UNKNOWN"
                                 _save(record, env)
                                 continue
-                            # The RUNNING slot counted itself in the
+                            # The RUNNING slot counted itself in this team's
                             # reserved floor, but has no claim yet. Exclude
-                            # that one intent, retaining all other writers.
-                            if (max(n, reserved_floor - 1) >= spec["max_writers"]
+                            # only that one intent so the team cap counts the
+                            # team's other WRITE slots, not foreign writers.
+                            if (reserved_floor - 1 >= spec["max_writers"]
                                     or os.path.realpath(task["repo"]) in working):
                                 continue
                     if slot["status"] == "running":

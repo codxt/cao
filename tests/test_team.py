@@ -436,7 +436,7 @@ class TeamTests(unittest.TestCase):
         self.assertIn("Dependency build accepted at " + A, calls[-1][2])
         self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
 
-    def test_global_two_writer_cap_even_with_stale_snapshot(self):
+    def test_team_local_two_writer_cap_across_ticks(self):
         spec = self.spec([task("a", self.paths[0]), task("b", self.paths[1]),
                           task("c", self.paths[2])])
         self.init(spec)
@@ -448,11 +448,31 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(len(started), 2)
         s = team.status("squad", env=self.env)
         self.assertEqual(s["tasks"]["c"]["status"], "pending")
+        # The next tick reconciles a and b but still holds c: this team's own
+        # two running WRITE slots already fill max_writers, independent of the
+        # (here stale) shared Registry count.
         self.tick(fake)
         self.assertEqual(len(started), 4)
         self.assertEqual(team.status("squad", env=self.env)["tasks"]["c"]["status"], "pending")
 
-    def test_external_writer_cap_and_read_bypass(self):
+    def test_team_local_one_writer_cap_holds_second_across_ticks(self):
+        spec = self.spec([task("a", self.paths[0]), task("b", self.paths[1])],
+                         max_writers=1)
+        self.init(spec)
+        started = []
+        def fake(**kwargs):
+            started.append(kwargs["task"]["id"])
+            return {"status": "running"}
+        self.tick(fake, writers=3)
+        self.assertEqual(started, ["a"])
+        self.tick(fake, writers=3)
+        self.assertEqual(started, ["a", "a"])
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["b"]["status"], "pending")
+
+    def test_foreign_writes_do_not_consume_team_writer_cap(self):
+        # max_writers bounds THIS team's simultaneous WRITE slots only. Two
+        # unrelated worktrees held by other claimants are foreign occupancy:
+        # they must not block this team's own writer cap of one.
         spec = self.spec([task("a", self.paths[0]), task("read", self.paths[1], mode="read")],
                          max_writers=1)
         self.init(spec)
@@ -460,9 +480,9 @@ class TeamTests(unittest.TestCase):
         def fake(**kwargs):
             started.append(kwargs["task"]["id"])
             return self.done()
-        self.tick(fake, writers=1)
-        self.assertEqual(started, ["read"])
-        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"], "pending")
+        self.tick(fake, writers=2)
+        self.assertEqual(started, ["a", "read"])
+        self.assertEqual(team.status("squad", env=self.env)["status"], "COMPLETE")
 
     def test_same_checkout_not_dispatched_alongside_existing_write(self):
         self.init(self.spec([task("a", self.paths[0])]))
@@ -1785,12 +1805,12 @@ class TeamTests(unittest.TestCase):
 
     def test_registry_failure_on_pending_does_not_skip_running_sibling(self):
         self.init(self.spec([task("a", self.paths[0]), task("b", self.paths[1])],
-                            max_writers=2))
+                            max_writers=1))
         calls = []
         def fake(**kw):
             calls.append(kw["task"]["id"])
             return self.done() if len(calls) > 1 else {"status": "running"}
-        self.tick(fake, writers=1)
+        self.tick(fake)
         self.assertEqual(calls, ["a"])
         result = team.tick("squad", config=self.config, driver=None,
                            env=self.env, execute=fake,
@@ -1883,22 +1903,53 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(team.validate_spec(spec)["roles"]["developer"]["model"],
                          "opencode/step-5-preview-free#xhigh")
 
-    def test_resume_after_checkpoint_before_claim_respects_external_cap(self):
-        self.init(self.spec([task("a", self.paths[0])]))
+    def test_checkpoint_before_claim_respects_team_writer_cap(self):
+        self.init(self.spec([task("a", self.paths[0]), task("b", self.paths[1])],
+                            max_writers=1))
         p = Path(team.team_path("squad", self.env))
         data = json.loads(p.read_text())
-        data["slots"]["a"].update(
-            status="running", execution_id=team._execution_id("squad", "a", "work", 0),
-            prompt="Previously checkpointed exact user task")
+        for name in ("a", "b"):
+            data["slots"][name].update(
+                status="running",
+                execution_id=team._execution_id("squad", name, "work", 0),
+                prompt="Previously checkpointed exact user task")
         p.write_text(json.dumps(data))
-        # No product_task record exists yet. Even though the slot is RUNNING,
-        # cap admission must be checked before first real task effect.
+        # No product_task record exists for either slot. Both are this team's
+        # own durable WRITE intents, so max_writers=1 admits neither first
+        # claim even though the shared Registry is otherwise empty: the bound
+        # is the team's own reserved floor, not the global writer count.
         result = team.tick("squad", config=self.config, driver=None,
-                           env=self.env, writer_snapshot=lambda _: (2, set()),
+                           env=self.env, writer_snapshot=lambda _: (0, set()),
                            registry_db="unused")
-        self.assertEqual(result["tasks"]["a"]["status"], "running")
-        self.assertFalse(Path(product_state.task_record_path(
-            data["slots"]["a"]["execution_id"], self.env)).exists())
+        for name in ("a", "b"):
+            self.assertEqual(result["tasks"][name]["status"], "running")
+            self.assertFalse(Path(product_state.task_record_path(
+                data["slots"][name]["execution_id"], self.env)).exists())
+
+    def test_exclusive_registry_claim_refuses_team_dispatch(self):
+        self.init(self.spec([task("a", self.paths[0])], max_writers=1))
+        db = str(self.root / "exclusive-registry.sqlite3")
+        registry.connect(db).close()
+        conn = registry.connect(db)
+        try:
+            registry.propose(conn, "other-run", "other-work", self.paths[1],
+                             paths=["a.txt"])
+            conn.execute(
+                "INSERT INTO claims (run_id, work_key, issue, owner, mode, "
+                "branch, worktree, claimed_at) VALUES (?,?,?,?,?,?,?,?)",
+                ("other-run", "other-work", "", "other-owner", "EXCLUSIVE",
+                 "", "", registry.now()),
+            )
+        finally:
+            conn.close()
+        called = []
+        result = team.tick(
+            "squad", config=self.config, driver=None, env=self.env,
+            execute=lambda **kw: called.append(kw),
+            registry_db=db, writer_snapshot=team._active_writes)
+        self.assertEqual(called, [])
+        self.assertEqual(result["tasks"]["a"]["status"], "pending")
+        self.assertEqual(result["tasks"]["a"]["error"], "REGISTRY_OCCUPANCY_UNKNOWN")
 
     def test_real_git_correction_uses_exact_verified_registry_history(self):
         repo = git_repo(self.root, name="correctable", files=("a.txt",))
