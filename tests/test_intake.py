@@ -885,23 +885,94 @@ class AncestryDurabilityTests(_StateFixture):
         self.assertEqual(retry["status"], "ADMITTED")
         self.assertEqual(len(intake.list_submissions(self.env)), 1)
 
-    def test_existing_ancestry_is_not_resynced(self) -> None:
+    def test_existing_ancestry_is_resynced_before_acknowledging(self) -> None:
         intake.submit(_doc(), env=self.env)
+        state_home = Path(self.env["XDG_STATE_HOME"])
         real_fsync = os.fsync
-        dir_syncs = {"n": 0}
+        synced: list[tuple[int, int]] = []
 
         def counting(fd: int) -> None:
-            if stat.S_ISDIR(os.fstat(fd).st_mode):
-                dir_syncs["n"] += 1
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                synced.append((info.st_dev, info.st_ino))
             real_fsync(fd)
 
         with mock.patch("os.fsync", side_effect=counting):
             duplicate = intake.submit(_doc(), env=self.env)
 
         self.assertEqual(duplicate["status"], "DUPLICATE")
-        # Only the leaf directory is synced on the duplicate path; the already
-        # existing ancestry is not re-synced.
-        self.assertEqual(dir_syncs["n"], 1)
+        # A directory that already exists is still re-synced: an earlier
+        # attempt may have created it and then failed its parent sync, so a
+        # present name is not by itself evidence of durability. Both the CAO
+        # state root entry (in the state home) and the intake entry (in the CAO
+        # root) are synced before the duplicate is acknowledged.
+        self.assertIn(
+            (state_home.stat().st_dev, state_home.stat().st_ino), synced
+        )
+        self.assertIn(
+            (self.state_root.stat().st_dev, self.state_root.stat().st_ino),
+            synced,
+        )
+
+
+class AncestryFsyncRetryTests(_StateFixture):
+    """A persistent ancestor fsync failure must never yield a durable-looking
+    acknowledgement -- not on the first submit, and not on any retry.
+
+    On the first submit the CAO-owned directory is created and its parent sync
+    fails, so the submit refuses. On the retry the directory now exists, so the
+    only thing that can prove its name durable is re-syncing its parent; the
+    bug skipped that sync whenever the directory was already present and
+    acknowledged an admission into a directory a crash could still lose. With
+    the sync restored the honest retry reconciles to exactly one record.
+    """
+
+    def _persistent_failure_for(self, target: Path):
+        real_fsync = os.fsync
+
+        def flaky(fd: int) -> None:
+            try:
+                info = os.fstat(fd)
+                target_info = target.stat()
+            except OSError:
+                return real_fsync(fd)
+            if (
+                stat.S_ISDIR(info.st_mode)
+                and (info.st_dev, info.st_ino)
+                == (target_info.st_dev, target_info.st_ino)
+            ):
+                raise OSError("simulated persistent ancestor fsync failure")
+            return real_fsync(fd)
+
+        return flaky
+
+    def _assert_never_acks_while_failing(self, target: Path) -> None:
+        Path(self.env["XDG_STATE_HOME"]).mkdir(parents=True, exist_ok=True)
+        with mock.patch(
+            "os.fsync", side_effect=self._persistent_failure_for(target)
+        ):
+            for _ in range(3):
+                with self.assertRaises(intake.IntakeUnavailable):
+                    intake.submit(_doc(), env=self.env)
+        # Nothing was acknowledged while the ancestry could not be proven
+        # durable, so there is no admission to read back.
+        self.assertEqual(intake.list_submissions(self.env), [])
+        # With the sync restored, the retry reconciles to one honest record.
+        restored = intake.submit(_doc(), env=self.env)
+        self.assertEqual(restored["status"], "ADMITTED")
+        self.assertEqual(len(intake.list_submissions(self.env)), 1)
+
+    def test_persistent_failure_to_sync_the_cao_root_never_acknowledges(
+        self,
+    ) -> None:
+        # The CAO root's own name lives in the XDG state home.
+        self._assert_never_acks_while_failing(Path(self.env["XDG_STATE_HOME"]))
+
+    def test_persistent_failure_to_sync_the_intake_dir_never_acknowledges(
+        self,
+    ) -> None:
+        # The intake directory's own name lives in the CAO root.
+        self._assert_never_acks_while_failing(self.state_root)
 
 
 class ParentSubstitutionTests(_StateFixture):

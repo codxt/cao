@@ -38,9 +38,18 @@ a Work Registry claim:
   `0700` explicitly as well. Every directory actually created on first submit
   (the CAO state root and the intake directory, and any missing ancestor) has
   its **parent** directory fsynced, so a newly created name cannot be lost by a
-  crash before an admission is acknowledged. A directory that already exists is
-  left alone, so a submit that finds its directories already present performs no
-  ancestry sync at all.
+  crash before an admission is acknowledged.
+- The CAO state root and the intake directory have their **parent** directory
+  fsynced on **every** acknowledgement, whether or not this submit created them.
+  A present name is not by itself evidence of durability: an earlier attempt can
+  create the directory and then fail that exact sync, so a retry that skipped the
+  sync whenever the directory already existed would acknowledge an admission
+  into a directory a crash can still lose. Re-syncing the existing ancestor is
+  the durable evidence that the admitted path survives, and it needs no separate
+  pending-durability state that a process restart could drop. A failure to sync
+  the CAO-root entry or the intake entry therefore refuses the admission rather
+  than acknowledging it — on the first submit and on every retry, so a
+  persistent ancestry-sync failure never yields `ADMITTED` or `DUPLICATE`.
 - A record is written to a private temp file, fsynced, then hard-linked into
   place and the containing directory fsynced **before** the admission is
   acknowledged. `os.link` is atomic and fails closed on an existing path, so
@@ -48,8 +57,9 @@ a Work Registry claim:
   record. A failure after the link is never acknowledged; an honest retry finds
   the record and reconciles it as a duplicate, and that duplicate path also
   syncs the directory (propagating a sync failure) so a link that is not yet
-  durable is never acknowledged. A failure to sync any required created ancestry
-  likewise refuses the admission rather than acknowledging it.
+  durable is never acknowledged. A failure to sync any required ancestry —
+  created or already present — likewise refuses the admission rather than
+  acknowledging it, and an honest retry after the sync is restored reconciles.
 - The whole write is descriptor-relative. After the CAO state root and the
   intake directory are validated, their descriptors are **pinned**: the temp
   file is created, the record is hard-linked, the temp file is cleaned up and

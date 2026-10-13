@@ -595,9 +595,14 @@ def _create_owned_dir_chain(directory: str) -> None:
 
     ``os.makedirs`` modes only the leaf it creates, so every component that is
     actually created has its parent directory fsynced: a newly created name
-    cannot be lost by a crash before an admission is acknowledged. A component
-    that already exists is left alone, so a submit that finds its directories
-    already present performs no ancestry sync at all.
+    cannot be lost by a crash before an admission is acknowledged.
+
+    When the directory already exists its parent entry is fsynced too. A prior
+    attempt may have created the name and then failed this exact sync, so the
+    name is present on disk but not yet durable; treating a present name as
+    durable would acknowledge a record whose directory a crash can lose. The
+    re-sync is the durable evidence that the admitted path survives, and it
+    needs no separate pending-durability state that a restart could drop.
     """
 
     missing: list[str] = []
@@ -616,6 +621,9 @@ def _create_owned_dir_chain(directory: str) -> None:
         raise IntakeUnavailable(
             f"intake directory is not usable ({type(exc).__name__})"
         ) from exc
+    if not missing:
+        _fsync_parent_entry(directory)
+        return
     for created in reversed(missing):
         _fsync_parent_entry(created)
 
@@ -624,32 +632,27 @@ def _open_or_create_owned_dir_at(parent_fd: int, name: str) -> int:
     """Open or create an owned ``0700`` directory relative to ``parent_fd``.
 
     The open is descriptor-relative with ``O_NOFOLLOW``, so a component swapped
-    for a symlink after validation cannot be followed. When the directory is
-    created, its parent descriptor is fsynced before the caller writes anything
-    into it, so the new name is durable before an admission is acknowledged.
+    for a symlink after validation cannot be followed. The parent descriptor is
+    fsynced on **every** open -- created or not -- before the caller writes
+    anything into the directory. A prior attempt may have created the directory
+    and then failed this exact sync, leaving the name present but not yet
+    durable; skipping the sync because the name exists would acknowledge an
+    admission into a directory a crash can still lose. The re-sync is the
+    durable evidence that the admitted path survives, with no separate pending
+    state to record or lose.
     """
 
     try:
         fd = os.open(name, _dir_open_flags(), dir_fd=parent_fd)
     except FileNotFoundError:
-        created = False
         try:
             os.mkdir(name, 0o700, dir_fd=parent_fd)
-            created = True
         except FileExistsError:
             pass
         except OSError as exc:
             raise IntakeUnavailable(
                 f"intake directory is not usable ({type(exc).__name__})"
             ) from exc
-        if created:
-            try:
-                _fsync_fd(parent_fd)
-            except OSError as exc:
-                raise IntakeUnavailable(
-                    f"intake directory ancestry is not durable "
-                    f"({type(exc).__name__})"
-                ) from exc
         try:
             fd = os.open(name, _dir_open_flags(), dir_fd=parent_fd)
         except OSError as exc:
@@ -659,6 +662,14 @@ def _open_or_create_owned_dir_at(parent_fd: int, name: str) -> int:
     except OSError as exc:
         raise IntakeUnavailable(
             f"intake directory is not usable ({type(exc).__name__})"
+        ) from exc
+    try:
+        _fsync_fd(parent_fd)
+    except OSError as exc:
+        os.close(fd)
+        raise IntakeUnavailable(
+            f"intake directory ancestry is not durable "
+            f"({type(exc).__name__})"
         ) from exc
     try:
         _validate_owned_dir(fd, "intake directory")
