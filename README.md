@@ -202,7 +202,8 @@ than reimplementing any of their logic.
 See [`docs/architecture.md`](docs/architecture.md),
 [`docs/runtime-plugin.md`](docs/runtime-plugin.md),
 [`docs/operators.md`](docs/operators.md),
-[`docs/automations.md`](docs/automations.md), and
+[`docs/automations.md`](docs/automations.md),
+[`docs/intake.md`](docs/intake.md), and
 [`docs/extraction-provenance.md`](docs/extraction-provenance.md).
 
 ## Development and validation

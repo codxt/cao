@@ -62,7 +62,18 @@ UNAVAILABLE_SCHEMA = "cao.product.unavailable.v0"
 #: The command groups this product CLI answers itself. Anything else is owned by
 #: the read-only foundation CLI, which also owns ``run list`` ledger inspection.
 _PRODUCT_GROUPS = frozenset(
-    {"doctor", "status", "daemon", "team", "improve", "run", "start", "stop", "logs"}
+    {
+        "doctor",
+        "status",
+        "daemon",
+        "team",
+        "improve",
+        "intake",
+        "run",
+        "start",
+        "stop",
+        "logs",
+    }
 )
 
 
@@ -436,6 +447,12 @@ def build_parser() -> argparse.ArgumentParser:
     improvement_command.add_argument("args", nargs=argparse.REMAINDER)
     improvement_command.set_defaults(handler=_cmd_start)  # main dispatches separately
 
+    intake_command = subcommands.add_parser(
+        "intake", help="durable private intake admission (no execution)"
+    )
+    intake_command.add_argument("args", nargs=argparse.REMAINDER)
+    intake_command.set_defaults(handler=_cmd_start)  # main dispatches separately
+
     for name, help_text, handler in (
         ("run", "submit a task", _cmd_run),
         ("start", "start the service (unavailable in this build)", _cmd_start),
@@ -484,6 +501,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args_list and args_list[0] == "improve":
         from . import improvement_cli
         return improvement_cli.main(args_list[1:])
+    if args_list and args_list[0] == "intake":
+        from . import intake_cli
+        return intake_cli.main(args_list[1:])
 
     parser = build_parser()
     args = parser.parse_args(args_list)

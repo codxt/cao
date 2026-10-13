@@ -37,9 +37,43 @@ SEPARATION_RULES = {
         "cao.contracts",
     ),
     "contracts.py": ("runtime", "cao.runtime", "policy", "cao.policy", "state", "cao.state"),
+    # Intake admission is a private inbound gate: it must not reach execution,
+    # policy, the runtime contract or the Work Registry, so an admitted
+    # submission can never start, merge or claim anything.
+    "intake.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+        "registry",
+        "cao.registry",
+    ),
+    # The inbound bridge is the same private gate seen from the transport side:
+    # it admits data and nothing else, so it must not reach execution, policy,
+    # the runtime contract or the Work Registry either.
+    "intake_bridge.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+        "registry",
+        "cao.registry",
+    ),
 }
 
-PRIVATE_TOKENS = ("albr", "sentinelx", "/home/", "resident")
+PRIVATE_TOKENS = (
+    "albr",
+    "sentinelx",
+    "/home/",
+    "resident",
+    "brain",
+    "tolest",
+    "companyos",
+)
 
 
 def _python_files(root: Path = CAO_ROOT) -> list[Path]:
