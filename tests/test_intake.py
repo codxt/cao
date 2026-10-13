@@ -15,6 +15,8 @@ import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -281,6 +283,43 @@ class SecretHandlingTests(_StateFixture):
                 with self.assertRaises(intake.IntakeInvalid):
                     intake.submit(_doc(item_id=item_id), env=self.env)
 
+    def test_single_quoted_credential_keys_are_redacted_whole(self) -> None:
+        body = (
+            "{'password': 'synthetic quoted value'}\n"
+            "'token'='synthetic-token-value'\n"
+        )
+        stored = intake.read_submission(
+            intake.submit(_doc(body=body), env=self.env)["submission"][
+                "submission_id"
+            ],
+            self.env,
+        )
+        self.assertNotIn("synthetic quoted value", stored["body"])
+        self.assertNotIn("synthetic-token-value", stored["body"])
+        self.assertIn("[REDACTED]", stored["body"])
+
+    def test_single_quoted_credential_shaped_item_id_is_refused(self) -> None:
+        with self.assertRaises(intake.IntakeInvalid):
+            intake.submit(
+                _doc(item_id="'token'='synthetic-token-value'"), env=self.env
+            )
+
+    def test_public_view_never_carries_a_raw_credential(self) -> None:
+        secret = "synthetic-token-value"
+        result = intake.submit(
+            _doc(
+                title="'token'='%s'" % secret,
+                source="'password'='%s'" % secret,
+                evidence_refs=[{"ref": "'token'='%s'" % secret}],
+            ),
+            env=self.env,
+        )
+        record = intake.read_submission(
+            result["submission"]["submission_id"], self.env
+        )
+        self.assertNotIn(secret, json.dumps(intake.public_view(record)))
+        self.assertNotIn(secret, json.dumps(record))
+
 
 class StrictInputTests(_StateFixture):
     def _load(self, name: str, payload) -> dict:
@@ -465,6 +504,59 @@ class StoredRecordTamperTests(_StateFixture):
             intake.read_submission(self.sid, self.env)
 
 
+class EvidenceRefCanonicalTests(_StateFixture):
+    """Nested evidence refs must already be canonical in the stored bytes.
+
+    Canonicalizing before fingerprinting must not launder a tampered record: an
+    injected ``fingerprint: null`` or an unknown nested field is refused on
+    ``show``, ``list`` and the duplicate path rather than returned as part of
+    the raw record. Absent and null are not equivalent.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        result = intake.submit(
+            _doc(evidence_refs=[{"ref": "urn:example:observation:1"}]),
+            env=self.env,
+        )
+        self.sid = result["submission"]["submission_id"]
+        self.path = Path(intake.submission_path(self.sid, self.env))
+
+    def _rewrite_refs(self, refs) -> None:
+        record = json.loads(self.path.read_text(encoding="utf-8"))
+        record["evidence_refs"] = refs
+        self.path.write_text(json.dumps(record), encoding="utf-8")
+
+    def test_injected_null_fingerprint_is_refused_on_show_list_duplicate(
+        self,
+    ) -> None:
+        self._rewrite_refs(
+            [{"ref": "urn:example:observation:1", "fingerprint": None}]
+        )
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.list_submissions(self.env)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.submit(
+                _doc(evidence_refs=[{"ref": "urn:example:observation:1"}]),
+                env=self.env,
+            )
+
+    def test_injected_unknown_nested_field_is_refused(self) -> None:
+        self._rewrite_refs([{"ref": "urn:example:observation:1", "extra": 1}])
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(self.sid, self.env)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.list_submissions(self.env)
+
+    def test_absent_fingerprint_remains_valid(self) -> None:
+        record = intake.read_submission(self.sid, self.env)
+        self.assertEqual(
+            record["evidence_refs"], [{"ref": "urn:example:observation:1"}]
+        )
+
+
 class PrivatePathSafetyTests(_StateFixture):
     """F3: records and directories are protected from symlinks, non-regular
     files, unsafe modes and foreign targets, while legitimate private state
@@ -532,6 +624,106 @@ class PrivatePathSafetyTests(_StateFixture):
             stat.S_IMODE(Path(intake.intake_dir(self.env)).stat().st_mode), 0o700
         )
 
+    def test_symlinked_cao_parent_fails_closed_on_list_and_read(self) -> None:
+        real_state = Path(self._temp.name) / "real"
+        result = intake.submit(_doc(), env={"XDG_STATE_HOME": str(real_state)})
+        sid = result["submission"]["submission_id"]
+        state_home = Path(self._temp.name) / "linked_state"
+        state_home.mkdir()
+        os.symlink(real_state / "cao", state_home / "cao")
+        env = {"XDG_STATE_HOME": str(state_home)}
+        with self.assertRaises(intake.IntakeError):
+            intake.list_submissions(env)
+        with self.assertRaises(intake.IntakeError):
+            intake.read_submission(sid, env)
+
+    def test_dangling_cao_parent_fails_closed_not_empty(self) -> None:
+        state_home = Path(self.env["XDG_STATE_HOME"])
+        state_home.mkdir(parents=True)
+        os.symlink(state_home / "nowhere", state_home / "cao")
+        with self.assertRaises(intake.IntakeError):
+            intake.list_submissions(self.env)
+
+    def test_unsafe_cao_parent_mode_fails_closed_on_list_and_read(self) -> None:
+        result = intake.submit(_doc(), env=self.env)
+        sid = result["submission"]["submission_id"]
+        os.chmod(Path(intake.intake_dir(self.env)).parent, 0o755)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.list_submissions(self.env)
+        with self.assertRaises(intake.IntakeStateError):
+            intake.read_submission(sid, self.env)
+
+    def test_symlinked_cao_parent_target_is_never_modified_by_reads(self) -> None:
+        foreign = Path(self._temp.name) / "foreign_state"
+        (foreign / "intake").mkdir(parents=True)
+        os.chmod(foreign, 0o700)
+        os.chmod(foreign / "intake", 0o700)
+        state_home = Path(self._temp.name) / "linked_state2"
+        state_home.mkdir()
+        os.symlink(foreign, state_home / "cao")
+        env = {"XDG_STATE_HOME": str(state_home)}
+        with self.assertRaises(intake.IntakeError):
+            intake.list_submissions(env)
+        # A refused read never chmod'ed or otherwise touched the target.
+        self.assertEqual(stat.S_IMODE(foreign.stat().st_mode), 0o700)
+
+
+class SpecialFileRecordTests(_StateFixture):
+    """A FIFO substituted for a record must be refused promptly, never hung on.
+
+    ``_open_record_at`` opens with ``O_NONBLOCK``; without it, opening a FIFO
+    blocks before ``fstat`` can reject a non-regular file, so the reader hangs.
+    The probe runs in a bounded subprocess, so a hang is a test failure instead
+    of a stuck run.
+    """
+
+    def _probe(self, call: str, timeout: float = 20.0):
+        script = "\n".join(
+            [
+                "import sys",
+                "sys.path.insert(0, %r)" % str(REPO_ROOT / "src"),
+                "from cao import intake",
+                "try:",
+                "    " + call,
+                "except intake.IntakeError as exc:",
+                "    print('REFUSED', exc.code)",
+                "    raise SystemExit(0)",
+                "raise SystemExit(3)",
+            ]
+        )
+        env = dict(os.environ)
+        env.update(self.env)
+        return subprocess.run(
+            [sys.executable, "-B", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+
+    def setUp(self) -> None:
+        super().setUp()
+        directory = intake.intake_dir(self.env)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(Path(directory).parent, 0o700)
+        os.chmod(directory, 0o700)
+        self.sid = "a" * 64
+        self.fifo = os.path.join(directory, self.sid + ".json")
+        os.mkfifo(self.fifo, 0o600)
+        self.addCleanup(lambda: os.path.exists(self.fifo) and os.unlink(self.fifo))
+
+    def test_fifo_record_is_refused_promptly_on_read(self) -> None:
+        proc = self._probe(
+            "intake.read_submission(%r, %r)" % (self.sid, self.env)
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REFUSED INTAKE_STATE", proc.stdout)
+
+    def test_fifo_record_is_refused_promptly_on_list(self) -> None:
+        proc = self._probe("intake.list_submissions(%r)" % (self.env,))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REFUSED INTAKE_STATE", proc.stdout)
+
 
 class ListAbsenceTests(_StateFixture):
     """F4: ``list`` returns ``[]`` only for a genuinely absent directory."""
@@ -596,6 +788,46 @@ class DurabilityTests(_StateFixture):
         # Nothing was linked, so a retry is an honest first admission.
         retry = intake.submit(_doc(), env=self.env)
         self.assertEqual(retry["status"], "ADMITTED")
+        self.assertEqual(len(intake.list_submissions(self.env)), 1)
+
+    def test_duplicate_path_syncs_directory_before_acknowledging(self) -> None:
+        intake.submit(_doc(), env=self.env)
+        real_fsync_dir = intake._fsync_dir
+        calls = {"n": 0}
+
+        def counting(directory: str) -> None:
+            calls["n"] += 1
+            real_fsync_dir(directory)
+
+        with mock.patch.object(intake, "_fsync_dir", side_effect=counting):
+            duplicate = intake.submit(_doc(), env=self.env)
+        # The duplicate/retry path must sync the containing directory too, so a
+        # link that was not yet durable cannot be acknowledged as a duplicate.
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(duplicate["status"], "DUPLICATE")
+
+    def test_repeated_directory_sync_failures_never_falsely_acknowledge(
+        self,
+    ) -> None:
+        real_fsync_dir = intake._fsync_dir
+        state = {"failures": 2}
+
+        def flaky(directory: str) -> None:
+            if state["failures"] > 0:
+                state["failures"] -= 1
+                raise OSError("simulated directory fsync failure")
+            real_fsync_dir(directory)
+
+        with mock.patch.object(intake, "_fsync_dir", side_effect=flaky):
+            # First write links the name but fails its directory sync; the
+            # retry hits the duplicate path and its sync fails too. Neither may
+            # be acknowledged as ADMITTED or DUPLICATE.
+            for _ in range(2):
+                with self.assertRaises(intake.IntakeUnavailable):
+                    intake.submit(_doc(), env=self.env)
+            # Only once the directory sync succeeds is the duplicate returned.
+            final = intake.submit(_doc(), env=self.env)
+        self.assertEqual(final["status"], "DUPLICATE")
         self.assertEqual(len(intake.list_submissions(self.env)), 1)
 
 

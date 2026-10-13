@@ -157,12 +157,17 @@ class IntakeConflict(IntakeError):
 # Secret redaction (never persist an obvious credential)
 # ---------------------------------------------------------------------------
 
-#: Assignment keys whose value is a credential. ``"?`` after the key accepts a
-#: JSON-style quoted key (``"token": "..."``) as well as a bare one.
+#: Assignment keys whose value is a credential. A key may be bare
+#: (``token: ...``) or quoted JSON-style with either delimiter
+#: (``"token": "..."`` or ``'token': '...'``).
 _SECRET_KEY = (
     r"(password|passwd|pwd|secret|token|api[_-]?key|"
     r"access[_-]?key|private[_-]?key|authorization|client[_-]?secret)"
 )
+#: An optional closing quote after the key name, in either delimiter. The
+#: opening quote is outside the key match; without this, a single-quoted key
+#: (``'token' = ...``) slips past every assignment rule entirely.
+_KEY_CLOSE_QUOTE = r"[\"']?"
 
 #: Order is load-bearing. Known provider tokens and the private-key block are
 #: replaced first. ``Bearer`` is replaced *before* the generic assignment rule,
@@ -186,13 +191,16 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\bBearer\s+[^\s,;\"']{3,}"), "Bearer [REDACTED]"),
     (
         re.compile(
-            rf"(?i)\b{_SECRET_KEY}\b(\"?\s*[:=]\s*)"
+            rf"(?i)\b{_SECRET_KEY}\b({_KEY_CLOSE_QUOTE}\s*[:=]\s*)"
             r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
         ),
         r"\1\2[REDACTED]",
     ),
     (
-        re.compile(rf"(?i)\b{_SECRET_KEY}\b(\"?\s*[:=]\s*)([^\r\n,;]{{1,}})"),
+        re.compile(
+            rf"(?i)\b{_SECRET_KEY}\b({_KEY_CLOSE_QUOTE}\s*[:=]\s*)"
+            r"([^\r\n,;]{1,})"
+        ),
         r"\1\2[REDACTED]",
     ),
 )
@@ -600,6 +608,11 @@ def _atomic_create(path: str, text: str) -> bool:
         try:
             os.link(temp, path)
         except FileExistsError:
+            # The record already exists, so this is the duplicate/retry path.
+            # The link that created it may still be un-durable, so the
+            # containing directory is synced here too and a failure propagates
+            # rather than acknowledging a duplicate that might not survive.
+            _fsync_dir(directory)
             return False
         _fsync_dir(directory)
     except OSError as exc:
@@ -615,43 +628,78 @@ def _atomic_create(path: str, text: str) -> bool:
 
 
 def _open_dir_or_none(directory: str) -> int | None:
-    """Open the intake directory read-only with no-follow, or ``None`` if absent.
+    """Open the intake directory read-only under a validated CAO state root.
 
-    A symlink, a non-directory, a foreign-owned directory or an unreadable path
-    raises; only a genuinely absent path returns ``None``, so a caller never
-    mistakes invalid state for first-run absence.
+    The CAO state root above the intake directory is opened first with
+    ``O_NOFOLLOW`` and required to be a real, owned ``0700`` directory; the
+    intake directory is then opened *relative to that validated descriptor*, so
+    a symlinked, dangling, foreign-owned or world-readable root fails closed
+    instead of being silently followed. The leaf is likewise no-follow checked
+    as an owned ``0700`` directory. Only a genuinely absent path returns
+    ``None``, so a caller never mistakes invalid state for first-run absence.
     """
 
+    root = os.path.dirname(directory)
+    if not root:
+        raise IntakeUnavailable("intake directory has no CAO state root")
     try:
-        fd = os.open(directory, _dir_open_flags())
+        root_fd = os.open(root, _dir_open_flags())
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise IntakeUnavailable(
-            f"intake directory cannot be opened ({type(exc).__name__})"
+            f"CAO state root cannot be opened ({type(exc).__name__})"
         ) from exc
-    info = os.fstat(fd)
-    if not stat.S_ISDIR(info.st_mode):
+    try:
+        root_info = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise IntakeStateError("CAO state root is not a directory")
+        if root_info.st_uid != os.getuid():
+            raise IntakeStateError("CAO state root is not owned by this user")
+        if stat.S_IMODE(root_info.st_mode) != 0o700:
+            raise IntakeStateError("CAO state root has unsafe permissions")
+        try:
+            fd = os.open(
+                os.path.basename(directory), _dir_open_flags(), dir_fd=root_fd
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise IntakeUnavailable(
+                f"intake directory cannot be opened ({type(exc).__name__})"
+            ) from exc
+    finally:
+        os.close(root_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise IntakeStateError("intake path is not a directory")
+        if info.st_uid != os.getuid():
+            raise IntakeStateError("intake directory is not owned by this user")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            raise IntakeStateError("intake directory has unsafe permissions")
+    except BaseException:
         os.close(fd)
-        raise IntakeStateError("intake path is not a directory")
-    if info.st_uid != os.getuid():
-        os.close(fd)
-        raise IntakeStateError("intake directory is not owned by this user")
-    if stat.S_IMODE(info.st_mode) != 0o700:
-        os.close(fd)
-        raise IntakeStateError("intake directory has unsafe permissions")
+        raise
     return fd
 
 
 def _open_record_at(dir_fd: int, name: str) -> int | None:
     """Open one stored record read-only, no-follow, relative to ``dir_fd``.
 
-    The opened file is fstat-checked: it must be a regular file, owned by this
-    user and mode ``0600``. A symlink, a device, a foreign file or an unsafe
-    mode fails closed. ``None`` means the name is genuinely absent.
+    The file is opened with ``O_NOFOLLOW`` and ``O_NONBLOCK``: without
+    ``O_NONBLOCK`` a FIFO substituted for a record would block the open before
+    its type can be checked, so the reader could hang. The opened file is
+    fstat-checked: it must be a regular file, owned by this user and mode
+    ``0600``. A symlink, a device, a FIFO, a foreign file or an unsafe mode
+    fails closed. ``None`` means the name is genuinely absent.
     """
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(name, flags, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -795,13 +843,19 @@ def _record_from_state(data: Any, expected_id: str) -> dict[str, Any]:
         raise IntakeStateError("stored submission id does not bind its item id")
     if not isinstance(data.get("body_redacted"), bool):
         raise IntakeStateError("stored submission body_redacted is not a boolean")
-    refs = data.get("evidence_refs")
-    if not isinstance(refs, list):
+    raw_refs = data.get("evidence_refs")
+    if not isinstance(raw_refs, list):
         raise IntakeStateError("stored submission evidence_refs must be a list")
     try:
-        refs = _evidence_refs(refs)
+        refs = _evidence_refs(raw_refs)
     except IntakeInvalid as exc:
         raise IntakeStateError("stored submission evidence_refs is malformed") from exc
+    if refs != raw_refs:
+        # Canonicalizing must not launder the stored bytes: an added
+        # ``fingerprint: null`` (or any other dropped key) would otherwise be
+        # fingerprinted away and returned as part of the raw record. The stored
+        # refs must already be exactly canonical, so absent and null differ.
+        raise IntakeStateError("stored submission evidence_refs is not canonical")
     content = {
         "item_id": item_id,
         "title": title,

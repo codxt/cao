@@ -41,16 +41,26 @@ a Work Registry claim:
   acknowledged. `os.link` is atomic and fails closed on an existing path, so
   two concurrent submitters can neither overwrite each other nor duplicate a
   record. A failure after the link is never acknowledged; an honest retry finds
-  the record and reconciles it as a duplicate.
+  the record and reconciles it as a duplicate, and that duplicate path also
+  syncs the directory (propagating a sync failure) so a link that is not yet
+  durable is never acknowledged.
 - Records are read through a strict, bounded reader that refuses duplicate JSON
   keys and non-finite numbers, and that re-derives the id and content
   fingerprint from the stored bytes. `submission_id` must equal
   `sha256(item_id)`, and the canonical fingerprint is recomputed over the stored
   body, id, title, source and evidence refs on **every** `show`, `list` and
-  duplicate check. A corrupt, tampered, malformed or unknown-schema record
+  duplicate check. Nested `evidence_refs` must already be exactly canonical in
+  the stored bytes — canonicalizing before fingerprinting may not launder an
+  added key such as `fingerprint: null`, which is refused (absent and null are
+  not equivalent). A corrupt, tampered, malformed or unknown-schema record
   **raises** and is never rounded up to an empty result or a valid record.
-- The private directory and each record are opened with `O_NOFOLLOW`,
-  descriptor-relative, and `fstat`-checked: a symlink, a non-regular file, a
+- The CAO state root above the intake directory is opened first with
+  `O_NOFOLLOW` and required to be a real, owned `0700` directory, and the intake
+  directory is then opened relative to that validated descriptor. A symlinked,
+  dangling, foreign-owned or world-readable state root fails closed rather than
+  being silently followed. Each record is opened with `O_NOFOLLOW` and
+  `O_NONBLOCK` (so a FIFO substituted for a record cannot block the open before
+  its type is checked) and `fstat`-checked: a symlink, a non-regular file, a
   file with unsafe permissions, or a path owned by another user fails closed.
   Only a real, owned `0700` directory is ever chmod'ed; a symlinked or foreign
   path is refused rather than followed. An absent intake directory is the only
@@ -80,8 +90,12 @@ leave the secret behind as a suffix: a `Bearer` token is redacted before any
 assignment rule can see it, so `Authorization: Bearer <token>` becomes
 `Authorization: [REDACTED]` and never `Authorization: [REDACTED] <token>`.
 Quoted values (`password="an inner space"`, JSON `"token": "..."`) are replaced
-whole. An `item_id` that is itself credential-shaped is refused as
-`INTAKE_INVALID` rather than redacted into a different durable identity.
+whole, and a key quoted with either delimiter is recognised — a single-quoted
+`'token': '...'` or `{'password': '...'}` assignment is redacted rather than
+slipping past the assignment rules. An `item_id` that is itself credential-shaped
+(including a single-quoted assignment such as `'token'='...'`) is refused as
+`INTAKE_INVALID` rather than redacted into a different durable identity, and no
+raw credential reaches the public view.
 
 ## CLI: local submission
 
