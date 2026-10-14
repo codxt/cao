@@ -907,6 +907,80 @@ class ChatTeamTests(unittest.TestCase):
                                      route + (variant or ""))
                     self.assertIs(route_view["model_allowed"], True)
 
+    def test_plan_refuses_a_claude_cli_spoofing_an_opencode_route(self):
+        # A $60 owner approval is paid for OpenCode routing. A profile whose
+        # argv model LOOKS allowed but whose resolved identity is
+        # agent_kind/provider.cli = claude used to pass the allowlist and
+        # dispatch on the foreign runtime; the read-only plan now answers the
+        # same deny decision dispatch enforces.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.raw["agent_profiles"] = {"claude_spoof": {
+            "agent_kind": "claude",
+            "read_args": ["--model", "opencode-go/glm-5.3-flash"]}}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                          "agent_profile": "claude_spoof"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["agent_kind"], "claude")
+        self.assertEqual(route["provider"]["cli"], "claude")
+        self.assertEqual(route["model"], "opencode-go/glm-5.3-flash")
+        self.assertIs(route["model_allowed"], False)
+
+    def test_init_refuses_a_claude_cli_spoofing_an_opencode_route(self):
+        # The identical spoofed route is refused at initialization before any
+        # team or Registry effect; no team is admitted, claimed or saved.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.raw["agent_profiles"] = {"claude_spoof": {
+            "agent_kind": "claude",
+            "read_args": ["--model", "opencode-go/glm-5.3-flash"]}}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                          "agent_profile": "claude_spoof"}
+        self.configure()
+        with self.assertRaises(team.TeamAdmissionError) as caught:
+            self.admit(approved=True)
+        self.assertIn("TEAM_ROUTE_IDENTITY_MISMATCH", str(caught.exception))
+        self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_listed_model_with_spoofed_identity_is_held_on_tick(self):
+        # The listed model is unchanged, but a foreign agent kind within the
+        # task defaults no longer re-verifies as the OpenCode identity a NEW
+        # dispatch needs: a crash/restore-shaped running desire still holds
+        # the pending task with no effect at all.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.admit(approved=True)
+        self.raw["task"] = {"agent_kind": "claude"}
+        self.configure()
+        record = team._required("alpha", self.env)
+        record["desired"] = "running"
+        team._save(record, self.env)
+        effects = []
+        result = self.tick(effects)
+        self.assertEqual(effects, [])
+        self.assertEqual(result["tasks"]["read"]["status"], "pending")
+        self.assertEqual(result["tasks"]["read"]["error"], "TEAM_ADMISSION_CHANGED")
+
+    def test_approved_opencode_profile_dispatches_at_init_start_and_tick(self):
+        # The positive identity case: agent_kind/provider.cli both opencode
+        # and a resolved argv model on an allowlisted OpenCode route are
+        # admitted, started and dispatched through the team executor.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.raw["agent_profiles"] = {"opencode_reader": {
+            "agent_kind": "opencode",
+            "read_args": ["mini", "--standalone",
+                          "--model", "opencode-go/glm-5.3-flash"]}}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                          "agent_profile": "opencode_reader"}
+        self.configure()
+        self.assertEqual(self.admit(approved=True)["status"], "PAUSED")
+        self.assertEqual(team.set_desired("alpha", "running", env=self.env)
+                         ["desired"], "running")
+        effects = []
+        result = self.tick(effects)
+        self.assertEqual(len(effects), 1)
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+
     def test_low_tier_routes_are_denied_at_init_before_any_effect(self):
         # $15 Go Luna / Space Bunny and any other unlisted route are refused
         # outright at init; the admission evidence and team state stay empty.

@@ -350,6 +350,18 @@ def route_model(route: Any) -> tuple[str, str | None]:
     return ("resolved", model) if model is not None else ("unresolved", None)
 
 
+#: Allowed ``opencode/`` and ``opencode-go/`` model ids name the OpenCode
+#: dispatch routes themselves, so a resolved route that lists one must carry
+#: the actual OpenCode agent kind and provider CLI. A model string alone never
+#: proves OpenCode routing or a paid provider, so a foreign or missing agent
+#: kind or provider CLI is refused before any effect instead of substituting
+#: another runtime. Routes for other provider prefixes keep generic behavior.
+_TEAM_ROUTE_RUNTIME = {
+    "opencode": ("opencode", "opencode"),
+    "opencode-go": ("opencode", "opencode"),
+}
+
+
 def model_policy_error(route: Any, policy: TeamModelPolicy | None) -> str | None:
     """The refusal reason when a configured policy forbids this route.
 
@@ -357,6 +369,10 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None) -> str | None
     never from an untrusted prompt. With a configured policy an ambiguous,
     missing, malformed or unlisted selection is denied rather than silently
     substituted, and a ``#effort`` variant is accepted as the same base route.
+    A listed ``opencode/`` or ``opencode-go/`` model id additionally binds the
+    route identity: the resolved agent kind and the provider CLI must both be
+    the actual authorized OpenCode runtime, so a spoofed ``claude`` CLI can
+    never pass on an allowed-looking model id.
     """
 
     if policy is None:
@@ -366,6 +382,14 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None) -> str | None
         return "TEAM_MODEL_UNRESOLVED"
     if not policy.permits(model):
         return "TEAM_MODEL_NOT_ALLOWED"
+    required = _TEAM_ROUTE_RUNTIME.get(model.split("/", 1)[0])
+    if required is not None:
+        provider = route.get("provider")
+        cli = (provider.get("cli")
+               if isinstance(provider, Mapping) else None)
+        if (safe_route_token(route.get("agent_kind")) != required[0]
+                or safe_route_token(cli) != required[1]):
+            return "TEAM_ROUTE_IDENTITY_MISMATCH"
     return None
 
 

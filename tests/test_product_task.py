@@ -1619,6 +1619,117 @@ class TeamModelPolicyTests(TaskCase):
         self.assertEqual(driver.names().count("agent_prompt"), 1)
 
 
+class TeamRouteIdentityTests(TaskCase):
+    """An allowlisted OpenCode model id binds the actual OpenCode runtime.
+
+    A model string alone never proved OpenCode routing or a paid provider:
+    a route with ``agent_kind="claude"`` and ``provider.cli="claude"`` used to
+    pass an allowlist of OpenCode model ids and dispatch on the foreign
+    runtime. A configured allowlist now refuses a foreign, missing or spoofed
+    runtime identity, and every direct refusal below leaves zero Registry
+    claim rows and no workspace, pane or agent effect.
+    """
+
+    OWNER_ROUTES = ("opencode/step-5-preview-free",
+                    "opencode-go/glm-5.3-flash",
+                    "opencode-go/deepseek-v4.1-flash")
+
+    def identity_config(self, provider, task=None):
+        return product_config.validate_config({
+            "schema": product_config.SCHEMA, "provider": provider,
+            "task": task or {},
+            "team_model_allowlist": list(self.OWNER_ROUTES),
+        })
+
+    def refused_dispatch(self, config):
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Review this repository",
+            config=config, env=self.env, registry_db=self.db, wait_ms=0)
+        return driver, payload
+
+    def assert_zero_effects(self, driver, payload):
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["stage"], "model_policy")
+        self.assertEqual(payload["refusal"]["errors"],
+                         ["TEAM_ROUTE_IDENTITY_MISMATCH"])
+        self.assertEqual(driver.names(), [])
+        self.assertIsNone(payload["claim"])
+        self.assertIsNone(payload["workspace"])
+        self.assertIsNone(payload["pane_id"])
+        self.assertIsNone(payload["agent"])
+        self.assertEqual(self.claim_rows(), [])
+
+    def test_spoofed_claude_provider_cli_is_refused(self):
+        # A fake synthetic route that claims agent_kind=opencode while the
+        # provider CLI dispatches claude is refused, even though the provider
+        # model and the verified argv model both look allowed.
+        config = self.identity_config(
+            {"cli": "claude", "model": "opencode-go/glm-5.3-flash"},
+            {"agent_kind": "opencode",
+             "agent_args": ["mini", "--standalone",
+                            "--model", "opencode-go/glm-5.3-flash"]})
+        self.assert_zero_effects(*self.refused_dispatch(config))
+
+    def test_foreign_agent_kind_is_refused(self):
+        # kind=claude with the actual CLI never proves OpenCode routing.
+        config = self.identity_config(
+            {"cli": "claude", "model": "opencode-go/glm-5.3-flash"},
+            {"agent_kind": "claude"})
+        self.assert_zero_effects(*self.refused_dispatch(config))
+
+    def test_missing_provider_cli_is_refused(self):
+        # A listing model id without a provider CLI names no runtime at all.
+        config = self.identity_config(
+            {"model": "opencode/step-5-preview-free"},
+            {"agent_kind": "opencode"})
+        self.assert_zero_effects(*self.refused_dispatch(config))
+
+    def test_missing_agent_kind_is_refused_at_the_shared_policy(self):
+        # The direct task runner's agent-kind fallback can never produce a
+        # missing kind, so the same shared policy refusal is pinned on the
+        # route shape any caller supplies.
+        policy = product_config.team_model_policy(self.identity_config(
+            {"cli": "opencode", "model": "opencode-go/glm-5.3-flash"}))
+        self.assertEqual(product_config.model_policy_error(
+            {"provider": {"cli": "opencode",
+                          "model": "opencode-go/glm-5.3-flash"},
+             "agent_args": []}, policy),
+            "TEAM_ROUTE_IDENTITY_MISMATCH")
+
+    def test_refused_write_task_leaves_zero_claim_rows(self):
+        # A direct refused WRITE task must also predate the first Registry
+        # claim: zero claim rows and no runtime effect of any kind.
+        write_repo = git_repo(self.root, name="identity-write", files=("a.txt",))
+        config = self.identity_config(
+            {"cli": "claude", "model": "opencode-go/glm-5.3-flash"})
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(write_repo), prompt="Edit a.txt",
+            mode="write", write_scope=("a.txt",), config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assert_zero_effects(driver, payload)
+
+    def test_actual_opencode_routes_still_dispatch_with_effort_variants(self):
+        # The approved routes dispatched by the real OpenCode identity (kind
+        # and CLI both opencode) keep working, including each #effort variant
+        # carried by the resolved provider argv.
+        for index, route in enumerate(self.OWNER_ROUTES):
+            for variant in ("", "#high", "#xhigh"):
+                with self.subTest(route=route, variant=variant):
+                    config = self.identity_config(
+                        {"cli": "opencode", "model": route + variant})
+                    driver = FakeDriver()
+                    payload = product_task.run_task(
+                        driver=driver, repo=str(self.repo),
+                        prompt="Review this repository",
+                        task_id=f"identity-{index}-{variant[1:] or 'base'}",
+                        config=config, env=self.env, registry_db=self.db,
+                        wait_ms=0)
+                    self.assertEqual(payload["status"], "running")
+                    self.assertEqual(driver.names().count("agent_start"), 1)
+
+
 class FailClosedTests(TaskCase):
     def test_corrupt_task_record_raises(self) -> None:
         task_id = product_task.task_id_for(str(self.repo), "Review this repository")

@@ -748,17 +748,22 @@ def _model_policy_refusal(
     The route is read only from the configured provider entry and this task's
     own verified argv, never from an untrusted prompt. An absent allowlist is
     the operator's opt-out and permits everything; a configured one denies an
-    unresolved or unlisted selection with no silent fallback.
+    unresolved or unlisted selection with no silent fallback. The resolved
+    agent kind and provider CLI are supplied so an allowlisted OpenCode model
+    id also binds the actual OpenCode runtime identity.
     """
 
     policy = product_config.team_model_policy(config)
     if policy is None:
         return None
+    provider = config.provider if config is not None else None
     return product_config.model_policy_error(
-        {"provider": {
-            "model": (config.provider.model
-                      if config is not None and config.provider else None)},
-         "agent_args": list(defaults.agent_args)}, policy)
+        {"agent_kind": defaults.agent_kind,
+         "agent_args": list(defaults.agent_args),
+         "provider": {"cli": provider.cli if provider is not None else None,
+                      "model": (provider.model
+                                if provider is not None else None)}},
+        policy)
 
 
 def run_task(

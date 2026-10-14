@@ -374,16 +374,22 @@ def _verify_model_policy(config: product_config.ProductConfig | None,
     if policy is None:
         return
     try:
-        allowed = (bound["allowed"] if bound is not None
-                   else _dispatchable_routes(config, spec)["allowed"])
+        bound = (bound if bound is not None
+                 else _dispatchable_routes(config, spec))
     except (TeamError, product_config.ProductConfigError) as exc:
         raise TeamAdmissionError(str(exc)) from exc
-    for task_id, entry in allowed.items():
+    for task_id, entry in bound["allowed"].items():
         for phase, permitted in entry.items():
             if not permitted:
+                # The exact route is reported with its real refusal code (a
+                # model that is not listed, or an allowlisted OpenCode model
+                # id reached through a foreign runtime identity) and never
+                # with a generic claim.
+                reason = product_config.model_policy_error(
+                    bound["routes"][task_id][phase], policy)
                 raise TeamAdmissionError(
                     f"team route {task_id}/{phase}: "
-                    "TEAM_MODEL_NOT_ALLOWED")
+                    f"{reason or 'TEAM_MODEL_NOT_ALLOWED'}")
 
 
 def _dispatchable_routes(config: product_config.ProductConfig,
