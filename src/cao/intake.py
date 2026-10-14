@@ -73,6 +73,11 @@ __all__ = [
     "submit",
     "list_submissions",
     "read_submission",
+    "open_private_dir",
+    "open_private_dir_readonly",
+    "write_private_record",
+    "read_private_record",
+    "list_private_names",
 ]
 
 #: The strict schema an operator-written submission file must carry.
@@ -1121,3 +1126,79 @@ def read_submission(
     if record is None:
         raise IntakeUnavailable("no submission with that id")
     return record
+
+
+# ---------------------------------------------------------------------------
+# Shared private-store toolkit (used by intake and by intake triage)
+# ---------------------------------------------------------------------------
+#
+# The functions below are the same validated, atomic storage primitives the
+# admission path already uses, exposed under public names so a second CAO-owned
+# private store (the intake triage advisory packets) can reuse them instead of
+# re-implementing storage. They are thin aliases: the behavior, every bound and
+# every fsync in the admission path is unchanged, so the accepted B1/B2
+# guarantees hold for a store created through them too. Callers own the two
+# ends of the protocol:
+#
+# * ``open_private_dir`` returns a pinned, validated ``0700`` descriptor that
+#   must be closed by the caller;
+# * ``write_private_record``/``read_private_record``/``list_private_names``
+#   operate *relative to that descriptor*, never a path re-resolved afterwards,
+#   so a post-validation swap cannot redirect a record.
+
+
+def open_private_dir(directory: str) -> int:
+    """Open (creating ``0700`` ancestors) a private CAO-state directory.
+
+    The returned descriptor is pinned. It is the descriptor every subsequent
+    write, link and read-back is resolved against, so a same-user process that
+    swaps a path component after validation cannot receive the record.
+    """
+
+    return _open_intake_dir_creating(directory)
+
+
+def open_private_dir_readonly(directory: str) -> int | None:
+    """Open an existing private directory read-only, or ``None`` when absent.
+
+    The CAO state root above ``directory`` is validated first (real, owned,
+    ``0700``), so a symlinked, foreign-owned or world-readable root fails closed
+    rather than being silently followed. Only a genuinely absent path is
+    ``None``.
+    """
+
+    return _open_dir_or_none(directory)
+
+
+def write_private_record(dir_fd: int, name: str, text: str) -> bool:
+    """Create one ``0600`` record under a pinned private dir, atomically.
+
+    Returns ``False`` when the name already exists (the idempotent retry path)
+    and ``True`` when this call created it. The write, exclusive link and
+    directory fsync all happen before it returns ``True``, so a caller never
+    acknowledges a record a crash can lose.
+    """
+
+    return _atomic_create_at(dir_fd, name, text)
+
+
+def read_private_record(dir_fd: int, name: str) -> dict[str, Any] | None:
+    """Read one strict, bounded record from a pinned private dir, or ``None``.
+
+    Opened no-follow and ``fstat``-checked as an owned ``0600`` regular file no
+    larger than :data:`MAX_RECORD_BYTES`; duplicate JSON keys and non-finite
+    numbers are refused. A corrupt record raises, never rounds up to absent.
+    """
+
+    return _read_record_data_at(dir_fd, name)
+
+
+def list_private_names(dir_fd: int) -> list[str]:
+    """Sorted entry names of a pinned private directory, fail-closed."""
+
+    try:
+        return sorted(os.listdir(dir_fd))
+    except OSError as exc:
+        raise IntakeUnavailable(
+            f"private directory cannot be listed ({type(exc).__name__})"
+        ) from exc
