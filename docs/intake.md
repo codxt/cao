@@ -269,7 +269,11 @@ Read-only context, each with explicit `UNKNOWN`/`UNAVAILABLE` when unavailable:
 - bounded default-branch Git evidence for `--repo`: the resolved default branch,
   the source commit id and its commit time;
 - local CAO team summaries and active Work Registry claims, read through the
-  Registry's read-only (`mode=ro`) connection — no claim, no mutation.
+  Registry's read-only (`mode=ro`) connection — no claim, no mutation. The
+  ledger path is resolved by the product config (`CAO_REGISTRY_DB`, then the
+  config `registry_db`, then the isolated XDG default), so triage reads the same
+  governed ledger the task layer attaches to; it never guesses a path and never
+  creates the database.
 
 Load-bearing properties:
 
@@ -291,6 +295,9 @@ Load-bearing properties:
   a bad ref, cutoff or commit, an unresolvable repository or a hostile body all
   fail closed. The submission body is opaque data: it is inspected only to pick a
   disposition and flag risk, and is never executed or interpolated into a shell.
+  The bounded Git observation runs with a minimal sanitized child environment
+  (only `PATH`, `HOME`, `TMPDIR` and `GIT_OPTIONAL_LOCKS=0`), so a caller's
+  `GIT_DIR` or `GIT_WORK_TREE` cannot redirect it to an unrelated repository.
 - **No invented scope.** Intake is single-operator and models no tenant or guest
   principal, so triage invents no cross-scope identity: it reads only the
   operator's own private state and locally available evidence. A source outside

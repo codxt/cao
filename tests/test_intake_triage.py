@@ -69,7 +69,12 @@ class _Fixture(unittest.TestCase):
         self._temp = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp.cleanup)
         self.root = Path(self._temp.name)
-        self.env = {"XDG_STATE_HOME": str(self.root / "state")}
+        self.env = {
+            "XDG_STATE_HOME": str(self.root / "state"),
+            # An isolated config root keeps a host operator's product config
+            # (and any configured registry_db) from leaking into a test.
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+        }
         self.state_root = Path(self.env["XDG_STATE_HOME"]) / "cao"
 
     def submit(self, item_id: str = "item-1", body: str = "hello", **extra) -> str:
@@ -424,6 +429,91 @@ class RegistryAndTeamEvidenceTests(_Fixture):
         team_evidence = packet["inputs"]["team"]
         self.assertEqual(team_evidence["verdict"], "SUPPORTED")
         self.assertEqual(team_evidence["teams"][0]["status"], "CORRUPT")
+
+
+class RegistryResolutionTests(_Fixture):
+    """The governed ledger is resolved by the product config, never guessed."""
+
+    def _write_ledger(self, path: Path, objective: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = registry_module.connect(str(path))
+        try:
+            conn.execute(
+                "INSERT INTO works (run_id, work_key, issue, repo, paths, "
+                "components, objective, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                ("run-1", "work-1", "", "/synthetic/repo", "", "", objective,
+                 "2026-01-01T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO claims (run_id, work_key, issue, owner, mode, "
+                "branch, worktree, claimed_at, released_at) "
+                "VALUES (?,?,?,?,?,?,?,?,NULL)",
+                ("run-1", "work-1", "", "owner-1", "READ", "", "",
+                 "2026-01-01T00:00:00Z"),
+            )
+        finally:
+            conn.close()
+
+    def _guessed_default(self) -> Path:
+        return (Path(self.env["XDG_STATE_HOME"]) / registry_module.APP_DIR
+                / registry_module.DB_NAME)
+
+    def _registry_evidence(self, env: dict, item_id: str) -> dict:
+        sid = intake.submit(
+            _doc(item_id, "implement the triage advisory packet widget",
+                 evidence_refs=[{"ref": "a"}]),
+            env=env,
+        )["submission"]["submission_id"]
+        return intake_triage.triage(sid, env=env)["packet"]["inputs"]["registry"]
+
+    def test_registry_db_env_override_selects_the_configured_ledger(self) -> None:
+        configured = self.root / "shared-env" / "registry.sqlite3"
+        self._write_ledger(configured, "triage advisory packet widget")
+        env = dict(self.env, CAO_REGISTRY_DB=str(configured))
+        evidence = self._registry_evidence(env, "env-ledger")
+        self.assertEqual(evidence["verdict"], "SUPPORTED")
+        self.assertTrue(evidence["active_claims"])
+        # The guessed isolated default was never created by triage.
+        self.assertFalse(self._guessed_default().exists())
+
+    def test_product_config_registry_db_selects_the_configured_ledger(self) -> None:
+        configured = self.root / "shared-config" / "registry.sqlite3"
+        self._write_ledger(configured, "triage advisory packet widget")
+        config_dir = Path(self.env["XDG_CONFIG_HOME"]) / "cao"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.json").write_text(
+            json.dumps({
+                "schema": "cao.product.config.v0",
+                "registry_db": str(configured),
+            }),
+            encoding="utf-8",
+        )
+        evidence = self._registry_evidence(dict(self.env), "config-ledger")
+        self.assertEqual(evidence["verdict"], "SUPPORTED")
+        self.assertFalse(self._guessed_default().exists())
+
+
+class GitEnvironmentTests(_Fixture):
+    """The read-only git observation sanitizes the child environment."""
+
+    @unittest.skipUnless(_HAVE_GIT, "git is not available")
+    def test_caller_git_dir_cannot_redirect_a_commit_observation(self) -> None:
+        supplied = make_repo(self.root, name="supplied")
+        unrelated = make_repo(self.root, name="unrelated",
+                              committed_at="2001-02-03T04:05:06Z")
+        supplied_head = run_git(supplied, "rev-parse", "HEAD").strip()
+        unrelated_head = run_git(unrelated, "rev-parse", "HEAD").strip()
+        self.assertNotEqual(supplied_head, unrelated_head)
+        hostile = {
+            "GIT_DIR": str(unrelated / ".git"),
+            "GIT_WORK_TREE": str(unrelated),
+            "GIT_INDEX_FILE": str(unrelated / ".git" / "index"),
+            "GIT_OBJECT_DIRECTORY": str(unrelated / ".git" / "objects"),
+        }
+        with mock.patch.dict(os.environ, hostile):
+            resolved = intake_triage._show_commit(str(supplied), "HEAD")
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved[0], supplied_head)
 
 
 class PersistenceAndReplayTests(_Fixture):

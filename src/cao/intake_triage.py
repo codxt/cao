@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from . import git, intake, registry, team
+from . import git, intake, product_config, registry, team
 from .evidence import canonical_json, fingerprint, utc_now
 from .product_state import state_dir
 
@@ -349,11 +349,19 @@ def _run_git(repo: str, args: list[str]) -> tuple[int | None, str]:
         return None, ""
     argv = ["git", "--no-optional-locks", "-c", "diff.autoRefreshIndex=false"]
     argv.extend(args)
+    # A minimal child environment. Only PATH, HOME and TMPDIR are forwarded, so
+    # a caller's GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE or any other GIT_*
+    # override cannot redirect this observation to an unrelated repository.
+    env = {"GIT_OPTIONAL_LOCKS": "0"}
+    for name in ("PATH", "HOME", "TMPDIR"):
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
     try:
         proc = subprocess.run(
             argv,
             cwd=repo,
-            env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=15,
@@ -449,8 +457,15 @@ def _git_evidence(
 
 
 def _registry_db_path(env: Mapping[str, str] | None) -> str:
-    base = os.path.dirname(state_dir(env))
-    return os.path.join(base, registry.APP_DIR, registry.DB_NAME)
+    """The governed Work Registry ledger, resolved by the product config.
+
+    Delegated to ``product_config.registry_db_path`` so B3 reads exactly the
+    ledger the product task layer attaches to — ``CAO_REGISTRY_DB``, then the
+    product config's ``registry_db``, then the isolated XDG default — instead of
+    guessing a path of its own.
+    """
+
+    return product_config.registry_db_path(env)
 
 
 def _registry_evidence(
@@ -469,7 +484,11 @@ def _registry_evidence(
         "active_claims": [],
         "overlaps": [],
     }
-    path = _registry_db_path(env)
+    try:
+        path = _registry_db_path(env)
+    except Exception:  # noqa: BLE001 - an unresolvable location is UNKNOWN
+        return {**base, "verdict": "UNKNOWN",
+                "reason": "the local Work Registry location could not be resolved"}
     if not os.path.isfile(path):
         return {**base, "verdict": "UNAVAILABLE",
                 "reason": "no local Work Registry was found"}
