@@ -36,8 +36,8 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from . import (intake, intake_bridge, intake_compile, intake_resolution,
-               intake_triage)
+from . import (intake, intake_bridge, intake_compile, intake_handoff,
+               intake_resolution, intake_triage)
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -285,6 +285,68 @@ def _cmd_reply(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_handoff(args: argparse.Namespace) -> int:
+    """Derive one governed Intake-to-CAO READ handoff plan (no dispatch).
+
+    The plan is safe by construction: it is derived from the original admission
+    and its B3 advisory, it starts nothing, and it is executed only through an
+    in-process authenticated operator authority. The CLI never constructs that
+    authority and never accepts one from a flag, the environment or a file, so
+    ``--authorize`` is an honest structured ``UNAVAILABLE`` rather than a
+    caller-asserted grant. ``--dry-run`` creates no state at all.
+    """
+
+    submission_id = getattr(args, "id", None)
+    item_id = getattr(args, "item_id", None)
+    try:
+        if submission_id is not None and item_id is not None:
+            derived = intake.submission_id_for(item_id)
+            if derived != submission_id:
+                return _error("handoff", "USAGE", "--id and --item-id name different items")
+        elif item_id is not None:
+            submission_id = intake.submission_id_for(item_id)
+        elif submission_id is None:
+            return _error("handoff", "USAGE", "handoff requires --id or --item-id")
+        if getattr(args, "authorize", False) and getattr(args, "inspect", False):
+            return _error("handoff", "USAGE",
+                          "choose either --inspect or --authorize, not both")
+        if getattr(args, "inspect", False):
+            document = intake_handoff.handoff_status(submission_id)
+            _emit(document)
+            return EXIT_OK
+        if getattr(args, "authorize", False):
+            # Fail closed. The governed authorize route needs a host that has
+            # *independently authenticated* the operator and granted this exact
+            # scoped READ execution in process. A flag, an environment variable
+            # or a JSON file is caller-controlled and is never proof, so this
+            # build serves no CLI authorize route and creates nothing.
+            return _error(
+                "handoff",
+                "HANDOFF_UNAVAILABLE",
+                "the governed authorize route is UNAVAILABLE: it requires an "
+                "in-process authenticated operator authority, and a CLI flag, "
+                "an environment variable or a JSON file is caller-controlled "
+                "and is never proof; supply the in-process adapter through the "
+                "library 'operator_authority' argument",
+            )
+        result = intake_handoff.handoff_plan(
+            submission_id,
+            repo=getattr(args, "repo", None),
+            source_ref=getattr(args, "source_ref", None),
+            operator_authority=None,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except intake_handoff.HandoffRefused as exc:
+        return _refusal("handoff", exc.code, str(exc), "REFUSED")
+    except (intake.IntakeError, intake_triage.TriageError,
+            intake_handoff.HandoffError) as exc:
+        return _error("handoff", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("handoff", "HANDOFF_ERROR", type(exc).__name__)
+    _emit(result)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cao intake",
@@ -385,6 +447,28 @@ def build_parser() -> argparse.ArgumentParser:
     reply_cmd.add_argument("--mock", action="store_true",
                            help="built-in simulated adapter; sends nothing")
     reply_cmd.set_defaults(handler=_cmd_reply)
+
+    handoff_cmd = commands.add_parser(
+        "handoff",
+        help="governed Intake-to-CAO READ handoff plan (no dispatch)",
+    )
+    handoff_cmd.add_argument("--id", metavar="SUBMISSION_ID",
+                             help="durable submission id to hand off")
+    handoff_cmd.add_argument("--item-id", metavar="ITEM_ID",
+                             help="stable item id; its submission id is derived")
+    handoff_cmd.add_argument("--repo", metavar="PATH",
+                             help="scoped checkout whose HEAD the plan binds")
+    handoff_cmd.add_argument("--source-ref", metavar="REF",
+                             help="ref or commit id to bind as the source")
+    handoff_cmd.add_argument("--dry-run", action="store_true",
+                             help="derive the plan and create no state")
+    handoff_cmd.add_argument("--inspect", action="store_true",
+                             help="derive the read-only handoff status instead")
+    handoff_cmd.add_argument("--authorize", action="store_true",
+                             help="attempt the governed authorize route; "
+                                  "UNAVAILABLE in this build (no in-process "
+                                  "authenticated operator authority exists)")
+    handoff_cmd.set_defaults(handler=_cmd_handoff)
     return parser
 
 
