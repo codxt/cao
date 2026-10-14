@@ -9,6 +9,11 @@ transport (:mod:`cao.intake_bridge`); any other named transport fails closed
 with structured UNAVAILABLE, and ``pull`` with no transport named reports
 ``NO_INBOUND_TRANSPORT`` rather than inventing a default.
 
+``triage`` is the on-demand B3 advisory path: it reads one admitted submission
+and bounded read-only evidence, and returns one advisory disposition with cited
+provenance. It starts nothing, claims nothing and sends nothing; with no
+qualified provider it always yields the deterministic context packet.
+
 Output is JSON on stdout. Exit codes are ``0`` success, ``2`` usage error and
 ``3`` explicit UNAVAILABLE/conflict, matching the rest of CAO's CLI.
 """
@@ -21,7 +26,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from . import intake, intake_bridge
+from . import intake, intake_bridge, intake_triage
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -131,6 +136,43 @@ def _cmd_transports(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_triage(args: argparse.Namespace) -> int:
+    """On-demand advisory triage of one admitted submission (read-only).
+
+    Every input is validated before anything is read: refs are checked as Git
+    refs, the cutoff as an explicit UTC timestamp and ``--implemented`` as a
+    commit id, so a malformed option never reaches the repository or the store.
+    """
+
+    submission_id = getattr(args, "id", None)
+    item_id = getattr(args, "item_id", None)
+    try:
+        if submission_id is not None and item_id is not None:
+            derived = intake.submission_id_for(item_id)
+            if derived != submission_id:
+                return _error(
+                    "triage", "USAGE",
+                    "--id and --item-id name different items",
+                )
+        elif item_id is not None:
+            submission_id = intake.submission_id_for(item_id)
+        elif submission_id is None:
+            return _error("triage", "USAGE", "triage requires --id or --item-id")
+        result = intake_triage.triage(
+            submission_id,
+            repo=getattr(args, "repo", None),
+            source_ref=getattr(args, "source_ref", None),
+            cutoff=getattr(args, "cutoff", None),
+            implemented=getattr(args, "implemented", None),
+        )
+    except (intake.IntakeError, intake_triage.TriageError) as exc:
+        return _error("triage", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("triage", "TRIAGE_ERROR", type(exc).__name__)
+    _emit(result)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cao intake",
@@ -171,6 +213,24 @@ def build_parser() -> argparse.ArgumentParser:
         "transports", help="show the inbound transport contract and status"
     )
     transports.set_defaults(handler=_cmd_transports)
+
+    triage = commands.add_parser(
+        "triage",
+        help="on-demand advisory triage of one admitted submission (read-only)",
+    )
+    triage.add_argument("--id", metavar="SUBMISSION_ID",
+                        help="durable submission id to triage")
+    triage.add_argument("--item-id", metavar="ITEM_ID",
+                        help="stable item id; its submission id is derived")
+    triage.add_argument("--repo", metavar="PATH",
+                        help="repository for bounded read-only Git evidence")
+    triage.add_argument("--source-ref", metavar="REF",
+                        help="ref or commit id to read as source evidence")
+    triage.add_argument("--cutoff", metavar="ISO8601",
+                        help="evidence cutoff (YYYY-MM-DDThh:mm:ssZ or YYYY-MM-DD, UTC)")
+    triage.add_argument("--implemented", metavar="COMMIT",
+                        help="commit id that already implements the request")
+    triage.set_defaults(handler=_cmd_triage)
     return parser
 
 

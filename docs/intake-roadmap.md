@@ -1,0 +1,420 @@
+# Intake roadmap (B3–B5): governed request intake
+
+> **Document status.** Accepted **owner plan** for the governed intake middle
+> (B3–B5). **B3 is implemented in source and verified by its own tests**
+> (`src/cao/intake_triage.py`, `tests/test_intake_triage.py`) and is reported as
+> `SOURCE_COMPLETE`: reviewed, merged and independently accepted are **separate,
+> later states** and are not claimed here. **B4 and B5 remain plan only** — no
+> B4/B5 code ships in this tree, and every B4/B5 capability below is a durable
+> intention, not a claim that it exists.
+
+> **Owner.** The CAO repository owner. Shared-contract changes and anything
+> beyond the stated scope require an accountable integration decision, exactly as
+> `AGENTS.md` requires.
+
+> **Doctrine basis.** The owner's generic cross-project work-execution contract
+> (owner-referenced **v0.4**): objective, accepted Plan, work package,
+> Capability, qualified Performer, Authority, Evidence. That contract is owned
+> outside this repository. The version cited here is the owner's accepted
+> planning reference and must be re-verified against its canonical home before
+> any further phase is implemented. It establishes **no universal task database
+> and no new authority concept**, and neither does this roadmap.
+
+> **Product source.** A vendor's official intake product page, reviewed
+> 2026-10-14. It is a promotional product page: its statements are **vendor
+> claims, not independently measured**, and its mechanisms are legal-work
+> specific. They are inspiration and a comparison point, **not** a specification
+> CAO copies wholesale.
+
+## How to read this document
+
+Three layers must stay explicit and never be blurred:
+
+| Layer | Meaning | Where it lives |
+|---|---|---|
+| **Source evidence** | What an external source or in-tree artifact actually says/does | vendor page; committed B1/B2/B3 code in `src/cao/intake.py`, `src/cao/intake_bridge.py`, `src/cao/intake_triage.py`, `docs/intake.md` |
+| **Accepted plan** | What the owner has decided CAO *should* build | this document |
+| **Live implementation** | What actually runs and is verified | B3 deterministic triage; **nothing for B4–B5 yet** |
+
+A statement in this document is a plan unless it cites source evidence or a live
+test. Reviewers must not read a planned capability as shipped.
+
+**B1/B2 standing.** The B1/B2 security source is committed on the default branch
+and its final independent security acceptance is recorded separately. Nothing in
+this document promotes a commit to a merge, a merge to a deploy, or a deploy to
+live acceptance.
+
+## 1. The gap B3–B5 close
+
+`docs/intake.md` describes what ships today: one bounded, strictly-shaped JSON
+submission admitted **once** into the operator's private XDG state, deliberately
+**not** a work item and **not** a Work Registry claim. Nothing in intake starts,
+merges, dispatches or schedules anything.
+
+That leaves a governed middle:
+
+- **B3** — read an admitted submission *on demand* together with permitted
+  context, and produce an advisory, provenance-linked triage result.
+  **Implemented.**
+- **B4** — match a proposed work item to an *accepted* Plan/objective/work
+  package, Capability, qualified performer and current authority, and compile an
+  immutable reviewable team manifest for **existing** Team Execution. **Plan.**
+- **B5** — derive a truthful requester status and accountable next mover from
+  existing evidence, and (only under explicit send authority) reply on the
+  originating channel. **Plan.**
+
+Each phase consumes the previous one. None adds a queue, scheduler, dispatcher,
+second Registry, universal task database or second authority model.
+
+## 2. Constraints carried forward (non-negotiable)
+
+These are inherited from `AGENTS.md` and the accepted B1/B2 contract and apply
+to every phase:
+
+- **Standard library only.** No runtime dependency. The `-S` test run proves the
+  core imports without third-party packages.
+- **No private values.** No private paths, usernames, tenant names, secrets or
+  internal operational values in code, docs or examples.
+- **Fail closed.** Required evidence that cannot be read stays `UNKNOWN`;
+  corrupt or unreadable state raises and is never rounded up to a valid state.
+- **No silent fallback.** An unavailable capability yields explicit
+  `UNAVAILABLE` evidence and a nonzero exit, never a substitute.
+- **Admission is not work.** Intake records intent only. No B3–B5 phase may
+  start, merge, dispatch, schedule or claim on the strength of an intake
+  submission alone.
+- **No new canonical home and no second ledger.** B3–B5 reuse the private
+  intake state, the existing shared Work Registry, the existing team checkpoints
+  and the existing daemon. They create no parallel store of authority or truth.
+- **Provenance is separate.** An advisory triage result is persisted distinctly
+  from the original submission and distinctly from any canonical accepted work.
+- **No outbound message without explicit send authorization.** Every outward
+  effect is gated, dry-run first, and receipted.
+- **Unimplemented commands report structured `UNAVAILABLE` and exit nonzero**,
+  never fabricated success.
+
+## 3. Vocabulary and the five dispositions
+
+A triage result is **advisory**. It is not authority, not a work item, not an
+approval and not canonical truth.
+
+Exactly **five** dispositions are permitted — no sixth, no free-text variant:
+
+| Disposition | Meaning |
+|---|---|
+| `ASK_CONTEXT` | More context is required before any grounded position is possible |
+| `ANSWER_CANDIDATE` | A grounded answer may exist, but it is **not** self-authorized |
+| `PROPOSE_WORK` | The request appears to map to work that must go through B4 |
+| `HUMAN_REVIEW` | A human decision is required; no automated disposition is safe |
+| `DENY_OR_REPLAN` | The request cannot proceed as stated and must be denied or replanned |
+
+Every disposition carries provenance: which inputs were read, which sources
+were current at the evidence cutoff, what was uncertain, and which of the five
+labels was chosen and why. `ANSWER_CANDIDATE` is explicitly **grounded but not
+self-authorized**: it is a candidate for review, never an answer CAO sends on
+its own.
+
+## 4. Phase B3 — on-demand context and intelligent triage
+
+**Status: implemented, `SOURCE_COMPLETE`; independent acceptance pending.**
+
+**Goal.** Given one admitted submission, assemble a bounded context packet on
+demand and produce an advisory triage result with a provenance record.
+
+**Inputs (read-only, permitted, as implemented):**
+
+- the operator's **private B1 submissions**, read through intake's own strict
+  reader (`intake.read_submission`) — never the permissive state reader;
+- the submission's declared **source references** (`evidence_refs`), with an
+  explicit evidence cutoff;
+- bounded **default-branch Git evidence** for the supplied repository: the
+  resolved default branch, the source commit id and its commit time;
+- an existing, **read-only** snapshot of the CAO team summaries and of active
+  Registry claims, opened through the Registry's read-only (`mode=ro`)
+  connection. No claim, no mutation, no schema creation.
+
+**Deterministic rule table (first match wins).** Rules depend only on the
+bounded evidence bundle; none consults anything outside it.
+
+| Order | Condition | Disposition |
+|---|---|---|
+| 1 | the submission states no request text | `ASK_CONTEXT` |
+| 2 | the request text carries a risk marker (directive text, shell payload, reserved action) | `HUMAN_REVIEW` |
+| 3 | the request is already implemented at an attributable commit | `DENY_OR_REPLAN` |
+| 4 | the submission duplicates an admitted submission with identical request content | `DENY_OR_REPLAN` |
+| 5 | no permitted source reference and no current default-branch Git evidence grounds it | `ASK_CONTEXT` |
+| 6 | grounded and question-shaped | `ANSWER_CANDIDATE` |
+| 7 | grounded and work-shaped | `PROPOSE_WORK` |
+| 8 | grounded but ambiguous | `HUMAN_REVIEW` |
+
+A short risk marker forces `HUMAN_REVIEW` rather than a confident wrong
+disposition. An empty body is checked first so it can never fall through to a
+work or answer disposition.
+
+**Work B3 performs:**
+
+- collects the **missing context** required for a grounded position;
+- detects **duplicate** submissions (identical request content under a different
+  item id) and requests that are **already implemented** (an operator-supplied
+  commit verified in the supplied repository);
+- classifies the request and derives advisory **priority, dependencies and
+  capability hints** — each `UNKNOWN` unless attributable evidence exists;
+- records the **evidence cutoff**, the cited provenance and the remaining
+  **uncertainties**, and reports a source read as **stale** when its commit
+  predates the requested cutoff rather than treating it as current.
+
+**Output.** One persisted, **provenance-linked private advisory packet**
+(`cao.intake.triage.v1`), distinct from the submission and from canonical
+accepted work. Its id is a one-way digest of the evidence bundle, so an identical
+replay is idempotent; different evidence yields a distinct packet, never a silent
+merge. The packet **never carries the submission body**: it holds only ids,
+fingerprints, the disposition, the signals, the cited sources and the cutoff.
+
+**Storage.** Packets live under `$XDG_STATE_HOME/cao/intake-triage/`, one file
+per packet, `0700` directories and `0600` files, written through the same
+validated, atomic, fsynced, descriptor-relative store the admission path uses.
+This is a private advisory store, **not** canonical Company State, **not** a
+second Registry and **not** a queue.
+
+**Privacy and model qualification.** A qualified AI may perform triage **only
+when the selected provider's privacy terms permit the data**. This build holds
+no provider credential and performs **no provider egress**, so B3 always yields
+the deterministic context packet and records `ai.used = false`,
+`ai.egress = "none"`. It does not send the material to an unqualified provider
+and does not fabricate an AI result. There is **no automated provider-privacy
+classification**: the operator must verify the provider's terms, exactly as
+`docs/team-execution.md` already requires for teams. A future AI path stays
+behind that gate and keeps the deterministic path as its fallback.
+
+**Explicitly not in B3:** no dispatcher, no scheduler, no second Registry, no
+outgoing message, no work claim, no canonical write, no provider egress.
+
+**CLI.** `cao intake triage` is the minimal command surface, justified by the
+existing `cao intake` group and the private XDG state:
+
+```sh
+cao intake triage --id <submission-id>
+cao intake triage --id <submission-id> --repo /path/to/repo --cutoff 2026-10-01
+cao intake triage --item-id <item-id> --source-ref <ref-or-commit>
+cao intake triage --id <submission-id> --repo /path/to/repo --implemented <commit>
+```
+
+Exit codes are `0` success, `2` usage error and `3` explicit
+`UNAVAILABLE`/refusal. Any command without a complete owning implementation
+reports structured `UNAVAILABLE` and a nonzero exit.
+
+**Tests (synthetic only).** `tests/test_intake_triage.py` is the runnable check
+and covers the acceptance list below; `tests/test_boundaries.py` additionally
+guards that triage imports no execution/authority concern, reaches the Registry
+through read-only calls only, opens no egress surface and uses no shell:
+
+- **unsafe input injection** — an admitted body full of shell metacharacters and
+  directive-shaped text changes no behaviour and is treated as opaque data;
+- **stale sources** — a source older than the evidence cutoff is reported stale,
+  never silently used as current;
+- **unauthorized reads** — a context source outside the operator's permission
+  fails closed, never returned;
+- **ambiguity** — an ambiguous request yields `HUMAN_REVIEW` or `ASK_CONTEXT`,
+  never a confident wrong disposition;
+- **duplicate** and **already implemented** — detected and reported, not
+  re-proposed as new work;
+- **replay** — the same submission triaged twice is idempotent; different
+  evidence is a distinct packet; a packet id reused for different content is a
+  conflict, never a silent merge;
+- **privacy** — with an unqualified provider, B3 yields the deterministic
+  context packet and sends nothing.
+
+**Acceptance gate.** B3 is accepted only on independent review of the above
+tests, the provenance record and the absence of any effect path.
+
+## 5. Phase B4 — governed routing and batch compiler
+
+**Status: plan only. Not implemented.**
+
+**Goal.** Take a B3 `PROPOSE_WORK` (and only that) and route it to an
+accountable home, then compile an immutable reviewable manifest for **existing**
+Team Execution. B4 **never starts work on intake alone.**
+
+**Matching.** B4 matches a proposal against:
+
+- the **accepted standing Plan / objective / work package**;
+- the required **Capability**;
+- the **domain** (repository and path scope);
+- the **performer qualification** and **current authority**;
+- the **approval digest**;
+- the **specific owner or reviewer**.
+
+**Performer law.** Human, AI, software and hybrid performers are all supported
+**through existing law**. A role is **configuration of the work, not
+authority**: a role name, a status string or the mere presence of a capability
+never grants authority. This mirrors the doctrine's performer-as-configuration
+rule and CAO's existing separation of concerns.
+
+**Output.** Immutable, reviewable `cao.team.v1` manifests consumed by the
+**existing** CAO Team Execution path. B4 compiles and records; it starts
+nothing.
+
+**Derived, not duplicated.** Queue position, ownership, escalation and the
+separation of **approval from release** are **derived** from existing evidence
+(the shared Registry, team checkpoints, plan records). B4 introduces no new
+ledger and no new authority.
+
+**Tests to write (synthetic only):** stale plan; revoked scope; unqualified
+performer; missing review; domain/path conflict; repeated request; no auto
+execution.
+
+**Acceptance gate.** B4 is accepted only after B3 acceptance, on independent
+review proving that routing is evidence-derived, manifest compilation is
+immutable, and no path starts or claims work.
+
+## 6. Phase B5 — request to resolution
+
+**Status: plan only. Not implemented.**
+
+**Goal.** Give the requester a truthful status and name the accountable **next
+mover**, derived from **existing** evidence — never fabricated.
+
+**Derived status.** Requester status and next mover are computed from existing
+Intake, triage, team, Registry, PR, review and acceptance evidence. The status
+vocabulary must truthfully show at least: **clarification requested**,
+**work proposed**, **waiting for review**, **verified answer**, **completion**,
+and **later outcomes** — **without false closure**. A request is never shown as
+answered or closed without the matching acceptance evidence.
+
+**Channel adapters.** Qualified adapters may reply on the **originating
+channel** with *followup*, *answer* and *event receipts* — but **only after
+explicit send authorization**. Adapters run **dry-run / mock first**. B5 does
+**not** build a custom marketplace MCP server, and does **not** presume a
+CAO-owned external status API. Marketplace policy and any channel credential
+remain the operator's, external to CAO, exactly as `docs/intake.md` states.
+
+**Guest view.** An optional **guest-owned status view** may be exposed through
+the operator's existing internal control surface, strictly as a **projection**.
+It is **not** a new canonical database, not a second source of truth, and not
+authority.
+
+**Tests to write (synthetic only):** guest and cross-tenant leak; wrong
+recipient; retries / ambiguous send; absent approval; missing evidence;
+misreported sent/closed.
+
+**Acceptance gate.** B5 is accepted only after B4 acceptance, on independent
+review proving truthful status derivation, gated and idempotent sends, and
+projection-only guest access.
+
+## 7. Dependencies and gates
+
+```text
+B2 final security approval
+  → B3 implementation            [done: SOURCE_COMPLETE]
+  → B3 independent acceptance    [pending]
+  → B4 implementation            [plan]
+  → B4 independent acceptance    [plan]
+  → B5                           [plan]
+```
+
+- No phase begins before the **previous gate is accepted**. B4 does not start
+  until B3's independent acceptance is recorded.
+- **Model qualification.** The owner plan names a read/manager model, a writer
+  model and a final-read advisory model. Every role is **qualified by provider
+  privacy and source scope**, and none is certified suitable for
+  private/client/tenant/secret data by the plan alone.
+- **Shared Registry and the same daemon.** B3–B5 reuse the one shared Work
+  Registry and the existing CAO daemon. No new scheduler, timer or manager.
+- **One governed batch/commit per repository**, with the full normal and `-S`
+  test suites. Git, CI and release state are verified **separately** — a commit
+  is not a merge, a merge is not a deploy, and a deploy is not live acceptance.
+
+## 8. Completion-state vocabulary
+
+Five distinct states, never collapsed:
+
+| State | Means | Does **not** mean |
+|---|---|---|
+| `SOURCE_COMPLETE` | The source change exists at a head | reviewed, merged or accepted |
+| `TEAM_COMPLETE` | The governed team run finished | merged to the default branch |
+| `MERGED` | Landed on the target branch | built, deployed or released |
+| `DEPLOYED` | Running in the target environment | verified live |
+| `LIVE_ACCEPTED` | Independently accepted in operation | permanent or self-maintaining |
+
+Reports must name the exact state reached and must not promote a lower state to
+a higher one.
+
+## 9. Pilot and acceptance criteria; smallest first steps
+
+**Pilot posture.** Every phase is piloted **synthetic-only**: invented
+submissions, invented repos, invented identities. No real client or private
+payload is used in a pilot or a test.
+
+**Smallest first steps (in order):**
+
+1. **B3 read-only context packet** — read one private submission and assemble a
+   deterministic context packet with an explicit evidence cutoff. No model.
+   **Done.**
+2. **B3 deterministic triage** — emit one of the five dispositions from
+   deterministic rules, with provenance, no provider. **Done.**
+3. **B3 qualified-AI triage** — enable the AI path only behind the provider
+   privacy gate; keep the deterministic path as the fallback. **Not started;**
+   this build performs no egress.
+4. **B4 matcher** — match a proposal to an accepted Plan/work package and refuse
+   on stale, revoked, unqualified, missing-review and conflict cases.
+5. **B4 manifest compiler** — compile one immutable `cao.team.v1` manifest with
+   no execution.
+6. **B5 derived status** — compute requester status and next mover from existing
+   evidence only.
+7. **B5 dry-run adapter** — one mock channel send, gated and receipted, before
+   any real adapter.
+
+**Acceptance criteria per phase:** full normal and `-S` test suites pass; the
+phase's tests pass; the foundation CLI smoke passes; `git diff --check` is
+clean; an independent reviewer confirms the phase's evidence and the absence of
+disallowed effects.
+
+## 10. Doctrine admission gate
+
+Before any future cross-project work-admission doctrine change is made, the
+implementation must first rehearse a **synthetic standing-Plan** end to end:
+proposal → matched accepted Plan/work package → compiled manifest → derived
+status. Only after that rehearsal passes may a doctrine change be proposed.
+This roadmap makes **no** doctrine change itself.
+
+## 11. Explicit non-goals
+
+B3–B5 do **not** introduce: a universal task database; a new authority concept;
+a dispatcher, scheduler or queue; a second Registry or a second ledger; a custom
+marketplace MCP server; a presumed external status API; automatic execution on
+intake; automatic or unapproved outbound messaging; or any fabricated
+completion, sent or closed state.
+
+## 12. Open questions and research debt
+
+- **Request/event intake remains research debt.** The shape of a generic
+  request/event intake beyond the current operator submission is unsettled.
+- **Marketplace policy is unresolved** (see `docs/intake.md`): whether and how a
+  marketplace app may deliver a document to a local adapter is a platform
+  question, and CAO implements the receiving side only.
+- **Vendor ROI is unmeasured.** The source page's routing, queue and audit
+  claims are vendor statements; none is independently measured here.
+- **Legal-specific mechanisms may not transfer.** Rule-based routing to approved
+  agents/lawyers, team queues and guest status are legal-work patterns; their
+  transfer to generic CAO is a hypothesis to test, not an assumption.
+- **Channel credentials stay external.** Any credential a connected adapter
+  needs is the operator's, external to CAO, and is never passed into intake.
+- **B3 provider path is unbuilt.** The AI triage step stays behind the provider
+  privacy gate and is not implemented in this build.
+
+## 13. Provenance
+
+| Item | Source | Standing |
+|---|---|---|
+| Vendor intake capabilities | official intake product page, reviewed 2026-10-14 | vendor claims, not independently measured |
+| B1/B2 admission contract | `docs/intake.md`, `src/cao/intake.py`, `src/cao/intake_bridge.py` | committed; final security acceptance recorded separately |
+| B3 advisory triage | `src/cao/intake_triage.py`, `tests/test_intake_triage.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
+| Team Execution manifest `cao.team.v1` | `docs/team-execution.md` | shipped |
+| Performer/authority/evidence semantics | owner's cross-project work-execution contract (owner-referenced v0.4) | owner planning reference; re-verify against canonical home |
+| B4–B5 design | this document | **accepted owner plan, not operating fact** |
+
+## 14. Navigation
+
+- Current shipped intake contract: [`docs/intake.md`](intake.md)
+- Team execution contract: [`docs/team-execution.md`](team-execution.md)
+- Portfolio admission planning: [`docs/portfolio-admission.md`](portfolio-admission.md)
+- Repository overview: [`README.md`](../README.md)

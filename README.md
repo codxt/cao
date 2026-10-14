@@ -53,6 +53,14 @@ an agent and write state under the CAO roots; they fail closed with an explicit
 Neither surface invents a result: when required state cannot be read, the
 command prints explicit `UNAVAILABLE` evidence and exits nonzero.
 
+`cao intake` is the inbound gate and its on-demand advisory triage. `submit`,
+`list`, `show` and `pull` admit and read private submissions; `triage` reads one
+admitted submission together with bounded read-only context and returns one
+advisory, provenance-linked disposition. Admission is not work and triage is not
+authority: neither starts, merges, dispatches or schedules anything. See
+[`docs/intake.md`](docs/intake.md) and the
+[B3–B5 governed-intake roadmap](docs/intake-roadmap.md).
+
 ## Install
 
 Requires Python 3.10+ and a POSIX `sh`. The read-only core is pure Python and
@@ -203,7 +211,8 @@ See [`docs/architecture.md`](docs/architecture.md),
 [`docs/runtime-plugin.md`](docs/runtime-plugin.md),
 [`docs/operators.md`](docs/operators.md),
 [`docs/automations.md`](docs/automations.md),
-[`docs/intake.md`](docs/intake.md), and
+[`docs/intake.md`](docs/intake.md),
+[`docs/intake-roadmap.md`](docs/intake-roadmap.md), and
 [`docs/extraction-provenance.md`](docs/extraction-provenance.md).
 
 ## Development and validation

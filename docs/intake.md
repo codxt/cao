@@ -239,6 +239,68 @@ and adds a remote egress surface, while the marketplace stdin path already
 covers the operator's connected flow. It is reported as an explicit deferred
 transport rather than silently missing; no half-working adapter is registered.
 
+## Advisory triage (B3): on-demand, read-only
+
+`cao intake triage` is the on-demand B3 path. It reads one already-admitted
+submission and bounded read-only context, and returns **one advisory
+disposition** with cited provenance. It is **read-only**: it starts, merges,
+dispatches, schedules, claims, sends and deploys nothing, and writes no Registry
+row. It is deliberately distinct from the submission (its own private packet
+store) and from canonical accepted Company State.
+
+```sh
+cao intake triage --id <submission-id>          # advisory packet for one admission
+cao intake triage --id <id> --repo /path/repo   # + bounded default-branch Git evidence
+cao intake triage --item-id <item-id>           # derive the submission id from the item id
+cao intake triage --id <id> --repo /repo --cutoff 2026-10-01
+cao intake triage --id <id> --repo /repo --implemented <commit>
+```
+
+Exactly five dispositions are permitted: `ASK_CONTEXT`, `ANSWER_CANDIDATE`,
+`PROPOSE_WORK`, `HUMAN_REVIEW` and `DENY_OR_REPLAN`. `PROPOSE_WORK` and
+`ANSWER_CANDIDATE` are **advisory only**: a proposal must still go through the
+future B4 routing, and a candidate answer is not self-authorized.
+
+Read-only context, each with explicit `UNKNOWN`/`UNAVAILABLE` when unavailable:
+
+- the submission itself, through intake's own strict reader (never the
+  permissive state reader);
+- the submission's declared `evidence_refs`;
+- bounded default-branch Git evidence for `--repo`: the resolved default branch,
+  the source commit id and its commit time;
+- local CAO team summaries and active Work Registry claims, read through the
+  Registry's read-only (`mode=ro`) connection — no claim, no mutation.
+
+Load-bearing properties:
+
+- **Deterministic and self-honest.** The disposition comes from a documented rule
+  table, never from a model. With no qualified provider this build performs **no
+  provider egress** and always yields the deterministic context packet; it never
+  pretends an AI decided.
+- **No fabricated claims.** Duplicate and already-implemented status are reported
+  only with attributable evidence; priority, dependencies and capability hints
+  stay `UNKNOWN` when uncertain.
+- **Separate, private, idempotent storage.** Advisory packets live under
+  `$XDG_STATE_HOME/cao/intake-triage/`, directories `0700` and files `0600`,
+  written through the same validated, atomic, fsynced store as admission. The
+  packet id is a one-way digest of the evidence bundle, so an identical replay is
+  idempotent and different evidence is a distinct packet — never a silent merge.
+  The packet **never carries the submission body**.
+- **Fail closed.** A stale source is reported stale and is not used as current
+  grounding; a symlinked, foreign-owned or unsafe-mode path, a malformed packet,
+  a bad ref, cutoff or commit, an unresolvable repository or a hostile body all
+  fail closed. The submission body is opaque data: it is inspected only to pick a
+  disposition and flag risk, and is never executed or interpolated into a shell.
+- **No invented scope.** Intake is single-operator and models no tenant or guest
+  principal, so triage invents no cross-scope identity: it reads only the
+  operator's own private state and locally available evidence. A source outside
+  that — an unresolvable ref, an unverifiable commit, a stale source — fails
+  closed rather than being silently adopted.
+
+The full plan for the governed middle — B3 (implemented), B4 routing and B5
+resolution (both future plan) — is in
+[`docs/intake-roadmap.md`](intake-roadmap.md).
+
 ## Limitations and unresolved items
 
 - **Marketplace policy is unresolved.** Whether and how a marketplace app may
@@ -258,11 +320,16 @@ transport rather than silently missing; no half-working adapter is registered.
 
 `tests/test_intake.py` (admission, idempotency, conflict, corruption,
 concurrency, redaction, strict input, CLI, stored-record tamper detection,
-private-path safety, list-absence handling, directory-ancestry durability and
-post-validation parent-substitution refusal) and
-`tests/test_intake_bridge.py` (end-to-end stdin admission, retries and
-reconciliation, collision, injection inertness, fail-closed
+private-path safety, list-absence handling, directory-ancestry durability,
+post-validation parent-substitution refusal and the shared private-store
+toolkit) and `tests/test_intake_bridge.py` (end-to-end stdin admission, retries
+and reconciliation, collision, injection inertness, fail-closed
 unsupported/deferred transports and transport-before-input ordering) are the
-runnable check. `tests/test_boundaries.py` additionally guards that intake never
-routes a durable record through the permissive state reader. Every value is
-synthetic; nothing is shipped and no private payload is used.
+runnable check. `tests/test_intake_triage.py` is the B3 runnable check: all five
+dispositions, refusal and unknown paths, stale sources, duplicate and
+already-implemented detection, replay/conflict, private crash-safe storage,
+prompt-injection inertness and the CLI. `tests/test_boundaries.py` additionally
+guards that intake never routes a durable record through the permissive state
+reader and that triage reaches the Registry through read-only calls only, opens
+no egress surface and uses no shell. Every value is synthetic; nothing is
+shipped and no private payload is used.

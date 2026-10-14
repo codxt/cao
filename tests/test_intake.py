@@ -1045,6 +1045,49 @@ class ParentSubstitutionTests(_StateFixture):
         self.assertTrue((moved / (sid + ".json")).is_file())
 
 
+class SharedStoreToolkitTests(_StateFixture):
+    """The shared private-store toolkit stays bounded and fails closed.
+
+    ``intake`` exposes these primitives so the B3 triage store can reuse the
+    exact validation, atomicity and fsync discipline of admission instead of
+    re-implementing storage. They must not weaken any B1/B2 guarantee.
+    """
+
+    def test_open_private_dir_creates_an_owned_0700_directory(self) -> None:
+        target = str(Path(self._temp.name) / "toolkit")
+        fd = intake.open_private_dir(target)
+        try:
+            self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o700)
+            self.assertTrue(intake.write_private_record(fd, "a.json", "{}"))
+            self.assertFalse(intake.write_private_record(fd, "a.json", "{}"))
+            self.assertEqual(intake.read_private_record(fd, "a.json"), {})
+            self.assertEqual(intake.list_private_names(fd), ["a.json"])
+        finally:
+            os.close(fd)
+
+    def test_open_private_dir_readonly_is_none_when_absent(self) -> None:
+        self.assertIsNone(
+            intake.open_private_dir_readonly(str(Path(self._temp.name) / "gone"))
+        )
+
+    def test_symlinked_private_dir_fails_closed(self) -> None:
+        target = Path(self._temp.name) / "real"
+        target.mkdir()
+        link = Path(self._temp.name) / "link"
+        os.symlink(target, link)
+        with self.assertRaises(intake.IntakeError):
+            intake.open_private_dir(str(link))
+
+    def test_duplicate_json_keys_in_a_private_record_fail_closed(self) -> None:
+        fd = intake.open_private_dir(str(Path(self._temp.name) / "keys"))
+        try:
+            intake.write_private_record(fd, "b.json", '{"a": 1, "a": 2}')
+            with self.assertRaises(intake.IntakeStateError):
+                intake.read_private_record(fd, "b.json")
+        finally:
+            os.close(fd)
+
+
 class CliTests(_StateFixture):
     def _run(self, argv: list[str]) -> tuple[int, dict]:
         stream = io.StringIO()

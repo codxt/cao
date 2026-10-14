@@ -63,7 +63,40 @@ SEPARATION_RULES = {
         "registry",
         "cao.registry",
     ),
+    # B3 advisory triage reads existing context (including the Work Registry,
+    # read-only) but must not reach execution, policy or the runtime contract,
+    # so an advisory result can never start, merge or claim anything. Its
+    # Registry access is separately restricted to read-only calls below.
+    "intake_triage.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
 }
+
+# The ONLY Registry attributes advisory triage may touch. Every mutating entry
+# point (connect, propose, claim, release, handoff, write_gate, ...) is absent,
+# so a triage packet can read active claims but can never write one.
+TRIAGE_REGISTRY_ALLOWED = frozenset({
+    "APP_DIR",
+    "DB_NAME",
+    "connect_readonly",
+    "list_active_claims",
+    "objective_tokens",
+    "lexical_similarity",
+    "OVERLAP_THRESHOLD",
+})
+
+# Modules that would create an egress surface. B3 performs no provider egress:
+# with no qualified provider it always yields the deterministic packet.
+EGRESS_MODULES = frozenset({
+    "socket", "ssl", "urllib", "http", "http.client", "ftplib", "smtplib",
+    "telnetlib", "xmlrpc", "asyncio", "requests", "httpx", "aiohttp",
+    "urllib3",
+})
 
 PRIVATE_TOKENS = (
     "albr",
@@ -249,6 +282,86 @@ class IntakeStrictnessBoundaryTests(unittest.TestCase):
     def test_intake_source_has_no_permissive_state_fallback(self) -> None:
         text = (CAO_ROOT / "intake.py").read_text(encoding="utf-8")
         self.assertNotIn("read_state", text)
+
+
+class IntakeTriageBoundaryTests(unittest.TestCase):
+    """B3 advisory triage: read-only, no egress, no shell, no execution."""
+
+    def _tree(self) -> ast.AST:
+        return ast.parse((CAO_ROOT / "intake_triage.py").read_text("utf-8"))
+
+    def test_registry_access_is_readonly_only(self) -> None:
+        offenders: set[str] = set()
+        for node in ast.walk(self._tree()):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "registry"
+            ):
+                if node.attr not in TRIAGE_REGISTRY_ALLOWED:
+                    offenders.add(node.attr)
+        self.assertEqual(offenders, set())
+
+    def test_no_egress_modules(self) -> None:
+        imported = _imports(CAO_ROOT / "intake_triage.py")
+        offenders = sorted(
+            module for module in imported if module in EGRESS_MODULES
+        )
+        self.assertEqual(offenders, [])
+
+    def test_no_shell_eval_or_dynamic_import(self) -> None:
+        offenders: list[str] = []
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in {
+                "eval", "exec", "__import__", "compile",
+            }:
+                offenders.append(func.id)
+            if isinstance(func, ast.Attribute):
+                if (
+                    func.attr in {"system", "popen"}
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    offenders.append(f"os.{func.attr}")
+                if func.attr in {"run", "call", "check_output", "Popen"}:
+                    for keyword in node.keywords:
+                        if keyword.arg == "shell":
+                            offenders.append("subprocess shell=True")
+        self.assertEqual(offenders, [])
+
+    def test_git_is_reached_only_through_the_validated_argv_choke_point(self) -> None:
+        # The module may import the read-only git probe core, but every actual
+        # git invocation must go through ``_run_git``. A stray ``subprocess``
+        # call outside it would bypass the allowlist.
+        tree = self._tree()
+        direct = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_git":
+                for inner in ast.walk(node):
+                    if (
+                        isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "run"
+                    ):
+                        direct += 1
+        self.assertEqual(direct, 1)
+
+    def test_no_registry_writes_or_ledger_in_triage(self) -> None:
+        text = (CAO_ROOT / "intake_triage.py").read_text(encoding="utf-8")
+        for forbidden in (
+            "registry.connect(",
+            "registry.propose",
+            "registry.claim(",
+            "registry.release",
+            "registry.handoff",
+            "registry.write_gate",
+            "registry.record_observation",
+            "registry.record_disposition",
+        ):
+            self.assertNotIn(forbidden, text)
 
 
 class RecursiveGuardTests(unittest.TestCase):
