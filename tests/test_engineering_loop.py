@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from cao import engineering_loop as e, product_config
+from cao import engineering_metrics as metrics_mod
 
 HEAD = "b" * 40
 BASE = "a" * 40
@@ -417,6 +418,83 @@ class EngineeringTests(unittest.TestCase):
         with self.assertRaises(e.EngineeringError):
             self.tick()
         self.assertFalse(self.state_file.exists())
+
+
+class EngineeringMetricsIntegrationTests(EngineeringTests):
+    """The R4 SLA/exception metrics observed through the real tick and queue."""
+
+    def test_checkpoint_first_seen_is_stable_and_operator_wait_reported(self):
+        # The first effectful tick records the exact head/evaluation sighting.
+        self.tick(execute=True)
+        saved = json.loads(self.state_file.read_text())
+        self.assertEqual(saved["first_seen"], "2026-10-11T00:00:00Z")
+        later = self.tick(execute=True, now=NOW + dt.timedelta(hours=30))
+        self.assertEqual(later["status"], "AWAITING_OPERATOR_APPROVAL")
+        self.assertEqual(later["metrics"]["wait"], "operator_grant")
+        self.assertEqual(later["metrics"]["age_seconds"], 30 * 3600)
+        self.assertEqual(later["metrics"]["first_seen"], "2026-10-11T00:00:00Z")
+        self.assertEqual(later["exceptions"][0]["code"],
+                         metrics_mod.OPERATOR_GRANT_WAIT_EXCEEDED)
+        self.assertEqual(len(self.merges), 0)
+
+    def test_repeated_tick_is_identical_and_never_resubmits(self):
+        self.grant()
+        first = self.tick(execute=True)
+        self.assertEqual(first["status"], "AUTO_MERGE_REQUESTED")
+        self.assertEqual(first["exceptions"], [])
+        self.assertEqual(len(self.merges), 1)
+        second = self.tick(execute=True, now=NOW + dt.timedelta(minutes=10))
+        self.assertEqual(second["status"], "AWAITING_GITHUB_RECONCILIATION")
+        self.assertEqual([x["code"] for x in second["exceptions"]],
+                         [metrics_mod.GITHUB_RECONCILIATION_PENDING])
+        self.assertEqual(len(self.merges), 1)
+
+    def test_identity_collision_and_source_drift_are_source_gate_exceptions(self):
+        self.grant()
+        self.github["user"] = {"login": "operator"}
+        held = self.tick()
+        self.assertEqual(held["status"], "SEPARATE_OPERATOR_IDENTITY_REQUIRED")
+        self.assertEqual([x["code"] for x in held["exceptions"]],
+                         [metrics_mod.SOURCE_GATE_HELD])
+        self.github["user"] = {"login": "automation-bot"}
+        self.evaluation["candidate_sha"] = "d" * 40
+        self.save()
+        drifted = self.tick()
+        self.assertEqual(drifted["status"], "PR_SOURCE_MISMATCH")
+        self.assertEqual([x["code"] for x in drifted["exceptions"]],
+                         [metrics_mod.SOURCE_GATE_HELD])
+        self.assertEqual(self.merges, [])
+
+    def test_missing_evaluation_measurement_is_refused_not_promoted(self):
+        self.grant()
+        del self.evaluation["objective_gain"]
+        self.save()
+        with self.assertRaises(e.EngineeringError):
+            self.tick(execute=True)
+        self.assertEqual(self.merges, [])
+        self.assertFalse(self.state_file.exists())
+
+    def test_queue_surfaces_its_members_exceptions(self):
+        queue = self.root / "queue"
+        queue.mkdir()
+        (queue / "001-first.json").write_text(json.dumps(self.manifest))
+        fresh = e.tick_queue(str(queue), execute=True, fetch=self.fetch,
+                             submit=self.submit, now=NOW)
+        self.assertEqual(fresh["exceptions"], [])
+        self.assertEqual(fresh["items"][0]["metrics"]["wait"], "operator_grant")
+        self.github["repos/example/repo/pulls/12"]["head"]["sha"] = BASE
+        drifted = e.tick_queue(str(queue), execute=True, fetch=self.fetch,
+                               submit=self.submit,
+                               now=NOW + dt.timedelta(seconds=120))
+        self.assertEqual([x["code"] for x in drifted["exceptions"]],
+                         [metrics_mod.SOURCE_GATE_HELD])
+        self.assertEqual(self.merges, [])
+
+    def test_metrics_enable_no_private_watch_or_cadence(self):
+        defaults = product_config.daemon_defaults()
+        self.assertIsNone(defaults.engineering_watch_file)
+        self.assertIsNone(defaults.engineering_queue_dir)
+        self.assertIsNone(defaults.feedback_watch_file)
 
 
 if __name__ == "__main__":

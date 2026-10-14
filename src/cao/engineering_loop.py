@@ -24,6 +24,8 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Callable
 
+from . import engineering_metrics
+
 SCHEMA = "cao.engineering.watch.v1"
 STATE_SCHEMA = "cao.engineering.state.v1"
 #: The canonical evaluation report schema. A report exported under the earlier
@@ -357,12 +359,24 @@ def _tick_unlocked(watch_file: str, *, execute: bool = False,
     baseline, head = _comparison(snapshot, manifest)
     identity = _digest(manifest)
     state = _read_state(manifest["state_file"], identity)
+    # One bounded, source-attested clock for the exact head/evaluation the
+    # checkpoint already binds. It is carried in the SAME checkpoint file, so
+    # no second ledger is introduced, and it resets whenever head or evaluation
+    # changes. An older checkpoint without the field falls back to its own last
+    # checked stamp rather than failing closed on this non-essential metric.
+    stamp = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    first_seen = stamp
+    if (state is not None and state.get("head") == head
+            and state.get("evaluation_sha256") == eval_sha):
+        prior = state.get("first_seen") or state.get("last_checked")
+        if isinstance(prior, str) and engineering_metrics.STAMP.fullmatch(prior):
+            first_seen = prior
     def checked(payload: dict) -> dict:
         if execute:
             _save_state(manifest["state_file"], {
                 "schema": STATE_SCHEMA, "manifest_sha256": identity,
                 "head": head, "evaluation_sha256": eval_sha,
-                "last_checked": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last_checked": stamp, "first_seen": first_seen,
                 "phase": "CHECKED",
             })
         return payload
@@ -374,6 +388,7 @@ def _tick_unlocked(watch_file: str, *, execute: bool = False,
         "evaluation_sha256": eval_sha, "status": "HOLD",
         "merge_requested": False, "deployment_authorized": False,
         "operator_approval_required": True,
+        "first_seen": first_seen, "observed_at": stamp,
     }
     if state is not None:
         if state.get("phase") in ("SUBMITTING", "REQUESTED"):
@@ -460,7 +475,7 @@ def _tick_unlocked(watch_file: str, *, execute: bool = False,
     base_state = {
         "schema": STATE_SCHEMA, "manifest_sha256": identity,
         "head": head, "evaluation_sha256": eval_sha,
-        "last_checked": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "last_checked": stamp, "first_seen": first_seen,
         "phase": "SUBMITTING",
     }
     _save_state(manifest["state_file"], base_state)
@@ -503,12 +518,16 @@ def tick(watch_file: str, *, execute: bool = False,
          submit: Callable[[str, int, str], None] | None = None,
          now: dt.datetime | None = None) -> dict:
     if not execute:
-        return _tick_unlocked(watch_file, execute=False,
-                              fetch=fetch, submit=submit, now=now)
-    manifest = validate(_file(watch_file))
-    with _effect_lock(manifest["state_file"]):
-        return _tick_unlocked(watch_file, execute=True,
-                              fetch=fetch, submit=submit, now=now)
+        result = _tick_unlocked(watch_file, execute=False,
+                                fetch=fetch, submit=submit, now=now)
+    else:
+        manifest = validate(_file(watch_file))
+        with _effect_lock(manifest["state_file"]):
+            result = _tick_unlocked(watch_file, execute=True,
+                                    fetch=fetch, submit=submit, now=now)
+    # The SLA/exception metrics are derived from the tick result and its own
+    # checkpoint stamps; they report only, and never change the gate verdict.
+    return engineering_metrics.annotate(result)
 
 
 def tick_queue(directory: str, *, execute: bool = False,
@@ -542,19 +561,25 @@ def tick_queue(directory: str, *, execute: bool = False,
         _comparison(_file(plan["evaluation_file"]), plan)
         _read_state(plan["state_file"], _digest(plan))
     status = []
+    exceptions: list[dict] = []
     for file in paths:
         row = tick(file, execute=execute, fetch=fetch, submit=submit, now=now)
+        item_exceptions = list(row.get("exceptions") or [])
+        exceptions.extend(item_exceptions)
         status.append({
             "watch_id": row["watch_id"], "repo": row["repo"],
             "pr": row["pr"], "status": row["status"],
             "merge_requested": row["merge_requested"],
+            "metrics": row.get("metrics"),
+            "exceptions": item_exceptions,
         })
         if row["status"] != "MERGED_SOURCE_ONLY":
             return {
                 "schema": "cao.engineering.queue.v1", "status": "PENDING",
                 "in_flight": row["watch_id"], "items": status,
+                "exceptions": exceptions,
             }
     return {
         "schema": "cao.engineering.queue.v1", "status": "COMPLETE",
-        "in_flight": None, "items": status,
+        "in_flight": None, "items": status, "exceptions": exceptions,
     }

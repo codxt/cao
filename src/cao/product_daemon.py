@@ -50,6 +50,7 @@ from typing import Any, Callable
 
 from . import (
     coordinator,
+    engineering_metrics,
     evidence,
     improvement,
     product_config,
@@ -809,6 +810,11 @@ class Daemon:
         checkpoints = dict(record.get("checkpoints") or {})
         supervision = dict(record.get("supervision") or {})
         effects: list[dict[str, Any]] = []
+        # Source-attested inputs to the R4 exception report. Everything is
+        # collected from records this tick already read; nothing is sent,
+        # persisted as a second ledger, or applied from the derived report.
+        engineering_exceptions: list[dict[str, Any]] = []
+        team_decisions: list[dict[str, Any]] = []
 
         for task in tasks:
             task_id = task.get("task_id")
@@ -892,6 +898,7 @@ class Daemon:
                     "watch_id": report["watch_id"],
                     "merge_requested": report["merge_requested"],
                 })
+                engineering_exceptions.extend(report.get("exceptions") or [])
             except (engineering_loop.EngineeringError, OSError, ValueError,
                     TypeError, UnicodeError) as exc:
                 record["errors"] = int(record.get("errors") or 0) + 1
@@ -910,6 +917,7 @@ class Daemon:
                     "merge_requested": any(
                         item["merge_requested"] for item in report["items"]),
                 })
+                engineering_exceptions.extend(report.get("exceptions") or [])
             except (engineering_loop.EngineeringError, OSError, ValueError,
                     TypeError, UnicodeError) as exc:
                 record["errors"] = int(record.get("errors") or 0) + 1
@@ -934,6 +942,7 @@ class Daemon:
                     # recorded in its own checkpoint. The daemon never applies
                     # a recovery itself: it reports what the team decided.
                     for decision in update.get("recovery") or ():
+                        team_decisions.append(decision)
                         effects.append({
                             "team_id": update["team_id"],
                             "task_id": decision.get("task_id"),
@@ -952,6 +961,18 @@ class Daemon:
                     "reason": getattr(exc, "code", type(exc).__name__),
                 })
         now = evidence.utc_now(self._clock)
+        # One bounded exception report over the records this tick already read.
+        # A healthy tick emits nothing here: only a real exception is surfaced,
+        # so this is not a routine per-tick message. The daemon applies none of
+        # it and persists no second ledger.
+        metrics_view = engineering_metrics.summary(engineering_metrics.report(
+            team_decisions=team_decisions, tasks=tasks,
+            exceptions=engineering_exceptions, now=now))
+        if metrics_view["status"] == "EXCEPTIONS":
+            effects.append({
+                "action": "engineering_metrics", "status": metrics_view["status"],
+                "count": metrics_view["count"], "codes": metrics_view["codes"],
+            })
         record.update(
             {
                 "ticks": int(record.get("ticks") or 0) + 1,
