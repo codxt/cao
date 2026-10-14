@@ -258,8 +258,9 @@ cao intake triage --id <id> --repo /repo --implemented <commit>
 
 Exactly five dispositions are permitted: `ASK_CONTEXT`, `ANSWER_CANDIDATE`,
 `PROPOSE_WORK`, `HUMAN_REVIEW` and `DENY_OR_REPLAN`. `PROPOSE_WORK` and
-`ANSWER_CANDIDATE` are **advisory only**: a proposal must still go through the
-future B4 routing, and a candidate answer is not self-authorized.
+`ANSWER_CANDIDATE` are **advisory only**: a proposal may be routed by the B4
+compiler (which still grants no authority), and a candidate answer is not
+self-authorized.
 
 Read-only context, each with explicit `UNKNOWN`/`UNAVAILABLE` when unavailable:
 
@@ -308,6 +309,82 @@ The full plan for the governed middle — B3 (implemented), B4 routing and B5
 resolution (both future plan) — is in
 [`docs/intake-roadmap.md`](intake-roadmap.md).
 
+## Governed routing compiler (B4): draft only
+
+`cao intake compile` is the B4 path. It reads one already-persisted B3 advisory
+packet whose disposition is **`PROPOSE_WORK`** — and only that — together with a
+strictly bounded, operator-supplied **route evidence** file, and compiles one
+**immutable, reviewable `cao.team.v1` draft** intended for the **existing** CAO
+Team Execution path.
+
+```sh
+cao intake compile --packet-id <packet-id> --route-file route.json
+cao intake compile --packet-id <packet-id> --route-file route.json --dry-run
+```
+
+It is **draft only**. The compiled manifest is `proposed`, carries
+`authority = "none"` and `dispatch = false`, and names the explicit owner and
+reviewer. B4 compiles and records; it starts, merges, dispatches, schedules,
+claims, sends and deploys nothing, writes no Registry row and writes no
+canonical Company State. The accountable owner must independently review the
+draft and run `cao team init --approved` before any governed dispatch is
+considered, and then authorize dispatch separately.
+
+The route file is **evidence, never approval**. It can only supply the accepted
+Plan/objective/work package, the required Capability, the domain/repository/path
+scope, the performer qualification and the current authority; it cannot
+authorize anything. Each load-bearing claim must cite a **source document
+anchored to an exact Git identity** (repository, ref, commit id, committer time
+and content digest). B4 verifies every citation with read-only Git evidence: the
+checkout is readable, the ref resolves to the cited commit id and time, and the
+document at that commit matches the cited digest. A free-text `accepted: true`,
+an unverifiable digest, a ref that has moved, a missing document or a
+credential-shaped value is refused rather than accepted.
+
+That verification establishes only that the cited document **exists at that
+commit with that content**. It does **not** establish that a currently-effective
+delegation or an operator decision exists: `accepted_at` and the authority grant
+are cited evidence, not proof of authority. The draft therefore reports the
+authority grant as declared but **not verified** (`verified: false`,
+`source_verified: true` — source existence only), keeps `authority = "none"` and
+`dispatch = false`, and leaves acceptance to the accountable owner outside Git.
+No digest, timestamp or free-text acceptance in the route can assert authority.
+
+Where a precondition cannot be objectively established B4 returns an explicit
+`NEEDS_HUMAN_REVIEW` (unverifiable plan, capability or authority evidence; a
+manifest with no independent reviewer of a WRITE task, or whose accountable plan
+reviewer is declared but reviews no WRITE task while an unrelated reviewer
+handles the writes; an unreadable shared Work Registry) or `UNAVAILABLE` (a
+non-`PROPOSE_WORK` packet; active Registry work overlapping the proposal; a
+performer kind with no existing Team Execution adapter) instead of fabricating a
+qualified manifest. Human, software and hybrid performers remain advisory: only
+the AI performer kind has an existing Team Execution adapter, so any other kind
+is `UNAVAILABLE` rather than a falsely launchable manifest. A role model
+selection is configuration, not authority, and no provider is certified suitable
+for private data by a draft.
+
+Load-bearing properties:
+
+- **Immutable and idempotent.** Drafts live under
+  `$XDG_STATE_HOME/cao/intake-routes/`, directories `0700` and files `0600`,
+  written through the same validated, atomic, fsynced, descriptor-relative store
+  as admission. A draft id is a one-way digest of the immutable inputs, so an
+  identical replay is idempotent, different evidence is a distinct draft, and a
+  reused id for different content is a conflict — never a silent merge.
+- **`--dry-run` creates no state.** It returns the would-be draft and writes no
+  directory or file.
+- **No dispatch, no model, no credential.** B4 opens no provider egress, runs no
+  model, holds no credential and cannot start an agent.
+- **Opaque text, screened for known credentials.** Objectives, work packages, the
+  required capability, task prompts and role instructions are untrusted, opaque
+  data: inspected and bounded, never executed or interpolated into a shell. Each
+  is refused if it is credential-shaped under intake's known-credential screen
+  (the same screen B1 admission uses) rather than persisted or silently redacted
+  into different content. This is a fail-closed screen for **known** credential
+  shapes only — it is not a guarantee that arbitrary secret text is detected — so
+  every prompt still requires operator review, and the draft never carries the
+  original submission body.
+
 ## Limitations and unresolved items
 
 - **Marketplace policy is unresolved.** Whether and how a marketplace app may
@@ -335,8 +412,18 @@ unsupported/deferred transports and transport-before-input ordering) are the
 runnable check. `tests/test_intake_triage.py` is the B3 runnable check: all five
 dispositions, refusal and unknown paths, stale sources, duplicate and
 already-implemented detection, replay/conflict, private crash-safe storage,
-prompt-injection inertness and the CLI. `tests/test_boundaries.py` additionally
+prompt-injection inertness and the CLI. `tests/test_intake_compile.py` is the B4
+runnable check: non-`PROPOSE_WORK` refusal, stale/revoked/unverifiable plan,
+unqualified capability, missing review or authority, a plan reviewer declared
+but unused by any WRITE task, wrong repository/path domain, active Registry
+overlap, replay/duplicate/conflict, prompt-injection inertness,
+credential-shaped task prompts and role instructions, symlinked/foreign route
+input, `--dry-run` creating no state, zero agent/team/claim effects, denied
+provider authority, an authority grant that is never asserted verified, and the
+CLI.
+`tests/test_boundaries.py` additionally
 guards that intake never routes a durable record through the permissive state
-reader and that triage reaches the Registry through read-only calls only, opens
-no egress surface and uses no shell. Every value is synthetic; nothing is
-shipped and no private payload is used.
+reader and that triage and B4 reach the Registry through read-only calls only,
+open no egress surface and use no shell — and that B4 never reaches a team
+execution entry point, a product task, a Registry write or canonical state.
+Every value is synthetic; nothing is shipped and no private payload is used.

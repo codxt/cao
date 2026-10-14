@@ -75,6 +75,17 @@ SEPARATION_RULES = {
         "contracts",
         "cao.contracts",
     ),
+    # B4 routing reads existing context (including the Work Registry, read-only)
+    # and shape-validates a manifest, but must not reach execution, policy or
+    # the runtime contract, so a draft can never start, merge or claim anything.
+    "intake_compile.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
 }
 
 # The ONLY Registry attributes advisory triage may touch. Every mutating entry
@@ -360,6 +371,101 @@ class IntakeTriageBoundaryTests(unittest.TestCase):
             "registry.write_gate",
             "registry.record_observation",
             "registry.record_disposition",
+        ):
+            self.assertNotIn(forbidden, text)
+
+
+class IntakeCompileBoundaryTests(unittest.TestCase):
+    """B4 routing: read-only, no egress, no shell, no execution or team write.
+
+    A compiled draft is a reviewable proposal, so this module must never reach
+    an execution entry point, initialize/start/tick a team, run a product task,
+    write a Registry row or touch canonical Company State.
+    """
+
+    def _tree(self) -> ast.AST:
+        return ast.parse((CAO_ROOT / "intake_compile.py").read_text("utf-8"))
+
+    def test_registry_access_is_readonly_only(self) -> None:
+        offenders: set[str] = set()
+        for node in ast.walk(self._tree()):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "registry"
+            ):
+                if node.attr not in TRIAGE_REGISTRY_ALLOWED:
+                    offenders.add(node.attr)
+        self.assertEqual(offenders, set())
+
+    def test_no_egress_modules(self) -> None:
+        imported = _imports(CAO_ROOT / "intake_compile.py")
+        offenders = sorted(
+            module for module in imported if module in EGRESS_MODULES
+        )
+        self.assertEqual(offenders, [])
+
+    def test_no_shell_eval_or_dynamic_import(self) -> None:
+        offenders: list[str] = []
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in {
+                "eval", "exec", "__import__", "compile",
+            }:
+                offenders.append(func.id)
+            if isinstance(func, ast.Attribute):
+                if (
+                    func.attr in {"system", "popen"}
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    offenders.append(f"os.{func.attr}")
+                if func.attr in {"run", "call", "check_output", "Popen"}:
+                    for keyword in node.keywords:
+                        if keyword.arg == "shell":
+                            offenders.append("subprocess shell=True")
+        self.assertEqual(offenders, [])
+
+    def test_git_is_reached_only_through_the_validated_choke_points(self) -> None:
+        # Every git invocation must go through ``_run_git`` (the argv-checked
+        # ``subprocess.run``) or ``_read_blob``'s bounded ``Popen``. A stray
+        # call outside them would bypass the allowlist.
+        tree = self._tree()
+        allowed = {"_run_git": {"run"}, "_read_blob": {"Popen"}}
+        offenders: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and isinstance(inner.func.value, ast.Name)
+                    and inner.func.value.id == "subprocess"
+                ):
+                    if inner.func.attr not in allowed.get(node.name, set()):
+                        offenders.append(f"{node.name}: subprocess.{inner.func.attr}")
+        self.assertEqual(offenders, [])
+
+    def test_no_team_execution_product_task_or_canonical_write(self) -> None:
+        text = (CAO_ROOT / "intake_compile.py").read_text(encoding="utf-8")
+        for forbidden in (
+            "team.initialize(",
+            "team.set_desired(",
+            "team.resume(",
+            "team.retry_read(",
+            "team.tick(",
+            "team.tick_all(",
+            "product_task.run",
+            "state.write_state",
+            "registry.connect(",
+            "registry.propose",
+            "registry.claim(",
+            "registry.release",
+            "registry.handoff",
+            "registry.write_gate",
         ):
             self.assertNotIn(forbidden, text)
 

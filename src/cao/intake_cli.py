@@ -26,7 +26,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from . import intake, intake_bridge, intake_triage
+from . import intake, intake_bridge, intake_compile, intake_triage
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -136,6 +136,46 @@ def _cmd_transports(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _refusal(command: str, code: str, message: str, status: str,
+             reasons: list[str] | None = None) -> int:
+    payload: dict[str, Any] = {
+        "schema": ERROR_SCHEMA,
+        "status": status,
+        "command": command,
+        "error": {"code": code, "verdict": status, "message": message},
+    }
+    if reasons:
+        payload["error"]["reasons"] = reasons
+    _emit(payload)
+    return EXIT_UNAVAILABLE
+
+
+def _cmd_compile(args: argparse.Namespace) -> int:
+    """Compile one PROPOSE_WORK packet into a reviewable draft (no dispatch).
+
+    Every input is validated before anything is written; ``--dry-run`` returns
+    the would-be draft and creates no state at all. No team is initialized and
+    no work is started, claimed or dispatched.
+    """
+
+    try:
+        result = intake_compile.compile_route(
+            args.packet_id,
+            args.route_file,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except intake_compile.CompileNeedsReview as exc:
+        return _refusal("compile", exc.code, str(exc), "NEEDS_HUMAN_REVIEW",
+                        exc.reasons)
+    except (intake.IntakeError, intake_triage.TriageError,
+            intake_compile.CompileError) as exc:
+        return _error("compile", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("compile", "ROUTE_ERROR", type(exc).__name__)
+    _emit(result)
+    return EXIT_OK
+
+
 def _cmd_triage(args: argparse.Namespace) -> int:
     """On-demand advisory triage of one admitted submission (read-only).
 
@@ -231,6 +271,18 @@ def build_parser() -> argparse.ArgumentParser:
     triage.add_argument("--implemented", metavar="COMMIT",
                         help="commit id that already implements the request")
     triage.set_defaults(handler=_cmd_triage)
+
+    compile_cmd = commands.add_parser(
+        "compile",
+        help="compile a PROPOSE_WORK packet into a reviewable draft (no dispatch)",
+    )
+    compile_cmd.add_argument("--packet-id", required=True, metavar="PACKET_ID",
+                             help="advisory triage packet dispositioned PROPOSE_WORK")
+    compile_cmd.add_argument("--route-file", required=True, metavar="PATH",
+                             help="bounded operator-supplied route evidence JSON")
+    compile_cmd.add_argument("--dry-run", action="store_true",
+                             help="return the draft and create no state")
+    compile_cmd.set_defaults(handler=_cmd_compile)
     return parser
 
 

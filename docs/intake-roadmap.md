@@ -1,11 +1,13 @@
 # Intake roadmap (B3–B5): governed request intake
 
 > **Document status.** Accepted **owner plan** for the governed intake middle
-> (B3–B5). **B3 is implemented in source and verified by its own tests**
-> (`src/cao/intake_triage.py`, `tests/test_intake_triage.py`) and is reported as
-> `SOURCE_COMPLETE`: reviewed, merged and independently accepted are **separate,
-> later states** and are not claimed here. **B4 and B5 remain plan only** — no
-> B4/B5 code ships in this tree, and every B4/B5 capability below is a durable
+> (B3–B5). **B3 is implemented in source** (`src/cao/intake_triage.py`,
+> `tests/test_intake_triage.py`), **merged to the default branch and
+> independently accepted**. **B4 is implemented in source**
+> (`src/cao/intake_compile.py`, `tests/test_intake_compile.py`) and is reported
+> as `SOURCE_COMPLETE`: reviewed, merged and independently accepted are
+> **separate, later states** and are not claimed here. **B5 remains plan only** —
+> no B5 code ships in this tree, and every B5 capability below is a durable
 > intention, not a claim that it exists.
 
 > **Owner.** The CAO repository owner. Shared-contract changes and anything
@@ -34,7 +36,7 @@ Three layers must stay explicit and never be blurred:
 |---|---|---|
 | **Source evidence** | What an external source or in-tree artifact actually says/does | vendor page; committed B1/B2/B3 code in `src/cao/intake.py`, `src/cao/intake_bridge.py`, `src/cao/intake_triage.py`, `docs/intake.md` |
 | **Accepted plan** | What the owner has decided CAO *should* build | this document |
-| **Live implementation** | What actually runs and is verified | B3 deterministic triage; **nothing for B4–B5 yet** |
+| **Live implementation** | What actually runs and is verified | B3 deterministic triage; B4 draft compiler; **nothing for B5 yet** |
 
 A statement in this document is a plan unless it cites source evidence or a live
 test. Reviewers must not read a planned capability as shipped.
@@ -58,7 +60,8 @@ That leaves a governed middle:
   **Implemented.**
 - **B4** — match a proposed work item to an *accepted* Plan/objective/work
   package, Capability, qualified performer and current authority, and compile an
-  immutable reviewable team manifest for **existing** Team Execution. **Plan.**
+  immutable reviewable team manifest for **existing** Team Execution.
+  **Implemented (`SOURCE_COMPLETE`).**
 - **B5** — derive a truthful requester status and accountable next mover from
   existing evidence, and (only under explicit send authority) reply on the
   originating channel. **Plan.**
@@ -115,7 +118,7 @@ its own.
 
 ## 4. Phase B3 — on-demand context and intelligent triage
 
-**Status: implemented, `SOURCE_COMPLETE`; independent acceptance pending.**
+**Status: implemented, `MERGED` and independently accepted.**
 
 **Goal.** Given one admitted submission, assemble a bounded context packet on
 demand and produce an advisory triage result with a provenance record.
@@ -228,43 +231,109 @@ tests, the provenance record and the absence of any effect path.
 
 ## 5. Phase B4 — governed routing and batch compiler
 
-**Status: plan only. Not implemented.**
+**Status: implemented, `SOURCE_COMPLETE`; independent acceptance pending.**
 
 **Goal.** Take a B3 `PROPOSE_WORK` (and only that) and route it to an
 accountable home, then compile an immutable reviewable manifest for **existing**
 Team Execution. B4 **never starts work on intake alone.**
 
+**Implemented surface.** `src/cao/intake_compile.py` and
+`cao intake compile --packet-id <packet-id> --route-file <path> [--dry-run]`.
+Given one persisted `cao.intake.triage.v1` packet whose disposition is
+`PROPOSE_WORK` and a strictly bounded, operator-supplied route evidence file, B4
+compiles one immutable, reviewable `cao.team.v1` draft. The draft is always
+`proposed`, carries `authority = "none"` and `dispatch = false`, and names an
+explicit, distinct owner and reviewer. B4 compiles and records; it starts,
+merges, dispatches, schedules, claims, sends and deploys nothing, writes no
+Registry row and writes no canonical Company State. The owner must separately
+review the draft and run `cao team init --approved`, then authorize dispatch.
+
+**The route file is evidence, not approval.** It supplies only the accepted
+Plan/objective/work package, the required Capability, the domain (repository and
+path scope), the performer qualification and the current authority. Each
+load-bearing claim cites a source document anchored to an exact Git identity
+(repository, ref, commit id, committer time, content digest). B4 verifies every
+citation with read-only Git evidence — a readable checkout, a ref resolving to
+the cited commit id and time, and the document at that commit matching the cited
+digest — and the plan acceptance time must equal the immutable plan commit time.
+A free-text `accepted: true` or any unverifiable assertion is refused, never
+treated as authority.
+
 **Matching.** B4 matches a proposal against:
 
-- the **accepted standing Plan / objective / work package**;
-- the required **Capability**;
-- the **domain** (repository and path scope);
-- the **performer qualification** and **current authority**;
-- the **approval digest**;
-- the **specific owner or reviewer**.
+- the **accepted standing Plan / objective / work package** — `plan.source`;
+- the required **Capability** — `capability.source`, with a performer kind;
+- the **domain** (repository and path scope) — every task repository must be the
+  declared scope checkout and every WRITE path must fall inside the declared
+  path scope;
+- the **performer qualification** and **current authority** —
+  `capability.source` and `authority.source`;
+- the **approval digest** — `plan.approval_digest`;
+- the **specific owner or reviewer** — a distinct `owner` and `reviewer`, the
+  reviewer declared as a manifest role and named by a WRITE task.
 
 **Performer law.** Human, AI, software and hybrid performers are all supported
 **through existing law**. A role is **configuration of the work, not
 authority**: a role name, a status string or the mere presence of a capability
 never grants authority. This mirrors the doctrine's performer-as-configuration
-rule and CAO's existing separation of concerns.
+rule and CAO's existing separation of concerns. CAO's existing Team Execution
+adapter launches AI specialists only, so a non-AI performer kind is reported
+`UNAVAILABLE` rather than compiled into a falsely launchable manifest.
+
+**Fail closed.** Where Plan acceptance, capability qualification, delegated
+authority or source access cannot be objectively established, B4 returns an
+explicit `NEEDS_HUMAN_REVIEW` (unverifiable plan, capability or authority
+evidence; an unreadable shared Work Registry) or `UNAVAILABLE` (a
+non-`PROPOSE_WORK` packet; active Registry work overlapping the proposal; an
+unsupported performer kind) instead of fabricating a qualified manifest.
 
 **Output.** Immutable, reviewable `cao.team.v1` manifests consumed by the
 **existing** CAO Team Execution path. B4 compiles and records; it starts
-nothing.
+nothing. Drafts live under `$XDG_STATE_HOME/cao/intake-routes/` (`0700`/`0600`,
+written through the same validated, atomic, fsynced, descriptor-relative store
+as admission); their id is a one-way digest of the immutable inputs, so an
+identical replay is idempotent, different evidence is a distinct draft and a
+reused id for different content is a conflict. `--dry-run` creates no state.
 
 **Derived, not duplicated.** Queue position, ownership, escalation and the
 separation of **approval from release** are **derived** from existing evidence
 (the shared Registry, team checkpoints, plan records). B4 introduces no new
 ledger and no new authority.
 
-**Tests to write (synthetic only):** stale plan; revoked scope; unqualified
-performer; missing review; domain/path conflict; repeated request; no auto
-execution.
+**Tests (synthetic only).** `tests/test_intake_compile.py` is the runnable
+check and covers the acceptance list below; `tests/test_boundaries.py`
+additionally guards that B4 imports no execution/authority concern, reaches the
+Registry through read-only calls only, opens no egress surface, uses no shell
+and never reaches a team execution entry point, a product task, a Registry write
+or canonical state:
+
+- **non-`PROPOSE_WORK` refusal** — any other disposition is refused;
+- **stale / revoked / unverifiable plan** — a moved ref, a removed document or a
+  mismatched digest yields `NEEDS_HUMAN_REVIEW`, never a compiled manifest;
+- **no qualified capability** — an unverifiable qualification is refused and an
+  unsupported performer kind is `UNAVAILABLE`;
+- **missing review or authority** — a manifest without a distinct reviewer, or
+  unverifiable authority evidence, is refused;
+- **domain / path conflict** — a task outside the scope repository, or a WRITE
+  path outside the declared scope, is refused;
+- **active Registry overlap** — overlapping registered work is refused;
+- **replay / duplicate / conflict** — identical replay is idempotent and a
+  reused id for different content is a conflict;
+- **prompt injection inert** — hostile route text executes nothing and changes
+  no file;
+- **wrong tenant / path / symlink** — a symlinked route file and path traversal
+  fail closed;
+- **zero agent/team/claim effects** — no team, task or Registry state appears;
+- **denied unapproved provider** — the draft authorizes no provider.
 
 **Acceptance gate.** B4 is accepted only after B3 acceptance, on independent
 review proving that routing is evidence-derived, manifest compilation is
 immutable, and no path starts or claims work.
+
+**Prerequisite for a real run.** No accepted Plan/authority record is shipped
+in this repository, so a real route file must cite the owner's own committed
+plan, qualification and grant evidence; absent that evidence B4 fails closed
+with `NEEDS_HUMAN_REVIEW` rather than fabricating a qualified manifest.
 
 ## 6. Phase B5 — request to resolution
 
@@ -305,14 +374,15 @@ projection-only guest access.
 ```text
 B2 final security approval
   → B3 implementation            [done: SOURCE_COMPLETE]
-  → B3 independent acceptance    [pending]
-  → B4 implementation            [plan]
-  → B4 independent acceptance    [plan]
+  → B3 independent acceptance    [done: accepted]
+  → B4 implementation            [done: SOURCE_COMPLETE]
+  → B4 independent acceptance    [pending]
   → B5                           [plan]
 ```
 
-- No phase begins before the **previous gate is accepted**. B4 does not start
-  until B3's independent acceptance is recorded.
+- No phase begins before the **previous gate is accepted**. B3's independent
+  acceptance is recorded, so B4 has begun; B5 does not start until B4's
+  independent acceptance is recorded.
 - **Model qualification.** The owner plan names a read/manager model, a writer
   model and a final-read advisory model. Every role is **qualified by provider
   privacy and source scope**, and none is certified suitable for
@@ -355,9 +425,9 @@ payload is used in a pilot or a test.
    privacy gate; keep the deterministic path as the fallback. **Not started;**
    this build performs no egress.
 4. **B4 matcher** — match a proposal to an accepted Plan/work package and refuse
-   on stale, revoked, unqualified, missing-review and conflict cases.
+   on stale, revoked, unqualified, missing-review and conflict cases. **Done.**
 5. **B4 manifest compiler** — compile one immutable `cao.team.v1` manifest with
-   no execution.
+   no execution. **Done.**
 6. **B5 derived status** — compute requester status and next mover from existing
    evidence only.
 7. **B5 dry-run adapter** — one mock channel send, gated and receipted, before
@@ -407,10 +477,11 @@ completion, sent or closed state.
 |---|---|---|
 | Vendor intake capabilities | official intake product page, reviewed 2026-10-14 | vendor claims, not independently measured |
 | B1/B2 admission contract | `docs/intake.md`, `src/cao/intake.py`, `src/cao/intake_bridge.py` | committed; final security acceptance recorded separately |
-| B3 advisory triage | `src/cao/intake_triage.py`, `tests/test_intake_triage.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
+| B3 advisory triage | `src/cao/intake_triage.py`, `tests/test_intake_triage.py`, `docs/intake.md` | implemented, merged and independently accepted |
+| B4 routing compiler | `src/cao/intake_compile.py`, `tests/test_intake_compile.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
 | Team Execution manifest `cao.team.v1` | `docs/team-execution.md` | shipped |
 | Performer/authority/evidence semantics | owner's cross-project work-execution contract (owner-referenced v0.4) | owner planning reference; re-verify against canonical home |
-| B4–B5 design | this document | **accepted owner plan, not operating fact** |
+| B5 design (and every B5 capability below) | this document | **accepted owner plan, not operating fact** |
 
 ## 14. Navigation
 
