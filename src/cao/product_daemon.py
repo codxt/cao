@@ -930,6 +930,19 @@ class Daemon:
                         "team_id": update["team_id"], "action": "team_reconcile",
                         "status": update["status"],
                     })
+                    # Surface the bounded per-task recovery decision the team
+                    # recorded in its own checkpoint. The daemon never applies
+                    # a recovery itself: it reports what the team decided.
+                    for decision in update.get("recovery") or ():
+                        effects.append({
+                            "team_id": update["team_id"],
+                            "task_id": decision.get("task_id"),
+                            "action": "team_recovery",
+                            "status": decision.get("decision"),
+                            "classification": decision.get("classification"),
+                            "auto_resume": bool(decision.get("auto_resume")),
+                            "reason": decision.get("reason"),
+                        })
             except (team.TeamError, StateError, OSError,
                     product_driver.DriverError, registry.RegistryError,
                     product_config.ProductConfigError) as exc:

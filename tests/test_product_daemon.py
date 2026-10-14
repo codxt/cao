@@ -31,6 +31,7 @@ from cao import (
     product_task,
     registry,
     team,
+    team_recovery,
 )
 from cao.registry import RuntimeObservation, AgentObservation
 from cao.state import StateError
@@ -1511,6 +1512,141 @@ def product_cli_main(argv):
     from cao import product_cli
 
     return product_cli.main(argv)
+
+
+class ClosingDriver(FakeDriver):
+    """The daemon fixture driver that honours a real pane close."""
+
+    def pane_close(self, pane_id):
+        self._note("pane_close", pane_id)
+        self._panes.pop(pane_id, None)
+        return "{}"
+
+
+class TeamRecoveryDaemonTests(DaemonCase):
+    """R3 automatic safe recovery observed through the real daemon cadence."""
+
+    def team_config(self, team_id="factory"):
+        return product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"agent_kind": "opencode", "run_id": "cao-team-" + team_id},
+        })
+
+    def team_read_setup(self, *, team_id="factory", task_id="inspect",
+                        pinned_head=Ellipsis, driver=None):
+        driver = driver or ClosingDriver()
+        config = self.team_config(team_id)
+        spec = {
+            "schema": "cao.team.v1", "team_id": team_id,
+            "roles": {"reader": {"instruction": "Read the checkout only."}},
+            "tasks": [{"id": task_id, "role": "reader", "repo": str(self.repo),
+                       "mode": "read", "prompt": "Inspect the checkout"}],
+        }
+        team.initialize(spec, env=self.env)
+        team.set_desired(team_id, "running", env=self.env)
+        ident = team._execution_id(team_id, task_id, "work", 0)
+        # A durable READ execution with a real open claim and a live agent.
+        product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Inspect the checkout",
+            task_id=ident, mode="read", config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        head = (team._git_head(str(self.repo)) if pinned_head is Ellipsis
+                else pinned_head)
+        record = team._required(team_id, self.env)
+        slot = record["slots"][task_id]
+        slot.update(status="unknown", error="TEAM_RESULT_UNREADABLE",
+                    execution_id=ident, prompt="Inspect the checkout",
+                    pinned_head=head, pinned_branch=team._git_branch(str(self.repo)),
+                    started_at="2026-01-01T00:00:00Z",
+                    progress_at="2026-01-01T00:00:00Z")
+        team._save(record, self.env)
+        return driver, config, ident
+
+    def start_daemon(self, driver, config):
+        record = product_state.default_daemon_record()
+        record["desired"] = "running"
+        product_state.write_daemon(record, self.env)
+        return self.build(driver, config=config)
+
+    def released_claim_count(self):
+        conn = registry.connect_readonly(self.db)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM claims").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_daemon_auto_resumes_original_read_and_completes(self):
+        driver, config, ident = self.team_read_setup()
+        driver.read_text = "analysis\nCAO_TEAM_RESULT: " + team._result_tag(ident)
+        report = self.start_daemon(driver, config).tick()
+        recovery = [e for e in report["effects"]
+                    if e.get("action") == "team_recovery"]
+        self.assertTrue(recovery)
+        self.assertTrue(any(e["auto_resume"] for e in recovery))
+        self.assertEqual(
+            team.status("factory", env=self.env)["tasks"]["inspect"]["status"],
+            "complete")
+        # The SAME original worker answered; it was never re-prompted.
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(self.released_claim_count(), 1)
+        record = team._required("factory", self.env)
+        self.assertEqual(record["recovery"]["resumed"][ident], 1)
+
+    def test_daemon_restart_preserves_the_recovery_decision(self):
+        driver, config, ident = self.team_read_setup(pinned_head="0" * 40)
+        daemon = self.start_daemon(driver, config)
+        daemon.tick()
+        first = team._required("factory", self.env)["recovery"]["decisions"]["inspect"]
+        self.assertEqual(first["classification"], team_recovery.GIT_DRIFT)
+        self.assertEqual(first["decision"], team_recovery.HOLD)
+        # A fresh daemon instance over the same durable checkpoint must not
+        # rewrite or re-apply the stored decision.
+        restarted = self.build(driver, config=config)
+        restarted.tick()
+        second = team._required("factory", self.env)["recovery"]["decisions"]["inspect"]
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+        self.assertEqual(first["at"], second["at"])
+        self.assertNotIn(ident, team._required("factory", self.env)["recovery"]["resumed"])
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_daemon_lost_terminal_receipt_holds_with_no_new_claim(self):
+        driver, config, ident = self.team_read_setup()
+        # The runtime returns DONE without a valid post-prompt receipt.
+        driver.read_text = "Model credits exhausted."
+        daemon = self.start_daemon(driver, config)
+        first = daemon.tick()
+        self.assertTrue(any(e.get("action") == "team_recovery" and e["auto_resume"]
+                            for e in first["effects"]))
+        self.assertEqual(
+            team.status("factory", env=self.env)["tasks"]["inspect"]["status"],
+            "unknown")
+        self.assertEqual(team._required("factory", self.env)
+                         ["recovery"]["resumed"][ident], 1)
+        # The next tick reclassifies the persisted UNKNOWN as a lost terminal
+        # receipt and holds: no second resume, no new claim, no re-prompt.
+        self.build(driver, config=config).tick()
+        decision = team._required("factory", self.env)["recovery"]["decisions"]["inspect"]
+        self.assertEqual(decision["classification"],
+                         team_recovery.TERMINAL_RECEIPT_MISSING)
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+        self.assertFalse(decision["auto_resume"])
+        self.assertEqual(team._required("factory", self.env)
+                         ["recovery"]["resumed"][ident], 1)
+        self.assertEqual(self.released_claim_count(), 1)
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_daemon_recovery_makes_no_external_egress(self):
+        driver, config, ident = self.team_read_setup()
+        import socket
+        with mock.patch.object(socket, "socket",
+                               side_effect=AssertionError("egress")) as net, \
+                mock.patch.object(socket, "create_connection",
+                                  side_effect=AssertionError("egress")) as dial:
+            self.start_daemon(driver, config).tick()
+        net.assert_not_called()
+        dial.assert_not_called()
 
 
 if __name__ == "__main__":

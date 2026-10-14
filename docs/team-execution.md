@@ -334,6 +334,41 @@ agent and never fabricates an identity. The exact existing execution identity,
 prompt and claim are retained for the operator, who resolves the runtime and
 then uses `cao team resume` (or the bounded retry above where it applies).
 
+### Bounded automatic READ recovery (R3)
+
+Each tick classifies every UNKNOWN team task once from durable evidence and
+records a bounded decision in the existing team checkpoint: a classification, a
+decision, a reason, the next required action and provenance (the task ID, the
+source HEAD, the Registry claim ID, the nonce-receipt state and a timestamp).
+The receipt is idempotent — an unchanged snapshot keeps its original
+fingerprint and capture stamp — so a restart does not rewrite or re-apply it. A
+running team that still holds an UNKNOWN slot is ticked for this classification;
+the daemon reports each decision and applies none of them itself. No second
+scheduler, ledger, database or observer is added.
+
+Exactly one transition is automatic: **one bounded resume of the SAME original
+UNKNOWN READ execution**. It is admitted only when all of these are proven from
+durable evidence: the failure is a recoverable READ transport failure (not a
+lost receipt); the original execution identity, prompt and agent/pane
+checkpoint are intact; the runtime is available and still reports the original
+worker; the shared Registry holds the exact open READ claim (claim ID, owner,
+mode, run and work key) that the durable record names; and the pinned Git HEAD
+and branch are unchanged. The resume reuses `cao team resume`'s transition and
+`product_task`'s own idempotent reconciliation under the same dispatch lock, so
+it never starts a replacement agent, replays an issued prompt or creates a new
+claim. At most one resume is admitted per original execution identity, so an
+unresolved failure is reported rather than looped.
+
+Everything else holds or blocks with a reported reason. A lost terminal receipt
+holds for `cao team retry-read` after an operator stops the original worker. A
+Registry conflict, an unreadable ledger, a Git HEAD or branch drift, a platform
+or tool-layer denial, an interactive provider/route gate and a pending
+exact-head PR CI gate all hold. An UNKNOWN WRITE — including a
+`SOURCE_COMPLETE`-but-unverified WRITE at an already committed head — is never
+automatically replayed, retried, stopped, released, merged or published, and its
+claimed worktree is never mutated. `cao team resume` and `cao team retry-read`
+remain the explicit operator paths.
+
 ### Crash recovery between the Registry claim and the record save
 
 A product task persists its **acquisition intent** — run, work key,
