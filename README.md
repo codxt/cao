@@ -53,16 +53,21 @@ an agent and write state under the CAO roots; they fail closed with an explicit
 Neither surface invents a result: when required state cannot be read, the
 command prints explicit `UNAVAILABLE` evidence and exits nonzero.
 
-`cao intake` is the inbound gate, its on-demand advisory triage and its
-governed routing compiler. `submit`, `list`, `show` and `pull` admit and read
-private submissions; `triage` reads one admitted submission together with
-bounded read-only context and returns one advisory, provenance-linked
-disposition; `compile` turns only a `PROPOSE_WORK` packet plus bounded
-operator-supplied route evidence into one immutable, reviewable `cao.team.v1`
-draft for the existing Team Execution path, carrying no authority and
-dispatching nothing. Admission is not work, triage is not authority and a
-compiled draft is not approval: the accountable owner must still review it and
-run `cao team init --approved` separately. See
+`cao intake` is the inbound gate, its on-demand advisory triage, its governed
+routing compiler and its request-to-resolution projection. `submit`, `list`,
+`show` and `pull` admit and read private submissions; `triage` reads one
+admitted submission together with bounded read-only context and returns one
+advisory, provenance-linked disposition; `compile` turns only a `PROPOSE_WORK`
+packet plus bounded operator-supplied route evidence into one immutable,
+reviewable `cao.team.v1` draft for the existing Team Execution path; `status`
+derives a truthful requester status and the accountable next mover from existing
+evidence, read-only and idempotent, with an optional redacted `--guest-view`.
+Admission is not work, triage is not authority, a compiled draft is not approval
+and a derived status is not acceptance: the accountable owner must still review
+the draft and run `cao team init --approved` separately. `reply` serves only a
+gated `--dry-run` or `--mock` origin-channel simulation; a real send is
+`UNAVAILABLE`, because no authenticated delivery identity or outbound credential
+exists. See
 [`docs/intake.md`](docs/intake.md) and the
 [B3–B5 governed-intake roadmap](docs/intake-roadmap.md).
 

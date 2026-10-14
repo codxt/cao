@@ -86,6 +86,17 @@ SEPARATION_RULES = {
         "contracts",
         "cao.contracts",
     ),
+    # B5 resolution is a read-only projection: it reads existing intake, team
+    # and Registry evidence but must not reach execution, policy or the runtime
+    # contract, so a derived status can never start, merge or claim anything.
+    "intake_resolution.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
 }
 
 # The ONLY Registry attributes advisory triage may touch. Every mutating entry
@@ -466,6 +477,92 @@ class IntakeCompileBoundaryTests(unittest.TestCase):
             "registry.release",
             "registry.handoff",
             "registry.write_gate",
+        ):
+            self.assertNotIn(forbidden, text)
+
+
+class IntakeResolutionBoundaryTests(unittest.TestCase):
+    """B5 resolution: read-only, no egress, no shell, no execution or team write.
+
+    A derived status is a projection, so this module must never reach an
+    execution entry point, initialize/start/tick a team, run a product task,
+    write a Registry row or touch canonical Company State, and it must open no
+    egress surface.
+    """
+
+    def _tree(self) -> ast.AST:
+        return ast.parse((CAO_ROOT / "intake_resolution.py").read_text("utf-8"))
+
+    def test_registry_access_is_readonly_only(self) -> None:
+        offenders: set[str] = set()
+        for node in ast.walk(self._tree()):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "registry"
+            ):
+                if node.attr not in TRIAGE_REGISTRY_ALLOWED:
+                    offenders.add(node.attr)
+        self.assertEqual(offenders, set())
+
+    def test_no_egress_modules(self) -> None:
+        imported = _imports(CAO_ROOT / "intake_resolution.py")
+        offenders = sorted(
+            module for module in imported if module in EGRESS_MODULES
+        )
+        self.assertEqual(offenders, [])
+
+    def test_no_shell_eval_or_dynamic_import(self) -> None:
+        offenders: list[str] = []
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in {
+                "eval", "exec", "__import__", "compile",
+            }:
+                offenders.append(func.id)
+            if isinstance(func, ast.Attribute):
+                if (
+                    func.attr in {"system", "popen"}
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    offenders.append(f"os.{func.attr}")
+                if func.attr in {"run", "call", "check_output", "Popen"}:
+                    for keyword in node.keywords:
+                        if keyword.arg == "shell":
+                            offenders.append("subprocess shell=True")
+        self.assertEqual(offenders, [])
+
+    def test_no_team_execution_product_task_or_canonical_write(self) -> None:
+        text = (CAO_ROOT / "intake_resolution.py").read_text(encoding="utf-8")
+        for forbidden in (
+            "team.initialize(",
+            "team.set_desired(",
+            "team.resume(",
+            "team.retry_read(",
+            "team.tick(",
+            "team.tick_all(",
+            "product_task.run",
+            "state.write_state",
+            "registry.connect(",
+            "registry.propose",
+            "registry.claim(",
+            "registry.release",
+            "registry.handoff",
+            "registry.write_gate",
+        ):
+            self.assertNotIn(forbidden, text)
+
+    def test_resolution_persists_nothing(self) -> None:
+        # A projection may not create a private store or write a record.
+        text = (CAO_ROOT / "intake_resolution.py").read_text(encoding="utf-8")
+        for forbidden in (
+            "open_private_dir(",
+            "write_private_record(",
+            "write_state(",
+            "os.makedirs",
         ):
             self.assertNotIn(forbidden, text)
 
