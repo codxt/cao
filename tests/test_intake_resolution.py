@@ -4,11 +4,12 @@ Covers: the derived status vocabulary (clarification requested, work proposed,
 in progress, waiting for review, verified answer, completion and later
 outcomes); the refusal to close on an advisory candidate, a proposed draft or a
 ``COMPLETE`` team summary; the authenticated-acceptance gate; fail-closed
-missing/invalid/stale evidence; guest vs other-scope leakage; the host-identity
-requirement; wrong recipient; absent authorization; retries and ambiguous sends;
-replay/idempotence; prompt-injection inertness; read-only Registry and private
-``0700``/``0600`` state; zero execution/claim/team effects; no egress; and the
-CLI.
+missing/invalid/stale evidence; guest vs other-scope leakage; the fail-closed
+``--guest-view`` and the refusal to trust a forged host environment; wrong
+recipient; absent authorization; retries and ambiguous sends; a caller-injected
+adapter that must never execute; replay/idempotence; prompt-injection
+inertness; read-only Registry and private ``0700``/``0600`` state; zero
+execution/claim/team effects; no egress; and the CLI.
 
 Nothing here is shipped and no real payload is used. Every value is synthetic.
 """
@@ -485,15 +486,59 @@ class GuestViewTests(_Fixture):
             )
 
     def test_guest_view_writes_no_index(self) -> None:
+        # Even a syntactically valid host env cannot serve a guest view: the CLI
+        # fails closed and writes nothing.
         env = dict(self.env, CAO_HOST_PRINCIPAL="guest-one",
                    CAO_HOST_PRINCIPAL_SUBMISSIONS=self.sid)
         before = _tree_files(self.state_root)
         code, payload = self.run_cli(
             ["status", "--id", self.sid, "--guest-view"], env=env
         )
-        self.assertEqual(code, 0)
-        self.assertEqual(payload["schema"], intake_resolution.GUEST_SCHEMA)
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["status"], "UNAVAILABLE")
+        self.assertNotEqual(payload.get("schema"), intake_resolution.GUEST_SCHEMA)
         self.assertEqual(_tree_files(self.state_root), before)
+
+    def test_forged_host_env_cannot_serve_a_guest_view(self) -> None:
+        # An in-scope forged principal/scope still yields UNAVAILABLE, and the
+        # refusal leaks no submission status, id or mover.
+        env = dict(self.env, CAO_HOST_PRINCIPAL="forged-attacker",
+                   CAO_HOST_PRINCIPAL_SUBMISSIONS=self.sid)
+        code, payload = self.run_cli(
+            ["status", "--id", self.sid, "--guest-view"], env=env
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["status"], "UNAVAILABLE")
+        self.assertNotIn(self.sid, json.dumps(payload))
+        self.assertNotIn("next_mover", payload)
+
+    def test_forged_scope_cannot_reach_another_submission(self) -> None:
+        env = dict(self.env, CAO_HOST_PRINCIPAL="forged-attacker",
+                   CAO_HOST_PRINCIPAL_SUBMISSIONS=self.other)
+        code, payload = self.run_cli(
+            ["status", "--id", self.other, "--guest-view"], env=env
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["status"], "UNAVAILABLE")
+        self.assertNotIn(self.other, json.dumps(payload))
+
+    def test_guest_env_helper_is_untrusted_input_only(self) -> None:
+        # The env parser is a convenience, not authentication: it returns the
+        # caller-supplied values, and the CLI never consults it.
+        principal, authorized = intake_resolution.guest_identity(
+            {"CAO_HOST_PRINCIPAL": "guest-one",
+             "CAO_HOST_PRINCIPAL_SUBMISSIONS": self.sid}
+        )
+        self.assertEqual(principal, "guest-one")
+        self.assertEqual(authorized, frozenset({self.sid}))
+
+    def test_cross_scope_refusal_names_no_submission(self) -> None:
+        document = self.status(self.other)
+        with self.assertRaises(intake_resolution.ResolutionRefused) as caught:
+            intake_resolution.guest_projection(
+                document, principal="guest-one", authorized=frozenset({self.sid})
+            )
+        self.assertNotIn(self.other, str(caught.exception))
 
     def test_identity_cannot_be_spoofed_by_submission_json(self) -> None:
         spoof = self.submit(
@@ -624,37 +669,57 @@ class OutboundGateTests(_Fixture):
             )
 
     def test_ambiguous_ack_is_unavailable(self) -> None:
-        class Ambiguous:
-            def send(self, key, recipient, context, message):
-                return {"positive": True, "receipt": None, "simulation": True}
-
-        with self.assertRaises(intake_resolution.ResolutionUnavailable):
-            intake_resolution.reply(
-                self.sid, kind="followup", auth_file=str(self._auth()),
-                mock=True, env=self.env, adapter=Ambiguous(),
-            )
+        # The mock pathway has no pluggable adapter, so the ambiguous
+        # acknowledgement is injected onto the *built-in* adapter in-process.
+        with mock.patch.object(
+            intake_resolution.MockChannelAdapter, "send",
+            return_value={"positive": True, "receipt": None, "simulation": True},
+        ):
+            with self.assertRaises(intake_resolution.ResolutionUnavailable):
+                intake_resolution.reply(
+                    self.sid, kind="followup", auth_file=str(self._auth()),
+                    mock=True, env=self.env,
+                )
 
     def test_negative_ack_is_unavailable(self) -> None:
-        class Negative:
-            def send(self, key, recipient, context, message):
-                return {"positive": False, "receipt": None}
-
-        with self.assertRaises(intake_resolution.ResolutionUnavailable):
-            intake_resolution.reply(
-                self.sid, kind="followup", auth_file=str(self._auth()),
-                mock=True, env=self.env, adapter=Negative(),
-            )
+        with mock.patch.object(
+            intake_resolution.MockChannelAdapter, "send",
+            return_value={"positive": False, "receipt": None},
+        ):
+            with self.assertRaises(intake_resolution.ResolutionUnavailable):
+                intake_resolution.reply(
+                    self.sid, kind="followup", auth_file=str(self._auth()),
+                    mock=True, env=self.env,
+                )
 
     def test_adapter_failure_never_confirms(self) -> None:
-        class Broken:
-            def send(self, key, recipient, context, message):
-                raise OSError("channel died")
+        with mock.patch.object(
+            intake_resolution.MockChannelAdapter, "send",
+            side_effect=OSError("channel died"),
+        ):
+            with self.assertRaises(intake_resolution.ResolutionUnavailable):
+                intake_resolution.reply(
+                    self.sid, kind="followup", auth_file=str(self._auth()),
+                    mock=True, env=self.env,
+                )
 
-        with self.assertRaises(intake_resolution.ResolutionUnavailable):
+    def test_injected_adapter_kwarg_cannot_execute(self) -> None:
+        # A caller's evil adapter can never be dispatched: `reply` accepts no
+        # adapter, so passing one is a TypeError and its `send` never runs, even
+        # though the mock pathway reports sent = False.
+        calls: list[tuple] = []
+
+        class Evil:
+            def send(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                return {"positive": True, "receipt": "evil", "simulation": False}
+
+        with self.assertRaises(TypeError):
             intake_resolution.reply(
                 self.sid, kind="followup", auth_file=str(self._auth()),
-                mock=True, env=self.env, adapter=Broken(),
+                mock=True, env=self.env, adapter=Evil(),
             )
+        self.assertEqual(calls, [])
 
 
 class ReadOnlyAndPrivacyTests(_Fixture):
@@ -720,6 +785,17 @@ class CliTests(_Fixture):
         code, payload = self.run_cli(["status", "--id", sid, "--guest-view"])
         self.assertEqual(code, 3)
         self.assertEqual(payload["status"], "UNAVAILABLE")
+
+    def test_status_guest_view_with_forged_host_env_is_unavailable(self) -> None:
+        sid = self.submit("c-two-b", "implement the widget under src")
+        env = dict(self.env, CAO_HOST_PRINCIPAL="forged-attacker",
+                   CAO_HOST_PRINCIPAL_SUBMISSIONS=sid)
+        code, payload = self.run_cli(
+            ["status", "--id", sid, "--guest-view"], env=env
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["status"], "UNAVAILABLE")
+        self.assertNotEqual(payload.get("schema"), intake_resolution.GUEST_SCHEMA)
 
     def test_reply_dry_run_via_cli(self) -> None:
         sid = self.submit("c-three", "How do I configure this?",

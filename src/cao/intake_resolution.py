@@ -28,15 +28,21 @@ It is deliberately small in effect and holds **no execution authority**:
   source provides no authenticated delivery identity and no outbound credential,
   so an unqualified real send is an explicit ``UNAVAILABLE``. Only a
   deterministic ``--dry-run`` (``egress = "none"``, ``sent = False``) or an
-  explicit ``--mock`` simulated adapter (``sent = False``, ``simulation = True``)
-  is served, and only after a separate operator authorizing event bound to the
-  verified recipient/context. There is no custom MCP server, HTTP service, email,
-  Slack, Jira, ServiceNow API, secret or background scheduler anywhere here;
-* the optional **guest view** is a redacted **projection** of one submission to
-  an externally authenticated caller whose trusted principal and submission
-  scope are proven by the operator's control surface. With no host identity it
-  fails closed ``UNAVAILABLE``; it never leaks another scope, never becomes a
-  second source of truth and never persists a public index.
+  explicit ``--mock`` run of the **built-in** deterministic simulated adapter
+  (``sent = False``, ``simulation = True``) is served, and only after a separate
+  operator authorizing event bound to the verified recipient/context. The mock
+  pathway accepts **no** caller-supplied adapter object or callable: it can only
+  invoke the built-in no-egress simulation, so a caller cannot inject a ``send``
+  that reaches the network or has a real side effect while the call still reports
+  ``sent = False``. There is no custom MCP server, HTTP service, email, Slack,
+  Jira, ServiceNow API, secret or background scheduler anywhere here;
+* the optional **guest view** is a redacted **projection** of one submission that
+  the pure library offers only to a host that has *independently authenticated*
+  the caller. The CLI serves **no** guest view in this build: with no trusted
+  host connector it fails closed ``UNAVAILABLE`` and never trusts a principal or
+  scope asserted through process environment or CLI input. It never leaks another
+  scope, never becomes a second source of truth and never persists a public
+  index.
 
 Standard library only; no third-party dependencies.
 """
@@ -105,9 +111,12 @@ STATUSES = (
 #: event receipt on the originating channel.
 SEND_KINDS = ("followup", "answer", "event")
 
-#: The host-provisioned environment keys that carry the guest's authenticated
-#: identity and authorized submission scope. They are set by the operator's
-#: control surface, never by argv, a submission body or a guest-supplied JSON.
+#: The host-provisioned environment keys that *carry* a guest identity and
+#: authorized submission scope. They are read as **untrusted input only**: the
+#: process environment is caller-controlled, so these values are never proof of
+#: identity and the CLI does not serve a guest view from them. Only a host that
+#: has independently authenticated the caller may pass the parsed principal and
+#: scope to :func:`guest_projection` in process.
 HOST_PRINCIPAL_ENV = "CAO_HOST_PRINCIPAL"
 HOST_SCOPE_ENV = "CAO_HOST_PRINCIPAL_SUBMISSIONS"
 
@@ -388,10 +397,13 @@ def _acceptance(acceptance_source: Any, submission_id: str,
                 env: Mapping[str, str] | None) -> dict[str, Any]:
     """An authenticated acceptance verdict, or explicit UNKNOWN.
 
-    This is the **only** place a closure status may originate. The source is a
-    host adapter supplied in process -- never argv, a submission body or a
-    guest-supplied JSON -- and it must positively report an authenticated
-    outcome. This build configures no source, so closure is never asserted.
+    This is the **only** place a closure status may originate. The source is an
+    in-process adapter supplied by the host -- never argv, a submission body, a
+    process-environment value or a guest-supplied JSON -- and it must positively
+    report an authenticated outcome. This is an in-process extension point, not
+    a proof channel: a value that merely arrives through CLI JSON or the
+    environment is untrusted and is never treated as authenticated acceptance.
+    This build configures no source, so closure is never asserted.
     """
 
     base: dict[str, Any] = {"source": "acceptance", "kind": None,
@@ -722,11 +734,15 @@ def derive_status(
 
 
 def guest_identity(env: Mapping[str, str] | None = None) -> tuple[str, frozenset[str]]:
-    """The host-provisioned guest principal and its authorized submission scope.
+    """Parse *untrusted* host-provisioned guest hints from the environment.
 
-    The principal and scope come from the operator's control surface through
-    environment the guest cannot set: with no host identity this raises
-    :class:`ResolutionUnavailable` rather than defaulting to any caller.
+    This is a convenience parser only. Values in the process environment are
+    caller-controlled, so this function is **not** authentication and must never
+    be treated as proof of a guest's principal or scope. The CLI **never** calls
+    it: ``cao intake status --guest-view`` fails closed ``UNAVAILABLE`` in this
+    build because no independently authenticated host connector exists. A host
+    that has already authenticated a caller may parse the principal and scope
+    here and pass them to :func:`guest_projection` in process.
     """
 
     source = os.environ if env is None else env
@@ -885,11 +901,13 @@ def send_id_for(
 
 
 class MockChannelAdapter:
-    """The only shipped origin-channel adapter: a deterministic simulation.
+    """The only origin-channel adapter: a deterministic, no-egress simulation.
 
     It performs no egress whatsoever and returns a simulated acknowledgement.
-    A real adapter -- and the credential it needs -- is the operator's and is
-    external to CAO, so it is deliberately absent.
+    It is the **sole** adapter the mock pathway will ever invoke; the pathway
+    accepts no caller-supplied object or callable, so nothing a caller injects
+    can perform a real send. A real adapter -- and the credential it needs -- is
+    the operator's and is external to CAO, so it is deliberately absent.
     """
 
     def send(self, key: str, recipient: str, context: str, message: str) -> dict[str, Any]:
@@ -922,16 +940,21 @@ def reply(
     mock: bool = False,
     env: Mapping[str, str] | None = None,
     acceptance_source: Any = None,
-    adapter: Any = None,
     clock: Any = None,
 ) -> dict[str, Any]:
     """Simulate one gated outbound reply on the originating channel.
 
     A real send is never available: B1/B2 source provides no authenticated
     delivery identity and no outbound credential, so ``dry_run``/``mock`` decide
-    between a deterministic no-egress plan and a simulated adapter. Both report
-    ``sent = False``; an ambiguous acknowledgement is an explicit
-    ``UNAVAILABLE`` and is never rounded up to a send.
+    between a deterministic no-egress plan and the **built-in** simulated
+    adapter. Both report ``sent = False``; an ambiguous acknowledgement is an
+    explicit ``UNAVAILABLE`` and is never rounded up to a send.
+
+    The mock pathway accepts **no** caller-supplied adapter: it always and only
+    invokes the built-in :class:`MockChannelAdapter`, so a caller cannot inject
+    an object whose ``send`` reaches the network or has a real side effect while
+    this function still reports ``sent = False``. Passing an unknown keyword such
+    as ``adapter`` is a ``TypeError`` and executes nothing.
     """
 
     if kind not in SEND_KINDS:
@@ -976,7 +999,11 @@ def reply(
                        "message": message})
         return result
 
-    channel = adapter if adapter is not None else MockChannelAdapter()
+    # The mock pathway has no pluggable adapter: it always and only invokes the
+    # built-in deterministic no-egress simulation. A caller therefore cannot
+    # inject an object or callable whose ``send`` could reach the network or
+    # have a real side effect while this function still reports ``sent = False``.
+    channel = MockChannelAdapter()
     try:
         ack = channel.send(send_id, auth["recipient"], auth["context"], message)
     except Exception as exc:  # noqa: BLE001 - a raised send is never confirmed

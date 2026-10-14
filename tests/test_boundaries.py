@@ -566,6 +566,42 @@ class IntakeResolutionBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, text)
 
+    def test_reply_accepts_no_caller_supplied_adapter(self) -> None:
+        # The mock pathway must have no pluggable adapter: `reply` cannot take a
+        # caller-supplied object or callable whose `send` might reach the
+        # network while the call still reports sent = False. An unknown keyword
+        # such as `adapter` is therefore a TypeError.
+        tree = self._tree()
+        signatures: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "reply":
+                names = {arg.arg for arg in node.args.args}
+                names |= {arg.arg for arg in node.args.kwonlyargs}
+                names |= {arg.arg for arg in (node.args.vararg, node.args.kwarg)
+                          if arg is not None}
+                signatures[node.name] = names
+        self.assertIn("reply", signatures)
+        self.assertNotIn("adapter", signatures["reply"])
+
+
+class IntakeCliGuestBoundaryTests(unittest.TestCase):
+    """The CLI serves no guest projection from caller-controlled input.
+
+    B5 has no independently authenticated host connector, so ``--guest-view``
+    must fail closed. If the CLI reached ``guest_identity``/``guest_projection``
+    it would trust a principal or scope a caller can assert through the process
+    environment.
+    """
+
+    def test_cli_never_serves_a_guest_projection(self) -> None:
+        text = (CAO_ROOT / "intake_cli.py").read_text(encoding="utf-8")
+        for forbidden in (
+            "guest_projection(",
+            "guest_identity(",
+            "CAO_HOST_PRINCIPAL",
+        ):
+            self.assertNotIn(forbidden, text)
+
 
 class RecursiveGuardTests(unittest.TestCase):
     """Proof that the guards genuinely cover nested core modules.

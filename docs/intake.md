@@ -397,7 +397,7 @@ receipt.
 
 ```sh
 cao intake status --id <submission-id>
-cao intake status --id <submission-id> --guest-view
+cao intake status --id <submission-id> --guest-view   # UNAVAILABLE in this build
 cao intake reply --id <submission-id> --kind followup --auth-file auth.json --dry-run
 cao intake reply --id <submission-id> --kind answer --auth-file auth.json --mock
 ```
@@ -428,30 +428,41 @@ Load-bearing properties:
   acceptance source, and no acceptance identity or connector exists, so this
   build never asserts closure: it reports the highest status the existing
   evidence honestly supports and names who moves next. A host that possesses an
-  authenticated acceptance adapter injects it in process; there is deliberately
-  no argv or submission-JSON path to acceptance.
+  authenticated acceptance adapter injects it **in process**; there is
+  deliberately no argv, submission-JSON or process-environment path to
+  acceptance. The adapter is an in-process extension point, not a proof channel:
+  a value that merely arrives through CLI JSON or the environment is untrusted
+  and is never treated as authenticated acceptance.
 - **External state is `UNKNOWN`.** External PR/review/acceptance state is not
   locally readable in this build, so it is reported `UNKNOWN` rather than
   guessed. B5 adds no GitHub client, no network call and no provider egress.
-- **The guest view is a redacted projection.** `--guest-view` serves one
-  submission to an externally authenticated caller whose trusted principal and
-  submission scope are supplied by the operator's control surface. With no host
-  identity it fails closed `UNAVAILABLE`; a submission outside the proven scope
-  is `REFUSED`; the projection carries no body, no item id, no evidence payload
-  and no internal identity, and it writes no index and no second canonical
-  state. Interaction with a submission body can never spoof the principal.
+- **The guest view fails closed in this build.** `--guest-view` is
+  `UNAVAILABLE`: a guest projection is only defensible for a caller a **host has
+  independently authenticated**, and B5 ships no such host connector. Process
+  environment and CLI arguments are caller-controlled, so a caller cannot assert
+  a principal or a submission scope through `CAO_HOST_PRINCIPAL` /
+  `CAO_HOST_PRINCIPAL_SUBMISSIONS`, or through any submission body; those values
+  are untrusted input, never proof. The pure library projection
+  (`guest_projection`) remains available for a host that *has* authenticated the
+  caller, and it stays scope-bound and redacted: a submission outside the proven
+  scope is `REFUSED`, and the projection carries no body, no item id, no
+  evidence payload and no internal identity, writes no index and no second
+  canonical state. Live guest access is not offered.
 - **Outbound is gated and simulated.** B1/B2 source provides no authenticated
   delivery identity and no outbound credential, so an unqualified real send is a
   structured `UNAVAILABLE`. Only a deterministic `--dry-run` (egress `none`,
-  `sent = false`) or an explicit `--mock` simulated adapter (`sent = false`,
-  `simulation = true`) is served, and only after a separate **operator
-  authorizing event** strictly bound to the submission, the resolution content
-  and the **verified** originating recipient/context (the admitted submission's
-  own source, never a value the authorization asserts). The send id is a
-  deterministic idempotency key, so retries collapse; an ambiguous
-  acknowledgement is `UNAVAILABLE` and is never rounded up to a send. There is
-  no custom MCP server, HTTP service, email, Slack, Jira, ServiceNow API, secret
-  or scheduler here.
+  `sent = false`) or an explicit `--mock` run of the **built-in** simulated
+  adapter (`sent = false`, `simulation = true`) is served, and only after a
+  separate **operator authorizing event** strictly bound to the submission, the
+  resolution content and the **verified** originating recipient/context (the
+  admitted submission's own source, never a value the authorization asserts).
+  The mock pathway takes **no** caller-supplied adapter: it can only invoke the
+  built-in no-egress simulation, so a caller cannot inject an object whose
+  `send` reaches the network or has a real side effect while the call still
+  reports `sent = false`. The send id is a deterministic idempotency key, so
+  retries collapse; an ambiguous acknowledgement is `UNAVAILABLE` and is never
+  rounded up to a send. There is no custom MCP server, HTTP service, email,
+  Slack, Jira, ServiceNow API, secret or scheduler here.
 
 ## Limitations and unresolved items
 
@@ -494,14 +505,17 @@ vocabulary; clarification requested, work proposed, in progress and waiting for
 review; the authenticated-acceptance gate for verified answer, completion and
 later outcomes; the refusal to close on a candidate answer, a proposed draft or
 a `COMPLETE` team summary; fail-closed missing and invalid evidence; a guest
-against another scope and a spoofed principal; wrong recipient; absent and stale
-authorization; retries, ambiguous sends and adapter failure; replay/idempotence;
-prompt-injection inertness; read-only Registry and private `0700`/`0600` state;
-zero execution/claim/team effects; and the CLI.
+against another scope, a forged host environment and the fail-closed
+`--guest-view`; wrong recipient; absent and stale authorization; retries,
+ambiguous sends and failure of the built-in adapter; a caller-injected adapter
+that can never execute; replay/idempotence; prompt-injection inertness; read-only
+Registry and private `0700`/`0600` state; zero execution/claim/team effects; and
+the CLI.
 `tests/test_boundaries.py` additionally
 guards that intake never routes a durable record through the permissive state
 reader and that triage, B4 and B5 reach the Registry through read-only calls
 only, open no egress surface and use no shell — and that B4 and B5 never reach a
 team execution entry point, a product task, a Registry write, canonical state or
-any private-store write.
+any private-store write, that B5 `reply` accepts no caller-supplied adapter and
+that the CLI never serves a guest projection from caller-controlled input.
 Every value is synthetic; nothing is shipped and no private payload is used.

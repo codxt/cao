@@ -369,27 +369,35 @@ never acceptance.
 **Channel adapters.** B1/B2 source provides no authenticated delivery identity
 and no outbound credential, so an unqualified real send is a structured
 `UNAVAILABLE`. Only a deterministic `--dry-run` (no egress) or an explicit
-`--mock` simulated adapter (`sent: false`, `simulation: true`) is served, after a
-separate operator authorizing event bound to the **verified** originating
-recipient/context. The send id is a deterministic idempotency key; an ambiguous
-acknowledgement is `UNAVAILABLE`, never rounded up. B5 builds **no** custom
-marketplace MCP server, **no** service, **no** external status API and **no**
-scheduler; marketplace policy and any channel credential stay the operator's,
-external to CAO, exactly as `docs/intake.md` states.
+`--mock` run of the **built-in** deterministic simulated adapter (`sent: false`,
+`simulation: true`) is served, after a separate operator authorizing event bound
+to the **verified** originating recipient/context. The mock pathway accepts
+**no** caller-supplied adapter object or callable, so a caller cannot inject a
+`send` that reaches the network while the call still reports `sent: false`. The
+send id is a deterministic idempotency key; an ambiguous acknowledgement is
+`UNAVAILABLE`, never rounded up. B5 builds **no** custom marketplace MCP server,
+**no** service, **no** external status API and **no** scheduler; marketplace
+policy and any channel credential stay the operator's, external to CAO, exactly
+as `docs/intake.md` states.
 
-**Guest view.** The optional guest status view is a **redacted projection**
-served only to an externally authenticated caller whose trusted principal and
-submission scope are supplied by the operator's control surface. With no host
-identity it fails closed `UNAVAILABLE`; a submission outside the proven scope is
-refused; it writes no index, keeps no second canonical state and cannot be
-spoofed by a submission body.
+**Guest view.** The optional guest status view is a **redacted projection** for
+a caller a host has **independently authenticated**; it is not served from a
+process environment or CLI input. B5 ships no authenticated host connector, so
+the CLI `--guest-view` fails closed `UNAVAILABLE` even when
+`CAO_HOST_PRINCIPAL` / `CAO_HOST_PRINCIPAL_SUBMISSIONS` are set: those values are
+untrusted input, never proof. The pure library `guest_projection` stays
+available for a host that *has* authenticated the caller; a submission outside
+the proven scope is refused; it writes no index, keeps no second canonical state
+and cannot be spoofed by a submission body. Live guest access is not offered.
 
-**Tests to write (synthetic only):** guest and cross-tenant leak; wrong
-recipient; retries / ambiguous send; absent approval; missing evidence;
-misreported sent/closed; invalid/stale status; prompt-injection inertness; no new
-task/work claim; read-only Registry and private `0700`/`0600`; no egress. These
-are the runnable check in `tests/test_intake_resolution.py`, with the read-only
-and zero-effect boundaries in `tests/test_boundaries.py`.
+**Tests to write (synthetic only):** guest and cross-tenant leak; a forged host
+environment that still yields a fail-closed `--guest-view`; wrong recipient;
+retries / ambiguous send; a caller-injected adapter that never executes; absent
+approval; missing evidence; misreported sent/closed; invalid/stale status;
+prompt-injection inertness; no new task/work claim; read-only Registry and
+private `0700`/`0600`; no egress. These are the runnable check in
+`tests/test_intake_resolution.py`, with the read-only and zero-effect boundaries
+in `tests/test_boundaries.py`.
 
 **Acceptance gate.** B5 is accepted only after B4 acceptance, on independent
 review proving truthful status derivation, gated and idempotent sends, and

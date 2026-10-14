@@ -16,11 +16,13 @@ qualified provider it always yields the deterministic context packet.
 
 ``status`` is the B5 request-to-resolution projection: it derives a truthful
 requester status and an accountable next mover from existing evidence, read-only
-and idempotent. ``--guest-view`` returns a redacted projection to an externally
-authenticated caller whose principal and submission scope the host supplies.
+and idempotent. ``--guest-view`` is refused ``UNAVAILABLE`` in this build: a
+guest projection is only defensible for a host that has independently
+authenticated the caller, and no such host connector exists, so the CLI never
+trusts a principal or scope asserted through process environment or CLI input.
 ``reply`` is the B5 outbound gate: a real send is never available, so it serves
-only a deterministic ``--dry-run`` or an explicit ``--mock`` simulation, and
-only after a separate operator authorizing event.
+only a deterministic ``--dry-run`` or an explicit ``--mock`` run of the built-in
+no-egress simulation, and only after a separate operator authorizing event.
 
 Output is JSON on stdout. Exit codes are ``0`` success, ``2`` usage error and
 ``3`` explicit UNAVAILABLE/conflict, matching the rest of CAO's CLI.
@@ -238,12 +240,20 @@ def _cmd_status(args: argparse.Namespace) -> int:
             submission_id = intake.submission_id_for(item_id)
         elif submission_id is None:
             return _error("status", "USAGE", "status requires --id or --item-id")
-        document = intake_resolution.derive_status(submission_id)
         if getattr(args, "guest_view", False):
-            principal, authorized = intake_resolution.guest_identity()
-            document = intake_resolution.guest_projection(
-                document, principal=principal, authorized=authorized
+            # Fail closed. A guest projection is only defensible for a caller a
+            # host has *independently authenticated*. Process environment and
+            # CLI arguments are caller-controlled, so this build serves no guest
+            # view from them: a forged host identity or scope, or any submission
+            # body, is not proof and yields UNAVAILABLE.
+            return _error(
+                "status",
+                "RESOLUTION_UNAVAILABLE",
+                "the guest view is UNAVAILABLE: it requires an independently "
+                "authenticated host connector, and this build serves no guest "
+                "projection from process environment or CLI input",
             )
+        document = intake_resolution.derive_status(submission_id)
     except intake_resolution.ResolutionRefused as exc:
         return _refusal("status", exc.code, str(exc), "REFUSED")
     except (intake.IntakeError, intake_resolution.ResolutionError) as exc:
@@ -355,7 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
     status_cmd.add_argument("--item-id", metavar="ITEM_ID",
                             help="stable item id; its submission id is derived")
     status_cmd.add_argument("--guest-view", action="store_true",
-                            help="redacted projection for an authenticated guest")
+                            help="request a redacted guest projection; "
+                                 "UNAVAILABLE in this build without an "
+                                 "authenticated host connector")
     status_cmd.set_defaults(handler=_cmd_status)
 
     reply_cmd = commands.add_parser(
@@ -371,7 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
     reply_cmd.add_argument("--dry-run", action="store_true",
                            help="deterministic no-egress plan; sends nothing")
     reply_cmd.add_argument("--mock", action="store_true",
-                           help="explicit simulated adapter; sends nothing")
+                           help="built-in simulated adapter; sends nothing")
     reply_cmd.set_defaults(handler=_cmd_reply)
     return parser
 
