@@ -191,6 +191,48 @@ class ClassificationTests(HandoffCase):
         self.assertEqual(effects["deploy"], "NEGATED")
         self.assertEqual(effects["credential"], "NEGATED")
 
+    def test_requested_effect_after_category_negation_is_not_masked(self) -> None:
+        # A category-level negation must never suppress an explicit request in a
+        # subordinate/later phrase of the same clause.
+        cases = {
+            "Read-only audit please. No merging, but deploy the service now.":
+                "deploy",
+            "Read-only audit. Never merge, yet do merge PR 7 as a followup.":
+                "merge",
+            "Read-only audit. Without merging anything first, squash merge PR 9.":
+                "merge",
+        }
+        for body, category in cases.items():
+            effects = intake_handoff.classify_effects(body)
+            self.assertIn(
+                effects[category], ("REQUESTED", "AMBIGUOUS"),
+                f"{category} was {effects[category]} in {body!r}",
+            )
+
+    def test_negation_scope_does_not_leak_past_a_contrast(self) -> None:
+        effects = intake_handoff.classify_effects(
+            "Read-only audit. No merge or deploy, but please publish the update."
+        )
+        self.assertEqual(effects["merge"], "NEGATED")
+        self.assertEqual(effects["deploy"], "NEGATED")
+        self.assertEqual(effects["publish"], "REQUESTED")
+
+    def test_negated_nominal_list_stays_negated(self) -> None:
+        effects = intake_handoff.classify_effects(
+            "No deployment, credentials, or deletion."
+        )
+        self.assertEqual(effects["deploy"], "NEGATED")
+        self.assertEqual(effects["credential"], "NEGATED")
+        self.assertEqual(effects["destructive"], "NEGATED")
+
+    def test_appositive_prohibition_negates_its_whole_list(self) -> None:
+        effects = intake_handoff.classify_effects(
+            "Read-only audit \u2014 do not merge, deploy or release."
+        )
+        self.assertEqual(effects["merge"], "NEGATED")
+        self.assertEqual(effects["deploy"], "NEGATED")
+        self.assertEqual(effects["release"], "NEGATED")
+
     def test_mixed_effect_and_read_request_holds(self) -> None:
         sid = self.admitted("mixed", (
             "Read-only audit of the source, then one squash merge of PR 7."
@@ -333,6 +375,33 @@ class HandoffPlanTests(HandoffCase):
         self.assertEqual(result["status"], "HOLD")
         self.assertFalse(result["plan"]["dispatch"])
         self.assertFalse((self.state_root / "teams").exists())
+
+    def test_masked_request_is_held_and_creates_no_work(self) -> None:
+        # Every request whose reserved effect is hidden behind a category-level
+        # negation must still derive a HOLD and gate the plan: no team, no agent
+        # and no claim is created for a held request.
+        bodies = (
+            "Read-only audit please. No merging, but deploy the service now.",
+            "Read-only audit. Never merge, yet do merge PR 7 as a followup.",
+            "Read-only audit. Without merging anything first, squash merge PR 9.",
+        )
+        for index, body in enumerate(bodies):
+            sid = self.admitted(f"masked-{index}", body)
+            derived = intake_handoff.derive_eligibility(sid, env=self.env)
+            self.assertEqual(derived["verdict"], "HOLD")
+            self.assertTrue(derived["holds"])
+            codes = {hold["code"] for hold in derived["holds"]}
+            self.assertTrue(
+                codes & {"mixed_effect_and_read_request",
+                         "ambiguous_consequential_effect"}
+            )
+            planned = self.plan(sid, dry_run=True)
+            self.assertEqual(planned["status"], "HOLD")
+            self.assertFalse(planned["plan"]["dispatch"])
+        self.assertFalse((self.state_root / "teams").exists())
+        self.assertFalse(
+            Path(self.env["XDG_STATE_HOME"]).joinpath("rsd-work-registry").exists()
+        )
 
     def test_authenticated_operator_dispatches_one_read_team(self) -> None:
         sid = self.admitted("dispatch")

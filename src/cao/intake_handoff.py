@@ -169,6 +169,17 @@ _NEG_ANY = re.compile(
 #: A local negation immediately before one effect token ("no new deployment").
 _NEG_LOCAL = re.compile(r"\b(?:no|not|never|without|non|zero)\s+(?:\w+[ _-]){0,4}\Z",
                         re.I)
+#: A contrastive coordinator opens a new, independently polarised sub-clause and
+#: ends any earlier negation's scope, so "no merging, but deploy the service"
+#: still asks for the deploy instead of silently negating it.
+_NEG_CONTRAST = re.compile(
+    r"\b(?:but|yet|however|instead|nevertheless|nonetheless|although|though|"
+    r"whereas)\b", re.I)
+#: A prepositional negation ("without") governs only its own phrase; the comma
+#: that closes a fronted such phrase ends its scope, so "without merging
+#: anything first, squash merge PR 9" still asks for the merge.
+_NEG_PREPOSITION = re.compile(
+    r"\b(?:without|excluding|except|despite|besides)\b", re.I)
 #: Request/directive framing. These are the *only* neutral markers that turn an
 #: effect word into an asked-for action; the effect verbs themselves are never
 #: framing, so a compound reference such as "release notes" stays a mention.
@@ -315,6 +326,27 @@ def _clauses(body: str) -> list[str]:
     return [part.strip() for part in _CLAUSE_SPLIT.split(body) if part.strip()]
 
 
+def _negation_scope_start(clause: str, position: int) -> int:
+    """The index where the negation scope governing ``position`` begins.
+
+    Negation is scoped to the sub-clause it belongs to, not to the whole clause
+    B6 happened to split on: a contrastive coordinator, or the comma that closes
+    a fronted prepositional phrase, ends an earlier negation's scope. That way an
+    explicit request later in the same clause ("no merging, but deploy the
+    service now") is never silently negated by a category-level negation that
+    only governs a subordinate phrase.
+    """
+
+    start = 0
+    for match in _NEG_CONTRAST.finditer(clause, 0, position):
+        start = match.end()
+    for match in _NEG_PREPOSITION.finditer(clause, 0, position):
+        comma = clause.find(",", match.end(), position)
+        if comma != -1:
+            start = max(start, comma + 1)
+    return start
+
+
 def classify_effects(body: str) -> dict[str, str]:
     """Classify each reserved effect category in opaque request text.
 
@@ -338,11 +370,16 @@ def classify_effects(body: str) -> dict[str, str]:
     for category, pattern in _EFFECT_PATTERNS:
         best = "ABSENT"
         for clause in clauses:
-            forbids = bool(_NEG_START.search(clause) or _NEG_ANY.search(clause))
             qualifies = bool(_QUALIFIED.search(clause))
             for match in pattern.finditer(clause):
                 prefix = clause[: match.start()]
-                imperative = not prefix.strip()
+                # Negation is scoped to the sub-clause that carries the effect,
+                # never the whole clause, so a category-level negation in one
+                # phrase can't mask an explicit request in a later one.
+                scope = _negation_scope_start(clause, match.start())
+                scoped = clause[scope: match.start()]
+                forbids = bool(_NEG_START.search(scoped) or _NEG_ANY.search(scoped))
+                imperative = not scoped.strip()
                 window = prefix[-_REQUEST_WINDOW:]
                 if forbids or _NEG_LOCAL.search(prefix):
                     verdict = "NEGATED"
