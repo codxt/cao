@@ -739,6 +739,28 @@ def _observe(
 # --------------------------------------------------------------------------
 
 
+def _model_policy_refusal(
+    config: product_config.ProductConfig | None,
+    defaults: product_config.TaskDefaults,
+) -> str | None:
+    """The model-allowlist refusal reason for this task's NEW dispatch route.
+
+    The route is read only from the configured provider entry and this task's
+    own verified argv, never from an untrusted prompt. An absent allowlist is
+    the operator's opt-out and permits everything; a configured one denies an
+    unresolved or unlisted selection with no silent fallback.
+    """
+
+    policy = product_config.team_model_policy(config)
+    if policy is None:
+        return None
+    return product_config.model_policy_error(
+        {"provider": {
+            "model": (config.provider.model
+                      if config is not None and config.provider else None)},
+         "agent_args": list(defaults.agent_args)}, policy)
+
+
 def run_task(
     *,
     driver: product_driver.RuntimeDriver,
@@ -792,6 +814,32 @@ def run_task(
     if record["status"] in _TERMINAL_STATUSES:
         return task_payload(record)
 
+    # A configured operator-local model allowlist denies a direct NEW agent
+    # start whose effective route is unresolvable or unlisted. The gate runs
+    # BEFORE any Registry claim, workspace or agent effect: a refusal must
+    # leave zero claim rows and no runtime effect. It reads only the
+    # configured provider and this task's own verified argv; an already
+    # started agent, a recorded prompt or an existing claim is never re-gated,
+    # so the original claim/agent resume below is preserved exactly. A record
+    # that holds a durable precrash claim intent is deferred to the recovery
+    # path below, which adopts the exact original claim without re-gating.
+    checkpoint = record.get("checkpoint") or {}
+    if (not (record.get("claim") or {}).get("claim_id")
+            and record.get("claim_intent") is None
+            and not checkpoint.get("agent_started")
+            and not checkpoint.get("prompt_issued")):
+        reason = _model_policy_refusal(config, defaults)
+        if reason is not None:
+            record["status"] = "refused"
+            record["refusal"] = {
+                "stage": "model_policy",
+                "status": "REFUSED",
+                "errors": [reason],
+                "conflicts": [],
+            }
+            _save(record, env, clock)
+            return task_payload(record)
+
     conn = registry.connect(db=registry_db or product_config.registry_db_path(env))
     try:
         prior_claim = record.get("claim") or {}
@@ -829,6 +877,25 @@ def run_task(
             # save leaves an OPEN row this task must recognize as its own.
             authority = _recover_acquired_claim(conn, record)
             if authority is None:
+                # The only remaining NEW acquisition path (a durable intent
+                # whose row never materialized, or a wholly fresh intent that
+                # reached the ledger) is gated by the identical route decision
+                # immediately before any claim row can be created, so a
+                # refusal still leaves zero claim rows.
+                checkpoint = record.get("checkpoint") or {}
+                if (not checkpoint.get("agent_started")
+                        and not checkpoint.get("prompt_issued")):
+                    reason = _model_policy_refusal(config, defaults)
+                    if reason is not None:
+                        record["status"] = "refused"
+                        record["refusal"] = {
+                            "stage": "model_policy",
+                            "status": "REFUSED",
+                            "errors": [reason],
+                            "conflicts": [],
+                        }
+                        _save(record, env, clock)
+                        return task_payload(record)
                 authority = _claim_authority(conn, record, observation, env, clock)
         if not authority.get("ok"):
             record["status"] = "refused"
@@ -1242,6 +1309,38 @@ def stop_task(
     prior_released = claim.get("released") is True and claim.get("outcome") == "abandon"
     conn = registry.connect(db=registry_db or product_config.registry_db_path(env))
     try:
+        if not claim.get("claim_id"):
+            # A task refused before its first effect holds no claim at all.
+            # Stop it only when the ledger proves no row was ever opened for
+            # this exact identity and the record started nothing: nothing is
+            # released, nothing is closed, and the stopped state is safe.
+            checkpoint = record.get("checkpoint") or {}
+            started = (checkpoint.get("agent_started")
+                       or checkpoint.get("prompt_issued")
+                       or checkpoint.get("pane_id")
+                       or checkpoint.get("workspace_id"))
+            open_rows = conn.execute(
+                "SELECT claim_id FROM claims WHERE run_id=? AND work_key=? "
+                "AND issue='' AND owner=?",
+                (record["run_id"], record["work_key"], OWNER),
+            ).fetchall()
+            if started or open_rows:
+                record["error"] = {
+                    "code": "TASK_CLAIM_RELEASE_REJECTED",
+                    "message": "the task's original claim cannot be verified; pane left untouched",
+                }
+                _save(record, env, clock)
+                return task_payload(record)
+            record["claim"] = {
+                "claim_id": None, "status": "RELEASED", "outcome": "abandon",
+                "released": True,
+            }
+            record["pane_closed"] = None
+            record.pop("error", None)
+            record["status"] = "stopped"
+            _save(record, env, clock)
+            _write_service("stopped", env, clock)
+            return task_payload(record)
         if prior_released:
             row = conn.execute(
                 "SELECT outcome, released_at FROM claims "

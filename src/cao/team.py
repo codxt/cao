@@ -355,6 +355,58 @@ def _new_dispatch_possible(record: Mapping[str, Any]) -> bool:
     return any(slot["status"] == "pending" for slot in record["slots"].values())
 
 
+def _verify_model_policy(config: product_config.ProductConfig | None,
+                         spec: Mapping[str, Any], *,
+                         bound: Mapping[str, Any] | None = None) -> None:
+    """Deny any NEW dispatch whose resolved route the model allowlist forbids.
+
+    Called on plan, initialization, start and every new dispatch intent. An
+    absent or unconfigured allowlist preserves existing behavior. Only routes
+    that have not started are gated: an already-issued execution keeps its exact
+    identity, prompt and claim and is still reconciled and released. Every
+    refusal is explicit; there is no silent fallback. A caller that already
+    resolved the boundary passes it in so one decision costs one resolution.
+    """
+
+    if config is None:
+        return
+    policy = product_config.team_model_policy(config)
+    if policy is None:
+        return
+    try:
+        allowed = (bound["allowed"] if bound is not None
+                   else _dispatchable_routes(config, spec)["allowed"])
+    except (TeamError, product_config.ProductConfigError) as exc:
+        raise TeamAdmissionError(str(exc)) from exc
+    for task_id, entry in allowed.items():
+        for phase, permitted in entry.items():
+            if not permitted:
+                raise TeamAdmissionError(
+                    f"team route {task_id}/{phase}: "
+                    "TEAM_MODEL_NOT_ALLOWED")
+
+
+def _dispatchable_routes(config: product_config.ProductConfig,
+                         spec: Mapping[str, Any]) -> dict[str, Any]:
+    """The effective routes PLUS the operator's model-allowlist decision.
+
+    The allowlist verdict is a separate parallel map: it never mutates the
+    resolved route objects, so the confirmation digests admission binds stay
+    exactly the effective selection the plan reports. ``team_cli._plan`` and
+    every dispatch gate consume this one structure.
+    """
+
+    routes = _effective_routes(config, spec)
+    policy = product_config.team_model_policy(config)
+    allowed: dict[str, dict[str, bool]] = {}
+    for task_id, entry in routes.items():
+        allowed[task_id] = {
+            phase: product_config.model_policy_error(route, policy) is None
+            for phase, route in entry.items()
+        }
+    return {"routes": routes, "allowed": allowed}
+
+
 def _verify_admission(record: Mapping[str, Any],
                       config: product_config.ProductConfig | None, *,
                       force: bool = False) -> None:
@@ -367,7 +419,8 @@ def _verify_admission(record: Mapping[str, Any],
     it holds the pending slot with ``TEAM_ADMISSION_CHANGED`` and leaves every
     running task to be reconciled and released. An unrelated configuration
     change therefore stops the team from starting anything new instead of
-    freezing what already runs.
+    freezing what already runs. The operator's model allowlist is part of the
+    same decision, so it is re-verified from the identical resolved routes.
     """
     admission = record.get("admission")
     if admission is None or (not force and not _new_dispatch_possible(record)):
@@ -377,13 +430,15 @@ def _verify_admission(record: Mapping[str, Any],
             "the approved team's configuration is unavailable; refusing new dispatch"
         )
     try:
-        routes = _effective_routes(config, record["spec"])
+        bound = _dispatchable_routes(config, record["spec"])
     except (TeamError, product_config.ProductConfigError) as exc:
         raise TeamAdmissionError(str(exc)) from exc
     try:
-        team_approval.verify_saved(record["spec"], config, admission, routes)
+        team_approval.verify_saved(
+            record["spec"], config, admission, bound["routes"])
     except team_approval.ApprovalError as exc:
         raise TeamAdmissionError(str(exc)) from exc
+    _verify_model_policy(config, record["spec"], bound=bound)
 
 
 def _check_initiative_lineage(spec: Mapping[str, Any],
@@ -484,6 +539,7 @@ def _confirm_undispatched_team(spec: Mapping[str, Any],
         raise TeamError("team already dispatched work; reapproval is refused")
     if _team_claim_count(env, spec["team_id"]):
         raise TeamError("team holds Registry claims; reapproval is refused")
+    _verify_model_policy(config, spec)
     try:
         record["admission"] = team_approval.confirmation(
             spec, config, _effective_routes(config, spec)
@@ -499,6 +555,7 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
     selected = validate_spec(spec)
     resolved = _admission_config(env, config)
     mode = team_approval.policy(resolved)["mode"]
+    _verify_model_policy(resolved, selected)
     with dispatch_lock(env):
         old = _read(selected["team_id"], env)
         if old is not None:
@@ -555,8 +612,13 @@ def set_desired(team_id: str, desired: str, *, env: Mapping[str, str] | None = N
             config = _admission_config(env, None)
             if record.get("admission") is not None:
                 _verify_admission(record, config)
-            elif team_approval.policy(config)["mode"] == "chat":
-                raise TeamAdmissionError("existing unapproved team cannot be newly started")
+            else:
+                # An unapproved team, or an unconfigured allowlist, must still
+                # refuse a disallowed route before any new dispatch intent.
+                _verify_model_policy(config, record["spec"])
+                if team_approval.policy(config)["mode"] == "chat":
+                    raise TeamAdmissionError(
+                        "existing unapproved team cannot be newly started")
         record["desired"] = desired
         _save(record, env)
         return summary(record)
@@ -1322,7 +1384,14 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     admission_cache = False
                 else:
                     try:
-                        _verify_admission(record, config, force=True)
+                        # One boundary decision per tick: an existing admission
+                        # re-verifies routes AND the model allowlist, while an
+                        # admission-less (legacy) team checks the allowlist
+                        # explicitly so a NEW dispatch is still denied.
+                        if record.get("admission") is None:
+                            _verify_model_policy(config, spec)
+                        else:
+                            _verify_admission(record, config, force=True)
                     except TeamAdmissionError:
                         admission_cache = False
                     else:

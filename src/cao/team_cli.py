@@ -3,117 +3,52 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from collections.abc import Mapping, Sequence
 
 from . import product_config, product_driver, team, team_approval
 from .state import StateError
-
-#: A bounded provider/model/agent-kind token. Anything that is not one is
-#: reported as unresolved instead of being echoed into operator output.
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+/#-]{0,150}\Z")
 
 
 def _emit(value: object) -> None:
     print(json.dumps(value, sort_keys=True))
 
 
-def _safe_token(value: object) -> str | None:
-    """The value only when it is a bounded, printable provider/model token."""
-
-    if type(value) is str and _SAFE_TOKEN.fullmatch(value):
-        return value
-    return None
-
-
-def _argv_model(arguments: object) -> tuple[str | None, int, bool]:
-    """One agent argv's declared ``--model`` switch, without echoing raw argv.
-
-    Returns ``(value, mentions, trap)``: ``value`` is the bounded token of the
-    single ``--model`` value (``None`` when that value is missing, unsafe or in
-    ``--model=value`` form), ``mentions`` counts ``--model`` switches, and
-    ``trap`` is set when a ``--model`` token is really the value of a preceding
-    flag. A caller treats more than one mention, an unusable value or a trap as
-    unresolved rather than guessing which token is the model.
-    """
-
-    if type(arguments) is not list:
-        return None, 0, False
-    mentions = 0
-    value: str | None = None
-    trap = False
-    for index, argument in enumerate(arguments):
-        if type(argument) is not str:
-            continue
-        if argument.startswith("--model="):
-            mentions += 1
-            value = None
-        elif argument == "--model":
-            mentions += 1
-            previous = arguments[index - 1] if index else None
-            # ``--standalone`` is a value-less switch CAO's own dispatch emits
-            # immediately before its ``--model`` selection, so it never
-            # consumes the switch; every other preceding flag may own the
-            # ``--model`` token as its value and stays ambiguous.
-            if (type(previous) is str and previous.startswith("-")
-                    and previous != "--standalone"):
-                trap = True
-            value = (_safe_token(arguments[index + 1])
-                     if index + 1 < len(arguments) else None)
-    return value, mentions, trap
-
-
-def _effective_model(provider_model: str | None, value: str | None,
-                     mentions: int, trap: bool) -> str | None:
-    """The one model the provider entry and the argv agree on, else ``None``.
-
-    A resolved model must never misreport what dispatch would select. OpenCode
-    rejects a provider/argv divergence at configuration time, but any other
-    agent kind can carry both, and a ``--model`` token that is really a
-    preceding flag's value is not a model at all. An ambiguous, invalid or
-    divergent selection is reported unresolved instead of falsely resolved.
-    """
-
-    if mentions == 0:
-        return provider_model
-    if mentions > 1 or value is None or trap:
-        return None
-    if provider_model is not None:
-        return provider_model if provider_model == value else None
-    return value
-
-
-def _route(entry: Mapping[str, object]) -> dict[str, object]:
+def _route(entry: Mapping[str, object],
+           allowed: object = None) -> dict[str, object]:
     """One read-only view of a resolved work/review route.
 
     The effective selection CAO would dispatch is reported (agent kind and
     provider), never the raw argument vector, environment or other private
     state. A model is shown only as a safe bounded token when the provider
     entry and any argv ``--model`` agree; a divergent, repeated or malformed
-    model selection is reported unresolved rather than falsely resolved.
+    model selection is reported unresolved rather than falsely resolved. The
+    operator's configured model allowlist decision is reported separately as
+    ``model_allowed`` so the read-only plan reflects the same deny decision
+    dispatch enforces without altering the resolved route.
     """
 
+    status, model = product_config.route_model(entry)
     provider = entry.get("provider")
     provider = provider if type(provider) is dict else {}
-    provider_model = _safe_token(provider.get("model"))
-    value, mentions, trap = _argv_model(entry.get("agent_args"))
-    model = _effective_model(provider_model, value, mentions, trap)
     return {
-        "agent_kind": _safe_token(entry.get("agent_kind")),
-        "provider": {"cli": _safe_token(provider.get("cli")),
-                     "id": _safe_token(provider.get("id")),
-                     "model": provider_model},
+        "agent_kind": product_config.safe_route_token(entry.get("agent_kind")),
+        "provider": {"cli": product_config.safe_route_token(provider.get("cli")),
+                     "id": product_config.safe_route_token(provider.get("id")),
+                     "model": product_config.safe_route_variant(
+                         provider.get("model"))},
         "model": model,
-        "model_status": "resolved" if model is not None else "unresolved",
+        "model_status": status,
+        "model_allowed": True if allowed is None else allowed,
     }
 
 
 def _task_plan(task: Mapping[str, object],
-               routes: Mapping[str, object]) -> dict[str, object]:
+               routes: Mapping[str, object],
+               allowed: Mapping[str, object]) -> dict[str, object]:
     return {"id": task.get("id"), "role": task.get("role"),
             "mode": task.get("mode"), "depends_on": task.get("depends_on"),
             "reviewer": task.get("reviewer"),
-            "routes": {phase: _route(routes[phase])
+            "routes": {phase: _route(routes[phase], allowed.get(phase))
                        for phase in ("work", "review") if phase in routes}}
 
 
@@ -127,7 +62,8 @@ def _plan(spec: Mapping[str, object],
     chat-confirmation authority and reports truthful null hashes.
     """
 
-    routes = team._effective_routes(config, spec)
+    bound = team._dispatchable_routes(config, spec)
+    routes, allowed = bound["routes"], bound["allowed"]
     mode = team_approval.policy(config)["mode"]
     confirmed = (team_approval.confirmation(spec, config, routes)
                  if mode == "chat" and spec.get("initiative") else None)
@@ -140,7 +76,8 @@ def _plan(spec: Mapping[str, object],
         "roles": {name: {key: role[key]
                          for key in ("model", "agent_profile") if key in role}
                   for name, role in spec["roles"].items()},
-        "tasks": [_task_plan(task, routes.get(task["id"], {}))
+        "tasks": [_task_plan(task, routes.get(task["id"], {}),
+                             allowed.get(task["id"], {}))
                   for task in spec["tasks"]],
         "max_writers": spec["max_writers"],
         "max_parallel": spec["max_parallel"],

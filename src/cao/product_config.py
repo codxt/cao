@@ -17,6 +17,7 @@ constants baked into this code.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -39,6 +40,13 @@ __all__ = [
     "load_config",
     "write_config",
     "initialize_config",
+    "TeamModelPolicy",
+    "team_model_policy",
+    "route_model",
+    "effective_route_model",
+    "safe_route_token",
+    "model_policy_error",
+    "SUPPORTED_TEAM_ROUTES",
     "TASK_SECTION",
     "DEFAULT_WORKSPACE_LABEL_PREFIX",
     "DEFAULT_RUNNER_TIMEOUT",
@@ -94,6 +102,25 @@ MAX_TEAM_STALL_TIMEOUT_MS = 604_800_000
 #: governed ledger (whose path ``registry_db_path`` resolves). A configuration
 #: naming any other policy is refused rather than silently ignored.
 REGISTRY_ATTACH_GOVERNED = "governed"
+
+#: Optional, operator-local model policy. Its vocabulary is the owner's
+#: authorized CAO/OpenCode dispatch routes (``provider/model``, optionally with
+#: a ``#effort`` variant). An absent field preserves the existing OSS behavior;
+#: a configured one is a deny gate applied to every NEW dispatch intent.
+TEAM_MODEL_ALLOWLIST_FIELD = "team_model_allowlist"
+_MAX_TEAM_MODELS = 16
+#: Documented owner routes, retained as explicit supported-route examples.
+SUPPORTED_TEAM_ROUTES = (
+    "opencode/step-5-preview-free",
+    "opencode-go/glm-5.3-flash",
+    "opencode-go/deepseek-v4.1-flash",
+)
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,150}\Z")
+#: A dispatch route may carry one bounded ``#effort`` variant (``#high``,
+#: ``#xhigh``, ...). The variant changes effort, never the base route, so the
+#: resolved argv model is normalized to its base before allowlist comparison.
+_MODEL_VARIANT = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,150}#[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
 class ProductConfigError(Exception):
@@ -158,6 +185,190 @@ def _optional_nonempty_str(value: Any, field_name: str) -> str | None:
     return value
 
 
+@dataclass(frozen=True)
+class TeamModelPolicy:
+    """A validated, operator-local allowlist of dispatch routes.
+
+    ``models`` holds unique normalized ``provider/model`` ids. ``None`` means
+    the operator has not configured the field, which preserves existing
+    behavior exactly.
+    """
+
+    models: frozenset[str]
+
+    def permits(self, model: str) -> bool:
+        return _normalize_team_model(model) in self.models
+
+
+def _normalize_team_model(value: str) -> str:
+    """Normalize one dispatch route by dropping an optional ``#effort`` variant."""
+
+    return value.split("#", 1)[0]
+
+
+def _validate_team_model(value: Any) -> str:
+    if ((type(value) is not str or not value
+            or not _MODEL_ID.fullmatch(value)
+            or ".." in value or "//" in value or "#" in value)):
+        raise ProductConfigError(
+            "team_model_allowlist must contain safe provider/model ids "
+            "without an #effort variant")
+    normalized = _normalize_team_model(value)
+    if "/" not in normalized or normalized.startswith("/") or normalized.endswith("/"):
+        raise ProductConfigError(
+            "team_model_allowlist entries must be provider/model ids")
+    return normalized
+
+
+def _team_model_values(raw: Any) -> list[str]:
+    """The field's string entries. Only a genuinely ABSENT key opts out.
+
+    An explicit ``[]``, ``null`` or wrong-type value would otherwise create a
+    deny-all or a silent bypass through ``team_model_policy``'s ``None``
+    return, so every present value must be a bounded nonempty array — it is
+    rejected here otherwise.
+    """
+
+    if not isinstance(raw, (list, tuple)) or isinstance(raw, (str, bytes)):
+        raise ProductConfigError("team_model_allowlist must be an array of strings")
+    if not raw:
+        raise ProductConfigError(
+            "team_model_allowlist must hold at least one entry; omit the field "
+            "entirely to keep its behavior unconfigured")
+    return list(raw)
+
+
+def team_model_policy(config: ProductConfig | None = None) -> TeamModelPolicy | None:
+    """The configured model allowlist, or ``None`` when the field is ABSENT.
+
+    ``None`` is only ever produced by a genuinely absent field, never by an
+    explicit ``[]`` or ``null`` value: those raise ``ProductConfigError``
+    above so strict enforcement can never be silently disabled. Fail closed:
+    a malformed field raises rather than being silently ignored.
+    """
+
+    if config is None or TEAM_MODEL_ALLOWLIST_FIELD not in config.raw:
+        return None
+    values = _team_model_values(config.raw[TEAM_MODEL_ALLOWLIST_FIELD])
+    if len(values) > _MAX_TEAM_MODELS:
+        raise ProductConfigError(
+            f"team_model_allowlist must hold at most {_MAX_TEAM_MODELS} entries")
+    normalized = [_validate_team_model(item) for item in values]
+    if len(set(normalized)) != len(normalized):
+        raise ProductConfigError(
+            "team_model_allowlist entries must be unique after normalization")
+    return TeamModelPolicy(models=frozenset(normalized))
+
+
+def safe_route_token(value: Any) -> str | None:
+    return value if type(value) is str and _MODEL_ID.fullmatch(value) else None
+
+
+def safe_route_variant(value: Any) -> str | None:
+    """A safe bounded route token, tolerating one trailing ``#effort`` variant."""
+
+    return (value if type(value) is str and (
+        _MODEL_ID.fullmatch(value) or _MODEL_VARIANT.fullmatch(value))
+        else None)
+
+
+def _argv_model(arguments: Any) -> tuple[str | None, int, bool]:
+    """One agent argv's declared ``--model`` switch, without echoing raw argv.
+
+    Returns ``(value, mentions, trap)``: ``value`` is the bounded token of the
+    single ``--model`` value (``None`` when that value is missing, unsafe or in
+    ``--model=value`` form), ``mentions`` counts ``--model`` switches, and
+    ``trap`` is set when a ``--model`` token is really the value of a preceding
+    flag. A caller treats more than one mention, an unusable value or a trap as
+    ambiguous rather than guessing which token is the model.
+    """
+
+    if type(arguments) is not list:
+        return None, 0, False
+    mentions = 0
+    value: str | None = None
+    trap = False
+    for index, argument in enumerate(arguments):
+        if type(argument) is not str:
+            continue
+        if argument.startswith("--model="):
+            mentions += 1
+            value = None
+        elif argument == "--model":
+            mentions += 1
+            previous = arguments[index - 1] if index else None
+            # ``--standalone`` is a value-less switch CAO's own dispatch emits
+            # immediately before its ``--model`` selection, so it never
+            # consumes the switch; every other preceding flag may own the
+            # ``--model`` token as its value and stays ambiguous.
+            if (type(previous) is str and previous.startswith("-")
+                    and previous != "--standalone"):
+                trap = True
+            value = (safe_route_variant(arguments[index + 1])
+                     if index + 1 < len(arguments) else None)
+    return value, mentions, trap
+
+
+def effective_route_model(provider_model: Any, value: Any,
+                          mentions: int, trap: bool) -> str | None:
+    """The one model the provider entry and the verified argv agree on, else None.
+
+    A resolved model must never misreport what dispatch would select: an
+    ambiguous, invalid or divergent selection is reported unresolved. A
+    bounded ``#effort`` variant is the same base route as its provider
+    selection, so agreement is compared on normalized base ids and the
+    effective argv selection is reported.
+    """
+
+    provider_model = safe_route_variant(provider_model)
+    if mentions == 0:
+        return provider_model
+    if mentions > 1 or value is None or trap:
+        return None
+    if provider_model is not None:
+        return (value
+                if _normalize_team_model(value)
+                == _normalize_team_model(provider_model) else None)
+    return value
+
+
+def route_model(route: Any) -> tuple[str, str | None]:
+    """The one model a resolved route would dispatch, else ``('unresolved', None)``.
+
+    The provider ``model`` and any single ``--model`` value in the verified
+    agent argv must agree; a repeated, missing, flag-trapped or divergent
+    selection is ambiguous and never reported as one resolved model.
+    """
+
+    if not isinstance(route, Mapping):
+        return "unresolved", None
+    provider = route.get("provider")
+    provider_model = (provider.get("model")
+                      if isinstance(provider, Mapping) else None)
+    value, mentions, trap = _argv_model(route.get("agent_args"))
+    model = effective_route_model(provider_model, value, mentions, trap)
+    return ("resolved", model) if model is not None else ("unresolved", None)
+
+
+def model_policy_error(route: Any, policy: TeamModelPolicy | None) -> str | None:
+    """The refusal reason when a configured policy forbids this route.
+
+    The model is read only from the provider entry and the verified agent argv,
+    never from an untrusted prompt. With a configured policy an ambiguous,
+    missing, malformed or unlisted selection is denied rather than silently
+    substituted, and a ``#effort`` variant is accepted as the same base route.
+    """
+
+    if policy is None:
+        return None
+    status, model = route_model(route)
+    if status != "resolved" or model is None:
+        return "TEAM_MODEL_UNRESOLVED"
+    if not policy.permits(model):
+        return "TEAM_MODEL_NOT_ALLOWED"
+    return None
+
+
 def validate_config(payload: Mapping[str, Any]) -> ProductConfig:
     """Validate a raw configuration document, failing closed on any defect."""
 
@@ -204,6 +415,14 @@ def validate_config(payload: Mapping[str, Any]) -> ProductConfig:
         team_approval.policy(SimpleNamespace(raw=payload))
     except team_approval.ApprovalError as exc:
         raise ProductConfigError(str(exc)) from exc
+
+    # Optional operator-local model allowlist. ABSENCE (no such key)
+    # preserves existing behavior; a present empty [], null, wrong type,
+    # malformed, duplicate or over-long list is refused here rather than
+    # silently disabling the gate or bypassing it at dispatch time.
+    team_model_policy(ProductConfig(
+        schema=schema, runtime_id=runtime_id, provider=provider,
+        managed=None, raw=dict(payload)))
 
     managed = payload.get("managed")
     if managed is not None and not isinstance(managed, Mapping):
@@ -397,12 +616,16 @@ def task_defaults(
           and config.provider.model is not None):
         # An advanced argv override must still identify the configured model.
         # A bare OpenCode TUI or silent model substitution can otherwise report
-        # an idle worker without performing the intended task.
+        # an idle worker without performing the intended task. A bounded
+        # ``#effort`` variant of the same base route is still the configured
+        # selection; a different base id is refused.
         matches = [i for i, arg in enumerate(agent_args) if arg == "--model"]
         if (not agent_args or agent_args[0] != "mini"
                 or len(matches) != 1
                 or matches[0] + 1 >= len(agent_args)
-                or agent_args[matches[0] + 1] != config.provider.model):
+                or _normalize_team_model(agent_args[matches[0] + 1])
+                != _normalize_team_model(config.provider.model)
+                or safe_route_variant(agent_args[matches[0] + 1]) is None):
             raise ProductConfigError(
                 "task.agent_args must select opencode mini and exactly provider.model"
             )

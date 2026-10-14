@@ -60,6 +60,30 @@ quota are all outside this rule: CAO reports the route `UNAVAILABLE` with its
 cause and escalates for an owner decision rather than dispatching another
 provider or model.
 
+Per installation, the operator may make this rule machine-enforced with the
+optional CAO product-config field `team_model_allowlist`:
+
+```json
+{"team_model_allowlist": ["opencode/step-5-preview-free", "opencode-go/glm-5.3-flash", "opencode-go/deepseek-v4.1-flash"]}
+```
+
+It is a bounded list (at most 16) of unique normalized `provider/model`
+identifiers without an `#effort` variant. Only the ABSENCE of the field is the
+opt-out: it preserves the existing behavior exactly. A present `[]`, `null`,
+wrong-typed, malformed, duplicate or over-long value is refused fail-closed by
+`validate_config` — a present value can never silently disable the gate. When
+configured it is a deny gate resolved only from each
+task's own provider and verified agent argv — never from an untrusted prompt.
+A route whose model is missing, ambiguous, flag-trapped or not listed is
+refused with no silent fallback. A route id carrying an `#effort` (or
+`#effort`-like) suffix is accepted as the same base route. The gate applies to
+the read-only plan (as a reported `model_allowed` verdict), to team
+initialization and start, and to every NEW dispatch intent before any Registry
+claim — for both team tasks and direct `cao run` product tasks. An
+already-started execution keeps its exact identity, prompt and claim and is
+still reconciled and released; changing the allowlist therefore stops new work
+instead of freezing work already in flight.
+
 ### Qualification states
 
 - **TEMPORARY.** Until the headless Codex transport is verified, the designated
