@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -198,13 +199,41 @@ class ChatTeamTests(unittest.TestCase):
         self.assertEqual(route["provider"]["model"], "claude/aaa")
         self.assertIsNone(route["model"])
         self.assertEqual(route["model_status"], "unresolved")
-        self.assertNotIn("bbb", json.dumps(plan))
+        # Assert only over the semantically relevant selection: the plan also
+        # carries random sha256 confirmation digests whose hex can coincidentally
+        # contain "bbb", so the whole serialized document is never a safe needle
+        # target. The divergent argv model must not be echoed as the route model.
+        self.assertNotIn("bbb", json.dumps(plan["tasks"]))
         # The route shown stays the exact selection admission binds.
         self.assertEqual(plan["routes_sha256"],
                          team_approval.confirmation(
                              self.spec, self.config,
                              team._effective_routes(self.config, self.spec))
                          ["routes_sha256"])
+
+    def test_plan_route_assertion_is_immune_to_random_digest_content(self):
+        # Regression for the false failure this suite used to risk: a 64-hex
+        # confirmation digest can contain "bbb", so an assertion that scanned
+        # the whole plan document could fail non-deterministically. The route
+        # fields alone carry no random digest and can never flip.
+        self.raw["provider"] = {"cli": "claude", "id": "account",
+                                "model": "claude/aaa"}
+        self.raw["task"] = {"agent_args": ["--model", "bbb"]}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        tasks = json.dumps(plan["tasks"])
+        # The needle is absent from every semantically relevant route field...
+        self.assertNotIn("bbb", tasks)
+        # ...while a confirmation digest is free to carry it. Inject the exact
+        # hex substring the old whole-document assertion would have matched and
+        # show the current document can hold it while the routes cannot.
+        injected = plan["spec_sha256"][:32] + "bbb" + plan["spec_sha256"][35:]
+        self.assertIn("bbb", injected)
+        self.assertIn(injected, json.dumps(
+            {**plan, "spec_sha256": injected}))
+        self.assertNotIn("bbb", tasks)
 
     def test_plan_treats_a_model_switch_used_as_a_flag_value_as_unresolved(self):
         # --model here is the value of the preceding flag, not a model switch.
@@ -750,6 +779,232 @@ class ChatTeamTests(unittest.TestCase):
         self.raw["team_approval"] = {"mode": "signed"}
         with self.assertRaises(product_config.ProductConfigError):
             product_config.validate_config(self.raw)
+
+    def test_plan_binds_the_model_allowlist_decision_and_fails_closed(self):
+        # The read-only plan reports the same deny decision dispatch enforces.
+        self.raw["team_model_allowlist"] = ["opencode/review"]
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["model"], "opencode/review")
+        self.assertEqual(route["model_status"], "resolved")
+        self.assertIs(route["model_allowed"], True)
+
+        self.raw["team_model_allowlist"] = ["opencode/other"]
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        self.assertIs(plan["tasks"][0]["routes"]["work"]["model_allowed"], False)
+
+    def test_initialize_denies_a_disallowed_team_route(self):
+        self.raw["team_model_allowlist"] = ["opencode/other"]
+        self.configure()
+        with self.assertRaises(product_config.ProductConfigError):
+            product_config.validate_config(
+                {**self.raw, "team_model_allowlist": ["not a route"]})
+        with self.assertRaises(team.TeamAdmissionError):
+            self.admit(approved=True)
+        self.assertEqual(team.list_teams(env=self.env), [])
+        self.raw["team_model_allowlist"] = ["opencode/review"]
+        self.configure()
+        self.assertEqual(self.admit(approved=True)["status"], "PAUSED")
+
+    def test_start_denies_a_disallowed_route_before_any_effect(self):
+        self.raw["team_model_allowlist"] = ["opencode/review"]
+        self.configure()
+        self.admit(approved=True)
+        self.raw["team_model_allowlist"] = ["opencode/other"]
+        self.configure()
+        # Starting an admitted team whose resolved route is now disallowed is
+        # refused outright; nothing new is dispatched.
+        with self.assertRaises(team.TeamAdmissionError):
+            team.set_desired("alpha", "running", env=self.env)
+        self.assertEqual(team.status("alpha", env=self.env)["desired"], "paused")
+        # Record the running intent directly (as crash/restore does) so the
+        # tick is the only gate; it must hold the NEW dispatch and run nothing.
+        record = team._required("alpha", self.env)
+        record["desired"] = "running"
+        team._save(record, self.env)
+        effects = []
+        result = self.tick(effects)
+        self.assertEqual(effects, [])
+        self.assertEqual(result["tasks"]["read"]["status"], "pending")
+        self.assertEqual(result["tasks"]["read"]["error"], "TEAM_ADMISSION_CHANGED")
+
+    def test_new_dispatch_holds_when_an_allowlist_appears_after_admission(self):
+        # A legacy team can start while unconfigured, then a configured
+        # allowlist that forbids its route must hold every NEW dispatch intent
+        # without touching the already-started execution.
+        self.raw.pop("team_approval")
+        self.configure()
+        self.admit()
+        self.raw["team_model_allowlist"] = ["opencode/other"]
+        self.configure()
+        self.assertEqual(self.tick([])["tasks"]["read"]["status"], "pending")
+
+    def test_already_started_task_reconciles_under_a_changed_allowlist(self):
+        self.raw["team_model_allowlist"] = ["opencode/review"]
+        self.configure()
+        self.admit(approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        self.tick([])  # dispatches the READ work execution
+        self.raw["team_model_allowlist"] = ["opencode/other"]
+        self.configure()
+        reconciled = []
+        result = self.tick(reconciled)
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+
+    def test_unconfigured_allowlist_preserves_existing_behavior(self):
+        # Only the ABSENCE of the field is the operator's opt-out. An explicit
+        # [] or null is a present value: validate_config refuses it fail-closed
+        # rather than silently disabling a strict gate.
+        self.raw.pop("team_model_allowlist", None)
+        self.configure()
+        self.admit(spec={**self.spec}, approved=True)
+        team.set_desired("alpha", "running", env=self.env)
+        effects = []
+        result = team.tick("alpha", config=self.config,
+                           driver=None, env=self.env,
+                           execute=lambda **kwargs: effects.append(kwargs)
+                           or dict(status="running"),
+                           writer_snapshot=lambda _: (0, set()),
+                           head_reader=lambda _: "a" * 40)
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+        self.assertEqual(len(effects), 1)
+        for bad in ("null", "empty"):
+            with self.subTest(present=bad):
+                raw = {**self.raw,
+                       "team_model_allowlist": None if bad == "null" else []}
+                with self.assertRaises(product_config.ProductConfigError):
+                    product_config.validate_config(raw)
+
+    def test_owner_routes_admit_effort_variants_at_init(self):
+        # All three owner-allowed routes are configurable; a role declaring an
+        # #effort variant resolves to the same base route and is admitted,
+        # while a lower-tier route on the same provider stays forbidden.
+        routes = ("opencode/step-5-preview-free",
+                  "opencode-go/glm-5.3-flash",
+                  "opencode-go/deepseek-v4.1-flash")
+        self.raw["team_model_allowlist"] = list(routes)
+        for route in routes:
+            for variant in ("", "#high", "#xhigh"):
+                with self.subTest(route=route, variant=variant):
+                    self.spec["roles"]["reviewer"]["model"] = route + variant
+                    slug = ("t-" + re.sub(r"[^a-z0-9-]", "-", route.lower())
+                            + (variant and "-" + variant[1:] or ""))
+                    spec = {**self.spec, "team_id": slug,
+                            "initiative": "i" + slug}
+                    self.configure()
+                    record = self.admit(spec, approved=True)
+                    self.assertEqual(record["status"], "PAUSED")
+                    # The plan's resolved route carries the variant argv truth.
+                    code, plan = self.plan(self.write_manifest(spec))
+                    self.assertEqual(code, 0)
+                    route_view = plan["tasks"][0]["routes"]["work"]
+                    self.assertEqual(route_view["model"],
+                                     route + (variant or ""))
+                    self.assertIs(route_view["model_allowed"], True)
+
+    def test_plan_refuses_a_claude_cli_spoofing_an_opencode_route(self):
+        # A $60 owner approval is paid for OpenCode routing. A profile whose
+        # argv model LOOKS allowed but whose resolved identity is
+        # agent_kind/provider.cli = claude used to pass the allowlist and
+        # dispatch on the foreign runtime; the read-only plan now answers the
+        # same deny decision dispatch enforces.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.raw["agent_profiles"] = {"claude_spoof": {
+            "agent_kind": "claude",
+            "read_args": ["--model", "opencode-go/glm-5.3-flash"]}}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                          "agent_profile": "claude_spoof"}
+        self.configure()
+        code, plan = self.plan(self.write_manifest())
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["agent_kind"], "claude")
+        self.assertEqual(route["provider"]["cli"], "claude")
+        self.assertEqual(route["model"], "opencode-go/glm-5.3-flash")
+        self.assertIs(route["model_allowed"], False)
+
+    def test_init_refuses_a_claude_cli_spoofing_an_opencode_route(self):
+        # The identical spoofed route is refused at initialization before any
+        # team or Registry effect; no team is admitted, claimed or saved.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.raw["agent_profiles"] = {"claude_spoof": {
+            "agent_kind": "claude",
+            "read_args": ["--model", "opencode-go/glm-5.3-flash"]}}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                          "agent_profile": "claude_spoof"}
+        self.configure()
+        with self.assertRaises(team.TeamAdmissionError) as caught:
+            self.admit(approved=True)
+        self.assertIn("TEAM_ROUTE_IDENTITY_MISMATCH", str(caught.exception))
+        self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_listed_model_with_spoofed_identity_is_held_on_tick(self):
+        # The listed model is unchanged, but a foreign agent kind within the
+        # task defaults no longer re-verifies as the OpenCode identity a NEW
+        # dispatch needs: a crash/restore-shaped running desire still holds
+        # the pending task with no effect at all.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.admit(approved=True)
+        self.raw["task"] = {"agent_kind": "claude"}
+        self.configure()
+        record = team._required("alpha", self.env)
+        record["desired"] = "running"
+        team._save(record, self.env)
+        effects = []
+        result = self.tick(effects)
+        self.assertEqual(effects, [])
+        self.assertEqual(result["tasks"]["read"]["status"], "pending")
+        self.assertEqual(result["tasks"]["read"]["error"], "TEAM_ADMISSION_CHANGED")
+
+    def test_approved_opencode_profile_dispatches_at_init_start_and_tick(self):
+        # The positive identity case: agent_kind/provider.cli both opencode
+        # and a resolved argv model on an allowlisted OpenCode route are
+        # admitted, started and dispatched through the team executor.
+        self.raw["team_model_allowlist"] = ["opencode-go/glm-5.3-flash"]
+        self.raw["agent_profiles"] = {"opencode_reader": {
+            "agent_kind": "opencode",
+            "read_args": ["mini", "--standalone",
+                          "--model", "opencode-go/glm-5.3-flash"]}}
+        self.spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                          "agent_profile": "opencode_reader"}
+        self.configure()
+        self.assertEqual(self.admit(approved=True)["status"], "PAUSED")
+        self.assertEqual(team.set_desired("alpha", "running", env=self.env)
+                         ["desired"], "running")
+        effects = []
+        result = self.tick(effects)
+        self.assertEqual(len(effects), 1)
+        self.assertEqual(result["tasks"]["read"]["status"], "running")
+
+    def test_low_tier_routes_are_denied_at_init_before_any_effect(self):
+        # $15 Go Luna / Space Bunny and any other unlisted route are refused
+        # outright at init; the admission evidence and team state stay empty.
+        for route in ("opencode-go/luna", "opencode-go/space-bunny"):
+            with self.subTest(route=route):
+                self.raw["team_model_allowlist"] = [
+                    "opencode/step-5-preview-free",
+                    "opencode-go/glm-5.3-flash",
+                    "opencode-go/deepseek-v4.1-flash",
+                ]
+                self.spec["roles"]["reviewer"]["model"] = route
+                self.configure()
+                with self.assertRaises(team.TeamAdmissionError):
+                    self.admit(approved=True)
+                self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_malformed_allowlist_is_refused_closed(self):
+        for bad in ("opencode/x#high", "notaroute", "opencode/a", "a" * 160,
+                    ["opencode/a", "opencode/a#high"], ["opencode/a", "opencode/a"],
+                    "opencode/a", [""], [1]):
+            with self.subTest(bad=bad):
+                raw = {**self.raw, "team_model_allowlist": bad}
+                with self.assertRaises(product_config.ProductConfigError):
+                    product_config.validate_config(raw)
 
 
 if __name__ == "__main__":

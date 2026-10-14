@@ -77,6 +77,75 @@ class TeamCliTests(unittest.TestCase):
         code, p = self.run_cao("init", "--file", str(self.manifest))
         self.assertEqual((code, p["status"]), (3, "UNAVAILABLE"))
 
+    def write_config(self, allowlist):
+        config = self.root / "config" / "cao" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({
+            "schema": "cao.product.config.v0",
+            "provider": {"cli": "opencode", "model": "opencode/step-5-preview-free"},
+            "team_model_allowlist": allowlist,
+        }), encoding="utf-8")
+
+    def test_configured_model_allowlist_denies_init_and_plan(self):
+        # Absence preserves existing behavior; a configured allowlist that
+        # forbids the effective route refuses init and reports the deny verdict
+        # on the read-only plan.
+        code, p = self.run_cao("validate", "--file", str(self.manifest))
+        self.assertEqual((code, p["status"]), (0, "VALID"))
+        self.write_config(["opencode-go/glm-5.3-flash"])
+        code, plan = self.run_cao("plan", "--file", str(self.manifest))
+        self.assertEqual(code, 0)
+        self.assertIs(plan["tasks"][0]["routes"]["work"]["model_allowed"], False)
+        code, p = self.run_cao("init", "--file", str(self.manifest))
+        self.assertEqual((code, p["status"]), (3, "UNAVAILABLE"))
+        self.assertEqual(p["code"], "TEAM_APPROVAL_REQUIRED")
+        self.assertFalse((self.root / "state" / "cao" / "teams" / "pilot.json").exists())
+        # The same manifest initializes once its route is authorized.
+        self.write_config(["opencode/step-5-preview-free"])
+        code, p = self.run_cao("init", "--file", str(self.manifest))
+        self.assertEqual((code, p["status"]), (0, "PAUSED"))
+        code, plan = self.run_cao("plan", "--file", str(self.manifest))
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["model"], "opencode/step-5-preview-free")
+        self.assertIs(route["model_allowed"], True)
+
+    def test_spoofed_claude_cli_plan_denied_and_init_refused(self):
+        # A profile whose argv model looks allowlisted but whose resolved
+        # runtime identity is agent_kind/provider.cli = claude is answered
+        # with the same deny decision dispatch enforces, refused at init and
+        # leaves no team state at all.
+        config = self.root / "config" / "cao" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({
+            "schema": "cao.product.config.v0",
+            "provider": {"cli": "opencode", "model": "opencode-go/glm-5.3-flash"},
+            "agent_profiles": {"claude_spoof": {
+                "agent_kind": "claude",
+                "read_args": ["--model", "opencode-go/glm-5.3-flash"]}},
+            "team_model_allowlist": ["opencode-go/glm-5.3-flash"],
+        }), encoding="utf-8")
+        manifest = self.root / "spoof.json"
+        manifest.write_text(json.dumps({
+            "schema": "cao.team.v1", "team_id": "spoof",
+            "roles": {"spy": {"instruction": "Inspect source",
+                              "agent_profile": "claude_spoof"}},
+            "tasks": [{"id": "inspect", "role": "spy",
+                       "repo": str(self.root / "repo"),
+                       "prompt": "Inspect the repository", "mode": "read"}],
+        }), encoding="utf-8")
+        code, plan = self.run_cao("plan", "--file", str(manifest))
+        self.assertEqual(code, 0)
+        route = plan["tasks"][0]["routes"]["work"]
+        self.assertEqual(route["agent_kind"], "claude")
+        self.assertEqual(route["provider"]["cli"], "claude")
+        self.assertEqual(route["model"], "opencode-go/glm-5.3-flash")
+        self.assertIs(route["model_allowed"], False)
+        code, p = self.run_cao("init", "--file", str(manifest), "--approved")
+        self.assertEqual((code, p["status"]), (3, "UNAVAILABLE"))
+        self.assertFalse(
+            (self.root / "state" / "cao" / "teams" / "spoof.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

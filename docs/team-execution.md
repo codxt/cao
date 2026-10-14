@@ -14,9 +14,23 @@ separate reviewer role with up to three correction rounds.
 
 Every model selection — a role's inline model, a reviewer or an
 `agent_profile` — must be one of the owner's authorized dispatch routes; see
-the allowlist in docs/automatic-recovery.md. CAO never substitutes a different
+the allowlist in docs/automatic-recovery.md. An operator may enforce that
+per installation with the optional CAO product-config `team_model_allowlist`
+(bounded unique normalized `provider/model` ids, no `#effort`); its absence
+preserves existing behavior. CAO never substitutes a different
 model when a route is unavailable or out of quota, and it holds the task
-`UNAVAILABLE` for an owner decision instead.
+`UNAVAILABLE` for an owner decision instead. When `team_model_allowlist` is
+configured, every NEW dispatch is additionally refused with zero Registry
+claim rows and no workspace or agent effect before the first effect; an
+already-claimed worker keeps its exact identity and is never re-gated.
+
+A listed `opencode/` or `opencode-go/` model id binds the dispatch route
+identity, not just the model string. A model id alone never proves OpenCode
+routing or a paid provider, so a resolved route that lists one must also name
+the actual OpenCode agent kind and provider CLI; a resolved route with a
+foreign, spoofed or missing agent kind or provider CLI is refused
+(`TEAM_ROUTE_IDENTITY_MISMATCH`) instead of dispatching on another runtime,
+even when the provider model and the verified argv `--model` look allowed.
 
 Example (replace checkout paths and illustrative model identifiers):
 
@@ -433,8 +447,13 @@ changes cannot silently alter dispatch.
 resolved work/review route each task would dispatch — the agent kind, the
 provider CLI/id and the effective model — and, in chat mode, the exact
 `spec_sha256` and `routes_sha256` that a following `cao team init --approved`
-would save, so an operator can confirm the digests before approving. Roles are
-shown only by their safe declared selection (an inline model or an
+would save, so an operator can confirm the digests before approving. Each route
+also reports `model_allowed`: the verdict the configured `team_model_allowlist`
+would apply at dispatch (truthful `true` when no allowlist is configured),
+including the OpenCode route-identity binding so a foreign or spoofed agent
+kind or provider CLI reads as denied on the plan exactly as it refuses at
+dispatch. Roles
+are shown only by their safe declared selection (an inline model or an
 `agent_profile`); raw role instructions, raw argument vectors, prompts,
 environment and configured document text are never emitted. The provider
 CLI/id and model fields shown are operator-declared identifier values, so an
