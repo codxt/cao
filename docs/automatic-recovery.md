@@ -18,6 +18,12 @@ with:
 - a structured, bounded final review carrying the exact reviewed HEAD and the
   task-bound nonce receipt.
 
+That headless Codex preference is a target transport, not a route grant: it
+stays a future optional adapter until a separate owner, provider and cost
+authority exists for it (R2), and until then the advisor dispatches on an
+authorized route from the allowlist below. It never widens the route set, and
+it never carries a broader sandbox or permission grant.
+
 Deterministic tests run through the approved CAO fixture runner in synthetic
 temporary fixtures, never through a model's unrestricted shell. Keep per-task
 **source, nonce, test and Registry** evidence: the exact reviewed commit, the
@@ -37,17 +43,38 @@ broader authority. If provider authentication, the exact route, policy or a
 trusted source fails, record `UNAVAILABLE` and escalate; never impersonate
 approval.
 
+### Authorized dispatch allowlist (owner rule)
+
+The owner's authoritative CAO/OpenCode dispatch routes are exactly these
+three, and nothing else:
+
+- `opencode/step-5-preview-free` — free;
+- `opencode-go/glm-5.3-flash` — $60 quota;
+- `opencode-go/deepseek-v4.1-flash` — $80 quota.
+
+An independent READ advisor must run on one of those three authorized routes,
+selected within its own quota, and the exact route is recorded next to the
+reviewed HEAD. A Go `$15` GPT-6 Luna route, a Space Bunny route, any other
+model, and any automatic substitution when a route is unavailable or out of
+quota are all outside this rule: CAO reports the route `UNAVAILABLE` with its
+cause and escalates for an owner decision rather than dispatching another
+provider or model.
+
 ### Qualification states
 
 - **TEMPORARY.** Until the headless Codex transport is verified, the designated
-  temporary READ advisor is the independent **OpenCode-Go GPT-6 High**
-  reviewer. The existing interactive Herdr/Codex review remains a legacy
+  temporary READ advisor is an independent reviewer dispatched on one of the
+  authorized routes above — Step 5 Preview Free, GLM 5.3 Flash or DeepSeek
+  v4.1 Flash. The existing interactive Herdr/Codex review remains a legacy
   compatibility fallback, not a reliable unattended default.
 - **Optional pilot.** A ChatGPT OAuth / OpenCode credential route may be tried
-  only after the account holder authorizes it themselves and the provider is
-  shown to qualify: the model, the subscription and the private-data policy
-  must all qualify, and a read-only permission-deny profile must be tested
-  first. CAO never logs in, copies or stores credentials automatically.
+  only after the account holder authorizes it themselves **and** a separate
+  owner, provider and cost authority for that route is granted explicitly; it
+  is never switched on automatically by the dispatch allowlist above. The
+  provider must still be shown to qualify: the model, the subscription and the
+  private-data policy must all qualify, and a read-only permission-deny profile
+  must be tested first. CAO never logs in, copies or stores credentials
+  automatically.
 
 A receipt proves a post-prompt response was observed; it is never a security
 signature, approval, guarantee of correctness or proof that tests passed.
@@ -104,6 +131,15 @@ environment, explicit no-hooks, no repository writes, an exact source SHA and
 an authenticated model. Compare the OpenCode OpenAI OAuth optional fallback;
 never modify credentials automatically. Run a disposable mock-driver and a
 source-free smoke first, then an actual trial.
+
+This batch is a **future optional** adapter, not an entitlement of the
+authorized dispatch allowlist above: it may begin only after a separate owner,
+provider and cost authority for the Codex route is granted, and until then the
+three authorized routes remain the only routes this rule dispatches. It is
+qualified under a READ-only sandbox with no interactive approvals and no
+untrusted hooks — never `--dangerously-bypass-approvals-and-sandbox`,
+`--dangerously-bypass-hook-trust`, `danger-full-access` or an unbounded
+`--auto` grant.
 
 Gate: zero Codex TUI trust, hook or command prompt for authorized READ review
 under sandbox; no unauthorized write; a reproducible bounded structured result;

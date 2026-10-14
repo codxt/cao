@@ -12,6 +12,12 @@ Tasks declare an absolute Git checkout path, role, prompt, mode, optional
 dependencies and a precisely scoped WRITE change set. A WRITE task may name a
 separate reviewer role with up to three correction rounds.
 
+Every model selection — a role's inline model, a reviewer or an
+`agent_profile` — must be one of the owner's authorized dispatch routes; see
+the allowlist in docs/automatic-recovery.md. CAO never substitutes a different
+model when a route is unavailable or out of quota, and it holds the task
+`UNAVAILABLE` for an owner decision instead.
+
 Example (replace checkout paths and illustrative model identifiers):
 
     {
@@ -144,7 +150,10 @@ labeled untrusted. A scoped WRITE verifies its actual committed Git changes,
 exact Registry release and worker shutdown through the existing task runner.
 
 A reviewer is a separate READ agent against the latest accepted source HEAD.
-It must report findings and exactly one of these lines:
+Its route is one of the owner's authorized dispatch routes recorded in
+docs/automatic-recovery.md, and no other model or automatic fallback model is
+dispatched in its place. It must report findings and exactly one of these
+lines:
 
     CAO_REVIEW_VERDICT: APPROVED
     CAO_REVIEW_VERDICT: CHANGES_REQUESTED
@@ -246,7 +255,10 @@ existing shared Registry; there is no second ledger.
 
 There is no automated provider privacy classification. Operators must verify
 the selected model's terms before using it on private or sensitive data.
-A free model is not a default destination for confidential material.
+A free model is not a default destination for confidential material. An
+authorized route's quota is a cost boundary, not a permission: exhausting it
+holds the task `UNAVAILABLE` for an owner decision, and neither an unlisted
+model nor a fallback provider is dispatched to work around it.
 Teams cannot publish, deploy, grant permissions, modify credentials, create
 production resources, or override repository governance by implication.
 
