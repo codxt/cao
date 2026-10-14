@@ -180,15 +180,18 @@ The findings and verdict sit at the **end** of a clipped capture, so correction
 feedback and every later handoff take the newest 5,000 characters of the kept
 text, never the oldest part of the retained window.
 
-Known limitation: `product_task` retains the longer of two observations so that
-a shorter later read can never erase a receipt an earlier read already proved.
-The converse is not detected: when an earlier longer read has no receipt and a
-later shorter read does, the shorter read is recorded as
-`superseded_read_chars` and the durable output keeps the earlier window. The
-task then holds UNKNOWN for operator inspection instead of accepting an
-unproven receipt. No generic rule preserves both directions without the task
-knowing its own completion nonce, so this trade-off is documented rather than
-silently weakened.
+Both directions of a scrolling pane are now retained. `product_task` keeps each
+bounded read as its own provenance-tagged observation -- its kept/limit/
+captured/dropped sizes, the capture timestamp and the prompt/stage provenance
+current when it was read -- alongside the primary capture. A shorter later read
+that newly carries the receipt is therefore evaluated instead of discarded, and
+an earlier receipt an already-proved read supplied is never lost when a longer
+later read arrives. A receipt is accepted only from a **post-prompt terminal**
+observation whose text is exactly the window it claims and carries this task's
+exact nonce; a pre-prompt or provenance-unknown window, a prompt echo, a changed
+nonce and another task's receipt are all refused. See
+docs/automatic-recovery.md for the reviewer and recovery policy this contract
+implements.
 
 Reviewer verdicts are workflow advisory, not deployment/publication/credential
 authority and not independent proof of correctness. Final acceptance still

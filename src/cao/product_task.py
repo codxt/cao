@@ -25,6 +25,10 @@ Fail-closed rules this module enforces:
   states how much of its beginning was dropped, so the completion receipt is
   never the part an operator loses, and a later read that captured less never
   erases the one already captured;
+* every bounded observation of the task's own pane is retained with its
+  timestamp and prompt provenance, so a longer earlier read that missed the
+  receipt cannot displace a shorter later read that carries it -- the durable
+  record keeps both, and the completion receipt is evaluated against each;
 * ``complete`` handback releases the claim with the observed repository HEAD;
   stop/abandon releases with outcome ``abandon`` and closes only CAO's own
   pane in the CAO-owned workspace.
@@ -62,6 +66,10 @@ TASK_SCHEMA = "cao.product.task.v0"
 LOGS_SCHEMA = "cao.product.logs.v0"
 
 _TERMINAL_STATUSES = ("complete", "stopped")
+#: How many of a task's own bounded pane observations are retained. A longer
+#: earlier read that missed the receipt and a shorter later one that carries it
+#: must both survive; the longest window is always preserved.
+_MAX_OBSERVATIONS = 4
 
 
 class TaskError(Exception):
@@ -233,6 +241,7 @@ def _new_record(
         "output": None,
         "output_truncated": False,
         "output_bounds": None,
+        "output_observations": [],
         "observation": None,
         "error": None,
         "refusal": None,
@@ -311,6 +320,7 @@ def task_payload(record: Mapping[str, Any]) -> dict[str, Any]:
         "output": record.get("output"),
         "output_truncated": bool(record.get("output_truncated")),
         "output_bounds": record.get("output_bounds"),
+        "output_observations": list(record.get("output_observations") or []),
         "pane_closed": record.get("pane_closed"),
         "error": record.get("error"),
         "refusal": record.get("refusal"),
@@ -639,12 +649,43 @@ def _prompt_once(
     return checkpoint
 
 
+def _remember_observation(record: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Retain a bounded set of this task's own observations of its pane.
+
+    A later read that captured less must never erase a completion receipt an
+    earlier read already proved, and the converse is just as important: a
+    longer earlier read that missed the receipt must not displace a shorter
+    later one that carries it. Both are kept, each with its own timestamp and
+    prompt provenance, so the durable record preserves every bounded window
+    that could prove completion. Entries are de-duplicated by their exact
+    captured text, the total is bounded, and the longest window is always
+    retained so an operator's completion receipt is never the part lost.
+    """
+
+    entries = [
+        existing
+        for existing in (record.get("output_observations") or [])
+        if isinstance(existing, Mapping) and existing.get("output") != entry["output"]
+    ]
+    entries.append(entry)
+    if len(entries) > _MAX_OBSERVATIONS:
+        longest = max(
+            range(len(entries)),
+            key=lambda index: len(str(entries[index].get("output") or "")),
+        )
+        drop = next(index for index in range(len(entries)) if index != longest)
+        del entries[drop]
+    record["output_observations"] = entries
+
+
 def _observe(
     driver: product_driver.RuntimeDriver,
     record: dict[str, Any],
     env: Mapping[str, str] | None,
     clock: Callable[[], Any] | None,
     defaults: product_config.TaskDefaults,
+    *,
+    terminal: bool = False,
 ) -> None:
     checkpoint = record.get("checkpoint") or {}
     agent_name = checkpoint.get("agent_name")
@@ -659,17 +700,27 @@ def _observe(
         return
     stamp = evidence.utc_now(clock)
     bounded, bounds = _bounded(text, defaults.max_output_chars)
+    # Every bounded read of this task's own pane is retained with the prompt
+    # provenance and terminal state that were current when it was captured, so
+    # a shorter later read carrying the receipt is never discarded in favour of
+    # a longer earlier read that missed it.
+    _remember_observation(record, {
+        "output": bounded,
+        "bounds": dict(bounds),
+        "observed_at": stamp,
+        "post_prompt": checkpoint.get("prompt_issued") is True,
+        "prompt_ack": checkpoint.get("prompt_ack"),
+        "stage": checkpoint.get("stage"),
+        "terminal": bool(terminal),
+    })
     stored = record.get("output")
     if isinstance(stored, str) and stored and len(bounded) < len(stored):
         # Each read is a bounded window of a scrolling pane. A later read that
         # captured less must not erase a completion receipt an earlier read
-        # already proved, so the longer capture is retained and the newer,
-        # shorter read is recorded as not stored. Known limitation: the
-        # converse is not detected -- a shorter later read that newly contains
-        # the receipt cannot displace a receipt-less longer window, so the task
-        # holds UNKNOWN instead. Distinguishing them needs this task's own
-        # nonce, which generic capture deliberately does not know; see
-        # docs/team-execution.md.
+        # already proved, so the longer capture is retained as the primary
+        # window and the newer, shorter read is recorded as not stored. The
+        # shorter read is still kept among the observations above, so a receipt
+        # it uniquely contains remains available to the receipt evaluator.
         record["output_bounds"] = dict(
             record.get("output_bounds") or {},
             superseded_read_chars=len(text),
@@ -1032,7 +1083,7 @@ def _finish(
                     }
                     _save(record, env, clock)
                     return task_payload(record)
-            _observe(driver, record, env, clock, defaults)
+            _observe(driver, record, env, clock, defaults, terminal=True)
             if record["mode"] == registry.WRITE:
                 closed, error = _close_owned_pane(driver, record)
                 if error is not None:
