@@ -688,6 +688,48 @@ class ReconciliationTests(DaemonCase):
                             for x in held["effects"]))
         self.assertEqual(product_state.read_daemon(self.env)["errors"], 1)
 
+    def test_healthy_tick_emits_no_engineering_metrics_exception(self):
+        driver = FakeDriver()
+        daemon = self.build(driver)
+        daemon.start()
+        report = daemon.tick()
+        self.assertFalse(any(item.get("action") == "engineering_metrics"
+                             for item in report["effects"]))
+
+    def test_engineering_exception_is_reported_bounded_and_applied_never(self):
+        watch = str(self.root / "engineering-watch.json")
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "example/model"},
+            "daemon": {"engineering_watch_file": watch},
+        })
+        driver = FakeDriver()
+        daemon = self.build(driver, config=config)
+        daemon.start()
+        held = {
+            "watch_id": "sample-loop", "status": "AWAITING_GITHUB_RECONCILIATION",
+            "merge_requested": True,
+            "exceptions": [{
+                "code": "GITHUB_RECONCILIATION_PENDING",
+                "source": "engineering_checkpoint",
+                "subject": "sample-loop",
+                "detail": "AWAITING_GITHUB_RECONCILIATION",
+                "observed": None, "head": None,
+            }],
+        }
+        with mock.patch("cao.engineering_loop.tick", return_value=held) as called:
+            result = daemon.tick()
+        called.assert_called_once_with(watch, execute=True)
+        metrics = [item for item in result["effects"]
+                   if item.get("action") == "engineering_metrics"]
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0]["status"], "EXCEPTIONS")
+        self.assertEqual(metrics[0]["codes"], ["GITHUB_RECONCILIATION_PENDING"])
+        self.assertEqual(metrics[0]["count"], 1)
+        # The bounded view carries no subject, detail or source identity.
+        self.assertNotIn("subject", metrics[0])
+        self.assertEqual(product_state.read_daemon(self.env)["errors"], 0)
+
     def test_daemon_watch_uses_existing_tick_and_never_grants_write(self):
         watch = str(self.root / "feedback-watch.json")
         configured = product_config.validate_config({
@@ -1636,6 +1678,19 @@ class TeamRecoveryDaemonTests(DaemonCase):
                          ["recovery"]["resumed"][ident], 1)
         self.assertEqual(self.released_claim_count(), 1)
         self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_daemon_reports_a_held_team_exception_without_applying_it(self):
+        driver, config, ident = self.team_read_setup(pinned_head="0" * 40)
+        report = self.start_daemon(driver, config).tick()
+        metrics = [item for item in report["effects"]
+                   if item.get("action") == "engineering_metrics"]
+        self.assertTrue(metrics)
+        self.assertIn("HELD_EVIDENCE", metrics[0]["codes"])
+        # The report changed nothing: the original worker was never re-prompted
+        # and no bounded resume was applied by the metric path.
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertNotIn(ident, team._required(
+            "factory", self.env)["recovery"]["resumed"])
 
     def test_daemon_recovery_makes_no_external_egress(self):
         driver, config, ident = self.team_read_setup()

@@ -216,14 +216,46 @@ ID/claim and refusing every unsafe mutation or unknown evidence.
 
 ### R4 — engineering queue and PR review (after R3 canary)
 
-Integrate the existing GitHub engineering evaluation queue and independent PR
-review with exact-head gates, a separate operator grant and the release
-lifecycle unchanged; add SLA/metrics for a lost receipt, review latency,
-retries and terminal provenance. Monitor and report exceptions rather than
-sending hourly routine messages.
+Implemented in source as one small pure module
+(`src/cao/engineering_metrics.py`) applied by the existing engineering tick and
+the existing daemon cadence. The GitHub engineering evaluation queue and the
+independent exact-head PR review keep their gates, the separate operator grant
+and the release lifecycle unchanged: exact head, evaluation digest, distinct
+bot/operator/reviewer identities, protected-branch CI and strict up-to-date
+checks, and a single GitHub-native auto-merge request guarded by the persisted
+`SUBMITTING`/`REQUESTED` checkpoint. No second ledger, scheduler, watch,
+database, worker or wake daemon is introduced, no new credential, permission or
+live webhook is added, and nothing is auto-enabled: the metrics change no gate
+verdict and the daemon applies none of them.
+
+The module derives SLA and exception metrics on demand from records CAO already
+keeps — the engineering checkpoint and tick result, the team recovery decision
+receipt (R3), and the durable product task record. It reports, and never
+collects into a new store. The covered conditions are:
+
+- **terminal receipt loss** — a held `TERMINAL_RECEIPT_MISSING` decision;
+- **review latency** — the exact head's wait for an independent `APPROVED`
+  review, measured from the checkpoint's own `first_seen` stamp;
+- **retry decisions** — an applied same-identity READ resume is counted, and a
+  spent resume budget is reported;
+- **claim-release provenance** — a `complete` task must carry a released claim
+  with a bounded `complete` outcome and the released source head, and a refused
+  release is reported rather than hidden;
+- **PR/CI/evaluation waits** — the head's wait on CI, on a measured evaluation
+  and on the separate operator grant, each against a bounded ceiling.
+
+Every exception carries its code, its source and the exact head; a condition
+that cannot be measured from evidence (a missing capture stamp) is reported
+unmeasured and is never rounded up to a breach. An `AWAITING_GITHUB_
+RECONCILIATION` state is always reported: the merge request's outcome is
+uncertain and must be inspected, never replayed. The daemon surfaces the report
+as a bounded effect only when an exception exists, so a healthy tick emits
+nothing — this is exception reporting, not an hourly routine message.
 
 Gate: CI/evaluation and an operator-granted GitHub merge; no irreversible
-sends, permission changes, production deploy or tenant egress.
+sends, permission changes, production deploy or tenant egress. Reaching this
+batch required the accepted, merged R3 source at the live default branch head;
+it grants no new authority and admits no new route.
 
 ## Reporting
 

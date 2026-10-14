@@ -187,17 +187,59 @@ unreviewed work, edit tenant knowledge, activate production monitors,
 deploy, change credentials, grant permissions, or override a deployment
 platform's release gates.
 
+## SLA and exception metrics
+
+Each read-only or effectful tick returns a derived
+`cao.engineering.metrics.v1` view next to its verdict. It never changes the
+verdict, and it is computed on demand from the tick result and its own
+checkpoint (`src/cao/engineering_metrics.py`) — no second ledger, scheduler,
+database, watch or worker is introduced and nothing is persisted.
+
+The view reports the exact head, the evaluation digest, the external gate the
+head is waiting on (`evaluation`, `ci`, `independent_review`, `operator_grant`,
+`github_reconciliation`), the `first_seen`/`observed_at` stamps and the measured
+age against a bounded ceiling. These wait ceilings are deliberately generous;
+they stop an unbounded silent wait, they are not a second release gate:
+
+| condition | exception code |
+| --- | --- |
+| independent review wait past its ceiling | `REVIEW_LATENCY_EXCEEDED` |
+| exact-head CI wait past its ceiling | `PR_CI_WAIT_EXCEEDED` |
+| measured-evaluation wait past its ceiling | `EVALUATION_WAIT_EXCEEDED` |
+| operator-grant wait past its ceiling | `OPERATOR_GRANT_WAIT_EXCEEDED` |
+| an uncertain `AWAITING_GITHUB_RECONCILIATION` state | `GITHUB_RECONCILIATION_PENDING` |
+| a refused exact-head source gate | `SOURCE_GATE_HELD` |
+
+The same report folds in the records the daemon already reads: a held
+`TERMINAL_RECEIPT_MISSING` decision is `TERMINAL_RECEIPT_LOSS`, a spent resume
+budget is `RETRY_BUDGET_SPENT`, a withheld provider/interactive route is
+`PROVIDER_ROUTE_HELD`, a held Registry/Git/security/source refusal is
+`HELD_EVIDENCE`, and a `complete` task without a proven released claim — or a
+release refused by the Registry — is `CLAIM_RELEASE_UNPROVEN`. An applied
+same-identity READ resume is counted as a retry decision.
+
+A condition that cannot be measured from evidence (a missing capture stamp) is
+reported unmeasured and is never rounded up to a breach. The daemon surfaces
+the report as one bounded `engineering_metrics` effect **only when an exception
+exists**, with a code list and a count and no private subject or detail; a
+healthy tick emits nothing. This is exception reporting, not an hourly routine
+message. `AWAITING_GITHUB_RECONCILIATION` is always reported and never
+replayed; no metric sends, merges, deploys, releases or widens a permission.
+
 ## Validation and qualification
 
 ~~~sh
 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
-  python3 -B -S -m unittest tests.test_engineering_loop -v
+  python3 -B -S -m unittest tests.test_engineering_loop tests.test_engineering_metrics -v
 ~~~
 
 Hermetic tests check exact-head identity, CI and branch protection, separate
 operator/reviewer, approval content, scope, TTL, polling cadence, crash
 idempotency, remote merge reconciliation and the daemon integration. They
-never call live GitHub merge or a production evaluator.
+never call live GitHub merge or a production evaluator. The metrics tests pin
+every derived wait and exception threshold, prove an unmeasurable interval
+never claims a breach, and prove the report is idempotent across repeated ticks
+with no duplicate submit.
 
 Prior to live use, qualify a real evaluation metric adapter/source, exact metrics
 and CI, safe bot permissions and protected branch, operator and reviewer
