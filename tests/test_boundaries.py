@@ -37,9 +37,43 @@ SEPARATION_RULES = {
         "cao.contracts",
     ),
     "contracts.py": ("runtime", "cao.runtime", "policy", "cao.policy", "state", "cao.state"),
+    # Intake admission is a private inbound gate: it must not reach execution,
+    # policy, the runtime contract or the Work Registry, so an admitted
+    # submission can never start, merge or claim anything.
+    "intake.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+        "registry",
+        "cao.registry",
+    ),
+    # The inbound bridge is the same private gate seen from the transport side:
+    # it admits data and nothing else, so it must not reach execution, policy,
+    # the runtime contract or the Work Registry either.
+    "intake_bridge.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+        "registry",
+        "cao.registry",
+    ),
 }
 
-PRIVATE_TOKENS = ("albr", "sentinelx", "/home/", "resident")
+PRIVATE_TOKENS = (
+    "albr",
+    "sentinelx",
+    "/home/",
+    "resident",
+    "brain",
+    "tolest",
+    "companyos",
+)
 
 
 def _python_files(root: Path = CAO_ROOT) -> list[Path]:
@@ -197,6 +231,24 @@ class ContractBoundaryTests(unittest.TestCase):
         # An environment with no installed plugins yields an empty registry;
         # CAO never ships a built-in runtime.
         self.assertEqual(PluginRegistry.discover(entry_points=[]).ids(), ())
+
+
+class IntakeStrictnessBoundaryTests(unittest.TestCase):
+    """F1 boundary: intake records are read through intake's own strict reader.
+
+    ``cao.state.read_state`` accepts duplicate JSON keys, so intake must not
+    route durable records through it. A regression to the permissive reader
+    would silently accept a tampered or ambiguous record.
+    """
+
+    def test_intake_does_not_import_the_permissive_state_reader(self) -> None:
+        imports = _imports(CAO_ROOT / "intake.py")
+        self.assertNotIn("state", imports)
+        self.assertNotIn("cao.state", imports)
+
+    def test_intake_source_has_no_permissive_state_fallback(self) -> None:
+        text = (CAO_ROOT / "intake.py").read_text(encoding="utf-8")
+        self.assertNotIn("read_state", text)
 
 
 class RecursiveGuardTests(unittest.TestCase):
