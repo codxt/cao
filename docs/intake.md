@@ -341,15 +341,27 @@ document at that commit matches the cited digest. A free-text `accepted: true`,
 an unverifiable digest, a ref that has moved, a missing document or a
 credential-shaped value is refused rather than accepted.
 
+That verification establishes only that the cited document **exists at that
+commit with that content**. It does **not** establish that a currently-effective
+delegation or an operator decision exists: `accepted_at` and the authority grant
+are cited evidence, not proof of authority. The draft therefore reports the
+authority grant as declared but **not verified** (`verified: false`,
+`source_verified: true` — source existence only), keeps `authority = "none"` and
+`dispatch = false`, and leaves acceptance to the accountable owner outside Git.
+No digest, timestamp or free-text acceptance in the route can assert authority.
+
 Where a precondition cannot be objectively established B4 returns an explicit
-`NEEDS_HUMAN_REVIEW` (unverifiable plan, capability or authority evidence; an
-unreadable shared Work Registry) or `UNAVAILABLE` (a non-`PROPOSE_WORK` packet;
-active Registry work overlapping the proposal; a performer kind with no existing
-Team Execution adapter) instead of fabricating a qualified manifest. Human,
-software and hybrid performers remain advisory: only the AI performer kind has
-an existing Team Execution adapter, so any other kind is `UNAVAILABLE` rather
-than a falsely launchable manifest. A role model selection is configuration, not
-authority, and no provider is certified suitable for private data by a draft.
+`NEEDS_HUMAN_REVIEW` (unverifiable plan, capability or authority evidence; a
+manifest with no independent reviewer of a WRITE task, or whose accountable plan
+reviewer is declared but reviews no WRITE task while an unrelated reviewer
+handles the writes; an unreadable shared Work Registry) or `UNAVAILABLE` (a
+non-`PROPOSE_WORK` packet; active Registry work overlapping the proposal; a
+performer kind with no existing Team Execution adapter) instead of fabricating a
+qualified manifest. Human, software and hybrid performers remain advisory: only
+the AI performer kind has an existing Team Execution adapter, so any other kind
+is `UNAVAILABLE` rather than a falsely launchable manifest. A role model
+selection is configuration, not authority, and no provider is certified suitable
+for private data by a draft.
 
 Load-bearing properties:
 
@@ -363,10 +375,15 @@ Load-bearing properties:
   directory or file.
 - **No dispatch, no model, no credential.** B4 opens no provider egress, runs no
   model, holds no credential and cannot start an agent.
-- **Opaque text.** Objectives, work packages, prompts and instructions are
-  untrusted, opaque data: inspected and bounded, never executed or interpolated
-  into a shell. A credential-shaped value is refused rather than persisted, and
-  the draft never carries the original submission body.
+- **Opaque text, screened for known credentials.** Objectives, work packages, the
+  required capability, task prompts and role instructions are untrusted, opaque
+  data: inspected and bounded, never executed or interpolated into a shell. Each
+  is refused if it is credential-shaped under intake's known-credential screen
+  (the same screen B1 admission uses) rather than persisted or silently redacted
+  into different content. This is a fail-closed screen for **known** credential
+  shapes only — it is not a guarantee that arbitrary secret text is detected — so
+  every prompt still requires operator review, and the draft never carries the
+  original submission body.
 
 ## Limitations and unresolved items
 
@@ -397,10 +414,13 @@ dispositions, refusal and unknown paths, stale sources, duplicate and
 already-implemented detection, replay/conflict, private crash-safe storage,
 prompt-injection inertness and the CLI. `tests/test_intake_compile.py` is the B4
 runnable check: non-`PROPOSE_WORK` refusal, stale/revoked/unverifiable plan,
-unqualified capability, missing review or authority, wrong repository/path
-domain, active Registry overlap, replay/duplicate/conflict, prompt-injection
-inertness, symlinked/foreign route input, `--dry-run` creating no state, zero
-agent/team/claim effects, denied provider authority and the CLI.
+unqualified capability, missing review or authority, a plan reviewer declared
+but unused by any WRITE task, wrong repository/path domain, active Registry
+overlap, replay/duplicate/conflict, prompt-injection inertness,
+credential-shaped task prompts and role instructions, symlinked/foreign route
+input, `--dry-run` creating no state, zero agent/team/claim effects, denied
+provider authority, an authority grant that is never asserted verified, and the
+CLI.
 `tests/test_boundaries.py` additionally
 guards that intake never routes a durable record through the permissive state
 reader and that triage and B4 reach the Registry through read-only calls only,

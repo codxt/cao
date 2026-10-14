@@ -255,6 +255,20 @@ class HappyPathTests(_GitFixture):
         self.assertIn("cao team init --approved", draft["review"]["action"])
         self.assertTrue(draft["uncertainties"])
 
+    def test_draft_never_asserts_authority_is_verified(self) -> None:
+        # Read-only Git evidence proves the cited authority document exists at
+        # that commit; it never proves a currently-effective delegation. The
+        # draft must not round source existence up to verified authority.
+        draft = self.compile(self.packet, self.document)["draft"]
+        grant = draft["authority_grant"]
+        self.assertEqual(grant["declared"], True)
+        self.assertIs(grant["verified"], False)
+        self.assertIs(grant["source_verified"], True)
+        self.assertEqual(draft["authority"], "none")
+        self.assertIs(draft["dispatch"], False)
+        self.assertIs(draft["requires_review"], True)
+        self.assertIs(draft["review"]["provider_authorized"], False)
+
     def test_sources_are_verified_against_git(self) -> None:
         draft = self.compile(self.packet, self.document)["draft"]
         labels = {source["label"]: source for source in draft["provenance"]["sources"]}
@@ -355,6 +369,19 @@ class RefusalTests(_GitFixture):
         with self.assertRaises(intake_compile.CompileInvalid):
             self.compile(self.packet, document)
 
+    def test_spoofed_authority_grant_digest_establishes_no_authority(self) -> None:
+        document = json.loads(json.dumps(self.document))
+        document["authority"]["source"]["digest"] = "sha256:" + "9" * 64
+        with self.assertRaises(intake_compile.CompileNeedsReview):
+            self.compile(self.packet, document)
+        self.assertFalse(Path(intake_compile.route_dir(self.env)).exists())
+
+    def test_free_text_acceptance_is_not_authority(self) -> None:
+        document = json.loads(json.dumps(self.document))
+        document["authority"]["accepted"] = True
+        with self.assertRaises(intake_compile.CompileInvalid):
+            self.compile(self.packet, document)
+
 
 class ScopeAndReviewTests(_GitFixture):
     def test_wrong_task_repository_is_refused(self) -> None:
@@ -389,6 +416,19 @@ class ScopeAndReviewTests(_GitFixture):
         document["plan"]["reviewer"] = "outsider"
         with self.assertRaises(intake_compile.CompileNeedsReview):
             self.compile(self.packet, document)
+
+    def test_plan_reviewer_declared_but_unused_by_a_write_task_is_refused(self) -> None:
+        # The accountable plan reviewer is a declared role, but the only WRITE
+        # task is reviewed by an unrelated role, so it independently reviews
+        # none of the work in question.
+        document = json.loads(json.dumps(self.document))
+        document["manifest"]["roles"]["auditor"] = {
+            "instruction": "Audit unrelated reporting work."
+        }
+        document["plan"]["reviewer"] = "auditor"
+        with self.assertRaises(intake_compile.CompileNeedsReview):
+            self.compile(self.packet, document)
+        self.assertFalse(Path(intake_compile.route_dir(self.env)).exists())
 
 
 class RegistryOverlapTests(_GitFixture):
@@ -458,6 +498,18 @@ class PersistenceAndReplayTests(_GitFixture):
         with self.assertRaises(intake_compile.CompileStateError):
             intake_compile.read_draft(result["draft"]["draft_id"], self.env)
 
+    def test_tampered_authority_verified_claim_fails_closed(self) -> None:
+        # A persisted draft that claims verified authority must fail closed even
+        # when its content fingerprint is recomputed to match.
+        result = self.compile(self.packet, self.document)
+        path = Path(intake_compile.draft_path(result["draft"]["draft_id"], self.env))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["authority_grant"]["verified"] = True
+        record["content_fingerprint"] = intake_compile._content_fingerprint(record)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaises(intake_compile.CompileStateError):
+            intake_compile.read_draft(result["draft"]["draft_id"], self.env)
+
     def test_draft_document_is_canonical_and_readable(self) -> None:
         result = self.compile(self.packet, self.document)
         stored = intake_compile.read_draft(result["draft"]["draft_id"], self.env)
@@ -490,6 +542,23 @@ class DryRunAndInjectionTests(_GitFixture):
         document["plan"]["objective"] = "use token: ghp_" + "a" * 36
         with self.assertRaises(intake_compile.CompileInvalid):
             self.compile(self.packet, document)
+
+    def test_credential_shaped_task_prompt_is_refused(self) -> None:
+        document = json.loads(json.dumps(self.document))
+        document["manifest"]["tasks"][0]["prompt"] = (
+            "Deploy with the AWS key AKIA" + "A" * 16
+        )
+        with self.assertRaises(intake_compile.CompileInvalid):
+            self.compile(self.packet, document)
+
+    def test_credential_shaped_role_instruction_is_refused(self) -> None:
+        document = json.loads(json.dumps(self.document))
+        document["manifest"]["roles"]["developer"]["instruction"] = (
+            "Use the provider token sk-" + "a" * 24
+        )
+        with self.assertRaises(intake_compile.CompileInvalid):
+            self.compile(self.packet, document)
+        self.assertFalse(Path(intake_compile.route_dir(self.env)).exists())
 
     def test_symlinked_route_file_is_refused(self) -> None:
         real = self.route_file(self.document, name="real.json")

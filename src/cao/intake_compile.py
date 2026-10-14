@@ -749,17 +749,32 @@ def _compile_manifest(route: Mapping[str, Any]) -> dict[str, Any]:
     except team.TeamError as exc:
         raise CompileInvalid(f"manifest is not a valid cao.team.v1: {exc}") from exc
 
-    review_roles = {task.get("reviewer") for task in normalized["tasks"]
-                    if task.get("reviewer")}
-    if not review_roles:
+    # The manifest carries task prompts and role instructions into Team
+    # Execution, so each is screened for a known credential shape before the
+    # manifest is accepted. This is fail-closed for known shapes only, not a
+    # guarantee that arbitrary secret text is refused.
+    for name, role in normalized["roles"].items():
+        _safe_text(role["instruction"], f"manifest.roles.{name}.instruction", 2000)
+    for task in normalized["tasks"]:
+        _safe_text(task["prompt"], f"manifest.tasks.{task['id']}.prompt", 12000)
+
+    # The accountable reviewer must actually review a WRITE task. A declared
+    # role that reviews nothing, while an unrelated reviewer handles every
+    # write, is not independent review of the work in question.
+    write_reviewers = {
+        task.get("reviewer")
+        for task in normalized["tasks"]
+        if task.get("mode") == "write" and task.get("reviewer")
+    }
+    if not write_reviewers:
         raise CompileNeedsReview(
             "the proposed manifest declares no independent reviewer",
             ["no WRITE task names a distinct reviewer role"],
         )
-    if route["plan"]["reviewer"] not in normalized["roles"]:
+    if route["plan"]["reviewer"] not in write_reviewers:
         raise CompileNeedsReview(
-            "the accountable reviewer is not a declared manifest role",
-            ["route.plan.reviewer is absent from the manifest roles"],
+            "the accountable reviewer does not review any WRITE task",
+            ["route.plan.reviewer is not the reviewer named by a WRITE task"],
         )
 
     for task in normalized["tasks"]:
@@ -872,7 +887,12 @@ def _build_draft(
             "grantor": authority["grantor"],
             "grant_digest": authority["grant_digest"],
             "declared": True,
-            "verified": True,
+            # Git evidence proves the cited grant document exists at that
+            # commit with that content. It does NOT prove a currently-effective
+            # delegation or an operator decision, so authority stays unverified
+            # and acceptance remains external to this draft.
+            "verified": False,
+            "source_verified": sources["authority"]["verdict"] == "SUPPORTED",
         },
         "scope": {
             "repo": scope["repo"],
@@ -965,6 +985,10 @@ def _verify_draft(data: Any, expected_id: str) -> dict[str, Any]:
             or data.get("dispatch") is not False
             or data.get("requires_review") is not True):
         raise CompileStateError("stored draft is not a proposed, non-authorizing record")
+    grant = data.get("authority_grant")
+    if (not isinstance(grant, Mapping) or grant.get("verified") is not False
+            or grant.get("declared") is not True):
+        raise CompileStateError("stored draft asserts a verified authority grant")
     try:
         declared = _record_id(data.get("draft_id"), "draft_id")
         stored_print = _bounded_str(
