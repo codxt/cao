@@ -14,6 +14,16 @@ and bounded read-only evidence, and returns one advisory disposition with cited
 provenance. It starts nothing, claims nothing and sends nothing; with no
 qualified provider it always yields the deterministic context packet.
 
+``status`` is the B5 request-to-resolution projection: it derives a truthful
+requester status and an accountable next mover from existing evidence, read-only
+and idempotent. ``--guest-view`` is refused ``UNAVAILABLE`` in this build: a
+guest projection is only defensible for a host that has independently
+authenticated the caller, and no such host connector exists, so the CLI never
+trusts a principal or scope asserted through process environment or CLI input.
+``reply`` is the B5 outbound gate: a real send is never available, so it serves
+only a deterministic ``--dry-run`` or an explicit ``--mock`` run of the built-in
+no-egress simulation, and only after a separate operator authorizing event.
+
 Output is JSON on stdout. Exit codes are ``0`` success, ``2`` usage error and
 ``3`` explicit UNAVAILABLE/conflict, matching the rest of CAO's CLI.
 """
@@ -26,7 +36,8 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from . import intake, intake_bridge, intake_compile, intake_triage
+from . import (intake, intake_bridge, intake_compile, intake_resolution,
+               intake_triage)
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -213,6 +224,67 @@ def _cmd_triage(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Derive one truthful request-to-resolution status (read-only)."""
+
+    submission_id = getattr(args, "id", None)
+    item_id = getattr(args, "item_id", None)
+    try:
+        if submission_id is not None and item_id is not None:
+            derived = intake.submission_id_for(item_id)
+            if derived != submission_id:
+                return _error(
+                    "status", "USAGE", "--id and --item-id name different items"
+                )
+        elif item_id is not None:
+            submission_id = intake.submission_id_for(item_id)
+        elif submission_id is None:
+            return _error("status", "USAGE", "status requires --id or --item-id")
+        if getattr(args, "guest_view", False):
+            # Fail closed. A guest projection is only defensible for a caller a
+            # host has *independently authenticated*. Process environment and
+            # CLI arguments are caller-controlled, so this build serves no guest
+            # view from them: a forged host identity or scope, or any submission
+            # body, is not proof and yields UNAVAILABLE.
+            return _error(
+                "status",
+                "RESOLUTION_UNAVAILABLE",
+                "the guest view is UNAVAILABLE: it requires an independently "
+                "authenticated host connector, and this build serves no guest "
+                "projection from process environment or CLI input",
+            )
+        document = intake_resolution.derive_status(submission_id)
+    except intake_resolution.ResolutionRefused as exc:
+        return _refusal("status", exc.code, str(exc), "REFUSED")
+    except (intake.IntakeError, intake_resolution.ResolutionError) as exc:
+        return _error("status", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("status", "RESOLUTION_ERROR", type(exc).__name__)
+    _emit(document)
+    return EXIT_OK
+
+
+def _cmd_reply(args: argparse.Namespace) -> int:
+    """Simulate one gated origin-channel reply (no egress)."""
+
+    try:
+        result = intake_resolution.reply(
+            args.id,
+            kind=args.kind,
+            auth_file=args.auth_file,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            mock=bool(getattr(args, "mock", False)),
+        )
+    except intake_resolution.ResolutionRefused as exc:
+        return _refusal("reply", exc.code, str(exc), "REFUSED")
+    except (intake.IntakeError, intake_resolution.ResolutionError) as exc:
+        return _error("reply", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("reply", "RESOLUTION_ERROR", type(exc).__name__)
+    _emit(result)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cao intake",
@@ -283,6 +355,36 @@ def build_parser() -> argparse.ArgumentParser:
     compile_cmd.add_argument("--dry-run", action="store_true",
                              help="return the draft and create no state")
     compile_cmd.set_defaults(handler=_cmd_compile)
+
+    status_cmd = commands.add_parser(
+        "status",
+        help="truthful request-to-resolution status projection (read-only)",
+    )
+    status_cmd.add_argument("--id", metavar="SUBMISSION_ID",
+                            help="durable submission id to project")
+    status_cmd.add_argument("--item-id", metavar="ITEM_ID",
+                            help="stable item id; its submission id is derived")
+    status_cmd.add_argument("--guest-view", action="store_true",
+                            help="request a redacted guest projection; "
+                                 "UNAVAILABLE in this build without an "
+                                 "authenticated host connector")
+    status_cmd.set_defaults(handler=_cmd_status)
+
+    reply_cmd = commands.add_parser(
+        "reply",
+        help="simulate one gated origin-channel reply (no egress)",
+    )
+    reply_cmd.add_argument("--id", required=True, metavar="SUBMISSION_ID",
+                           help="durable submission id to reply about")
+    reply_cmd.add_argument("--kind", required=True, choices=intake_resolution.SEND_KINDS,
+                           help="followup, answer or event receipt")
+    reply_cmd.add_argument("--auth-file", required=True, metavar="PATH",
+                           help="separate operator authorizing event JSON")
+    reply_cmd.add_argument("--dry-run", action="store_true",
+                           help="deterministic no-egress plan; sends nothing")
+    reply_cmd.add_argument("--mock", action="store_true",
+                           help="built-in simulated adapter; sends nothing")
+    reply_cmd.set_defaults(handler=_cmd_reply)
     return parser
 
 

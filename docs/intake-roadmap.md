@@ -6,9 +6,11 @@
 > independently accepted**. **B4 is implemented in source**
 > (`src/cao/intake_compile.py`, `tests/test_intake_compile.py`) and is reported
 > as `SOURCE_COMPLETE`: reviewed, merged and independently accepted are
-> **separate, later states** and are not claimed here. **B5 remains plan only** —
-> no B5 code ships in this tree, and every B5 capability below is a durable
-> intention, not a claim that it exists.
+> **separate, later states** and are not claimed here. **B5 is implemented in
+> source** (`src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`)
+> and is likewise reported as `SOURCE_COMPLETE`; its independent acceptance is a
+> separate, later state and is not claimed here. B4 and B5 are **not** promoted
+> past the state the repository actually records.
 
 > **Owner.** The CAO repository owner. Shared-contract changes and anything
 > beyond the stated scope require an accountable integration decision, exactly as
@@ -36,7 +38,7 @@ Three layers must stay explicit and never be blurred:
 |---|---|---|
 | **Source evidence** | What an external source or in-tree artifact actually says/does | vendor page; committed B1/B2/B3 code in `src/cao/intake.py`, `src/cao/intake_bridge.py`, `src/cao/intake_triage.py`, `docs/intake.md` |
 | **Accepted plan** | What the owner has decided CAO *should* build | this document |
-| **Live implementation** | What actually runs and is verified | B3 deterministic triage; B4 draft compiler; **nothing for B5 yet** |
+| **Live implementation** | What actually runs and is verified | B3 deterministic triage; B4 draft compiler; B5 read-only status projection and mock gate |
 
 A statement in this document is a plan unless it cites source evidence or a live
 test. Reviewers must not read a planned capability as shipped.
@@ -64,7 +66,7 @@ That leaves a governed middle:
   **Implemented (`SOURCE_COMPLETE`).**
 - **B5** — derive a truthful requester status and accountable next mover from
   existing evidence, and (only under explicit send authority) reply on the
-  originating channel. **Plan.**
+  originating channel. **Implemented (`SOURCE_COMPLETE`); sends nothing.**
 
 Each phase consumes the previous one. None adds a queue, scheduler, dispatcher,
 second Registry, universal task database or second authority model.
@@ -337,33 +339,65 @@ with `NEEDS_HUMAN_REVIEW` rather than fabricating a qualified manifest.
 
 ## 6. Phase B5 — request to resolution
 
-**Status: plan only. Not implemented.**
+**Status: implemented in source (`SOURCE_COMPLETE`); independent acceptance
+pending. Reads only; sends nothing.**
 
 **Goal.** Give the requester a truthful status and name the accountable **next
 mover**, derived from **existing** evidence — never fabricated.
 
+**Implemented surface.** `src/cao/intake_resolution.py` and
+`cao intake status --id <submission-id> [--guest-view]`, with the outbound gate
+`cao intake reply --id <id> --kind <followup|answer|event> --auth-file <path>
+[--dry-run|--mock]`. The projection reuses the existing strict private readers
+for the B1 submission, the B3 advisory packet and the B4 draft, reads the
+existing CAO team checkpoint and the shared Work Registry read-only, and
+persists **nothing at all** (no queue, ledger, index or canonical state), so it
+is idempotent by construction.
+
 **Derived status.** Requester status and next mover are computed from existing
-Intake, triage, team, Registry, PR, review and acceptance evidence. The status
-vocabulary must truthfully show at least: **clarification requested**,
-**work proposed**, **waiting for review**, **verified answer**, **completion**,
-and **later outcomes** — **without false closure**. A request is never shown as
-answered or closed without the matching acceptance evidence.
+Intake, triage, team and Registry evidence, with external PR/review state
+reported `UNKNOWN` because it is not locally readable (no client, no network).
+The vocabulary truthfully shows **clarification requested**, **work proposed**,
+**in progress**, **waiting for review**, **verified answer**, **completion** and
+**later outcomes**, without false closure. `VERIFIED_ANSWER`, `COMPLETION` and
+`LATER_OUTCOME` are emitted only from an **authenticated** acceptance source;
+this build ships none, so it never asserts closure and instead reports the
+highest supported status and names the reviewer/operator. A candidate answer, a
+`PROPOSED` draft, a `COMPLETE` team summary and any user-supplied status are
+never acceptance.
 
-**Channel adapters.** Qualified adapters may reply on the **originating
-channel** with *followup*, *answer* and *event receipts* — but **only after
-explicit send authorization**. Adapters run **dry-run / mock first**. B5 does
-**not** build a custom marketplace MCP server, and does **not** presume a
-CAO-owned external status API. Marketplace policy and any channel credential
-remain the operator's, external to CAO, exactly as `docs/intake.md` states.
+**Channel adapters.** B1/B2 source provides no authenticated delivery identity
+and no outbound credential, so an unqualified real send is a structured
+`UNAVAILABLE`. Only a deterministic `--dry-run` (no egress) or an explicit
+`--mock` run of the **built-in** deterministic simulated adapter (`sent: false`,
+`simulation: true`) is served, after a separate operator authorizing event bound
+to the **verified** originating recipient/context. The mock pathway accepts
+**no** caller-supplied adapter object or callable, so a caller cannot inject a
+`send` that reaches the network while the call still reports `sent: false`. The
+send id is a deterministic idempotency key; an ambiguous acknowledgement is
+`UNAVAILABLE`, never rounded up. B5 builds **no** custom marketplace MCP server,
+**no** service, **no** external status API and **no** scheduler; marketplace
+policy and any channel credential stay the operator's, external to CAO, exactly
+as `docs/intake.md` states.
 
-**Guest view.** An optional **guest-owned status view** may be exposed through
-the operator's existing internal control surface, strictly as a **projection**.
-It is **not** a new canonical database, not a second source of truth, and not
-authority.
+**Guest view.** The optional guest status view is a **redacted projection** for
+a caller a host has **independently authenticated**; it is not served from a
+process environment or CLI input. B5 ships no authenticated host connector, so
+the CLI `--guest-view` fails closed `UNAVAILABLE` even when
+`CAO_HOST_PRINCIPAL` / `CAO_HOST_PRINCIPAL_SUBMISSIONS` are set: those values are
+untrusted input, never proof. The pure library `guest_projection` stays
+available for a host that *has* authenticated the caller; a submission outside
+the proven scope is refused; it writes no index, keeps no second canonical state
+and cannot be spoofed by a submission body. Live guest access is not offered.
 
-**Tests to write (synthetic only):** guest and cross-tenant leak; wrong
-recipient; retries / ambiguous send; absent approval; missing evidence;
-misreported sent/closed.
+**Tests to write (synthetic only):** guest and cross-tenant leak; a forged host
+environment that still yields a fail-closed `--guest-view`; wrong recipient;
+retries / ambiguous send; a caller-injected adapter that never executes; absent
+approval; missing evidence; misreported sent/closed; invalid/stale status;
+prompt-injection inertness; no new task/work claim; read-only Registry and
+private `0700`/`0600`; no egress. These are the runnable check in
+`tests/test_intake_resolution.py`, with the read-only and zero-effect boundaries
+in `tests/test_boundaries.py`.
 
 **Acceptance gate.** B5 is accepted only after B4 acceptance, on independent
 review proving truthful status derivation, gated and idempotent sends, and
@@ -376,13 +410,16 @@ B2 final security approval
   → B3 implementation            [done: SOURCE_COMPLETE]
   → B3 independent acceptance    [done: accepted]
   → B4 implementation            [done: SOURCE_COMPLETE]
-  → B4 independent acceptance    [pending]
-  → B5                           [plan]
+  → B4 independent acceptance    [separate recorded gate]
+  → B5 implementation            [done: SOURCE_COMPLETE]
+  → B5 independent acceptance    [pending]
 ```
 
 - No phase begins before the **previous gate is accepted**. B3's independent
-  acceptance is recorded, so B4 has begun; B5 does not start until B4's
-  independent acceptance is recorded.
+  acceptance is recorded, so B4 has begun; B5's source is present at the merged
+  B4 head and its own independent acceptance is a separate, later state that is
+  **not** claimed here. The repository records exactly the states above and
+  promotes none of them.
 - **Model qualification.** The owner plan names a read/manager model, a writer
   model and a final-read advisory model. Every role is **qualified by provider
   privacy and source scope**, and none is certified suitable for
@@ -429,9 +466,10 @@ payload is used in a pilot or a test.
 5. **B4 manifest compiler** — compile one immutable `cao.team.v1` manifest with
    no execution. **Done.**
 6. **B5 derived status** — compute requester status and next mover from existing
-   evidence only.
+   evidence only. **Done (`SOURCE_COMPLETE`).**
 7. **B5 dry-run adapter** — one mock channel send, gated and receipted, before
-   any real adapter.
+   any real adapter. **Done (`SOURCE_COMPLETE`);** real adapters remain
+   unavailable, and an unqualified send is `UNAVAILABLE`.
 
 **Acceptance criteria per phase:** full normal and `-S` test suites pass; the
 phase's tests pass; the foundation CLI smoke passes; `git diff --check` is
@@ -479,9 +517,10 @@ completion, sent or closed state.
 | B1/B2 admission contract | `docs/intake.md`, `src/cao/intake.py`, `src/cao/intake_bridge.py` | committed; final security acceptance recorded separately |
 | B3 advisory triage | `src/cao/intake_triage.py`, `tests/test_intake_triage.py`, `docs/intake.md` | implemented, merged and independently accepted |
 | B4 routing compiler | `src/cao/intake_compile.py`, `tests/test_intake_compile.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
+| B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
 | Team Execution manifest `cao.team.v1` | `docs/team-execution.md` | shipped |
 | Performer/authority/evidence semantics | owner's cross-project work-execution contract (owner-referenced v0.4) | owner planning reference; re-verify against canonical home |
-| B5 design (and every B5 capability below) | this document | **accepted owner plan, not operating fact** |
+| B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending; the owner plan below is its authority, not operating fact |
 
 ## 14. Navigation
 
