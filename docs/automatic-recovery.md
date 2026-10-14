@@ -171,12 +171,45 @@ no silent model or provider fallback.
 
 ### R3 — safe deterministic recovery transitions (after R2 release)
 
-Add safe recovery transitions to the existing CAO daemon: a durable
-budget/decision receipt, observations, per-team idempotency and classification.
-READ-only resumes may be automatic when the evidence is exact; WRITE is never
-automatically replayed and authority, claim and approval remain externally
-proven. Add crash/restart and competing-worker tests. No second scheduler or
-ledger.
+Implemented in source as one small pure classifier
+(`src/cao/team_recovery.py`) applied by the existing team tick under the same
+`team.dispatch_lock`, over the existing team checkpoint, Work Registry and
+runtime observation. No second scheduler, ledger, database, controller, agent
+or wake daemon is introduced: the daemon reports each recorded decision and
+applies nothing itself.
+
+For every UNKNOWN team task the classifier records exactly one bounded decision
+— a classification, a decision, a reason, the next required action and
+provenance (task ID, phase, source HEAD, Registry claim ID, nonce-receipt state
+and capture timestamp) — into the existing team checkpoint. The receipt is
+idempotent: an unchanged evidence snapshot keeps its original fingerprint and
+capture stamp instead of rewriting the record. Each task's decision is bounded
+to one entry and the per-identity resume ledger is bounded as well.
+
+Classifications: `RUNNING_PROGRESS`, `TERMINAL`, `TERMINAL_RECEIPT_MISSING`,
+`INTERACTIVE_GATE`, `READ_TRANSPORT`, `WRITE_COMMITTED_BUT_UNVERIFIED`,
+`REGISTRY_CONFLICT`, `GIT_DRIFT`, `SECURITY_FAILURE` and `PR_CI_PENDING`.
+Decisions: `CONTINUE`, `RESUME_READ`, `HOLD`, `BLOCK` and `OBSERVE`.
+
+The only automatic transition is one bounded, same-identity READ resume. It is
+admitted **only** when every gate is proven from durable evidence: a
+recoverable READ transport failure; the SAME original execution identity with
+its checkpointed original prompt and agent/pane; an available runtime that
+still reports the original worker; a verified active READ Registry row with the
+exact claim id, owner, mode, run and work key; and an unchanged pinned Git HEAD
+and branch. It reuses the existing `team.resume` transition and the existing
+`product_task` reconciliation under the same dispatch lock, so it never starts
+a replacement agent, replays an issued prompt, or creates a new claim. At most
+one resume is admitted per original execution identity; a repeat holds.
+
+Every other snapshot holds or blocks with its reason: a lost terminal receipt,
+an interactive provider/route gate, a Registry conflict or unreadable ledger, a
+Git HEAD or branch drift, a platform or tool-layer denial, a pending
+exact-head PR CI gate, or an UNKNOWN WRITE — including a
+`SOURCE_COMPLETE`-but-unverified WRITE at an already committed head — is never
+automatically replayed, retried, stopped, released, merged, published or
+impersonated, and its claimed worktree is never mutated. Uncertain evidence
+always holds.
 
 Gate: self-healing only where evidence exists, preserving the ORIGINAL task
 ID/claim and refusing every unsafe mutation or unknown evidence.

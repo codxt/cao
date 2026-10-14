@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from cao import (product_config, product_daemon, product_state, product_task,
-                 registry, team)
+                 registry, team, team_recovery)
 from tests.test_product_task import FakeDriver, GIT_ENV, git_repo
 from cao.state import StateError
 
@@ -2468,6 +2468,232 @@ class TeamTests(unittest.TestCase):
                 c.execute("SELECT COUNT(*) FROM dispositions").fetchone()[0], 1)
         finally:
             c.close()
+
+
+    # -- R3 automatic safe recovery ---------------------------------------
+
+    def _recovery_setup(self, *, team_id="squad", task_id="inspect",
+                        mode="read", error="TEAM_RESULT_UNREADABLE",
+                        driver=None):
+        """Build a real READ product task with an open claim, then hold the
+        team slot at the exact same original identity but UNKNOWN."""
+
+        os.makedirs(self.paths[0], exist_ok=True)
+        driver = driver or FakeDriver()
+        driver.agent_present = True
+        db = product_config.registry_db_path(self.env)
+        task = {"id": task_id,
+                "role": "analyst" if mode == "read" else "developer",
+                "repo": self.paths[0], "prompt": "Analyze source",
+                "mode": mode,
+                "write_scope": ["README.md"] if mode == "write" else [],
+                "depends_on": []}
+        self.init(self.spec([task], team_id=team_id))
+        ident = team._execution_id(team_id, task_id, "work", 0)
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "opencode/dev"},
+            "task": {"agent_kind": "opencode", "run_id": "cao-team-" + team_id},
+        })
+        product_task.run_task(
+            driver=driver, repo=task["repo"], prompt=task["prompt"],
+            task_id=ident, mode=mode, write_scope=task["write_scope"],
+            config=config, env=self.env, registry_db=db, wait_ms=0)
+        record = team._required(team_id, self.env)
+        slot = record["slots"][task_id]
+        slot.update(status="unknown", error=error, execution_id=ident,
+                    prompt=task["prompt"], pinned_head=A, pinned_branch="main",
+                    started_at="2026-01-01T00:00:00Z",
+                    progress_at="2026-01-01T00:00:00Z")
+        team._save(record, self.env)
+        return driver, db, ident, config
+
+    def _recovery_tick(self, driver, db, *, execute=None, head=A, branch="main",
+                       writers=0, worktrees=None, team_id="squad"):
+        return team.tick(
+            team_id, env=self.env, config=self.config, driver=driver,
+            registry_db=db, execute=execute,
+            writer_snapshot=lambda _db: (writers, worktrees or set()),
+            head_reader=lambda _repo: head,
+            branch_reader=lambda _repo: branch,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    def _claim_count(self, db):
+        conn = registry.connect_readonly(db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _decision(self, team_id="squad", task_id="inspect"):
+        return team._required(team_id, self.env)["recovery"]["decisions"][task_id]
+
+    def test_recovery_resumes_the_original_read_identity_without_reprompt(self):
+        driver, db, ident, _ = self._recovery_setup()
+        calls = []
+
+        def fake(**kwargs):
+            calls.append((kwargs["execution_id"], kwargs["prompt"]))
+            return {"status": "unknown",
+                    "error": {"code": "TEAM_RESULT_UNREADABLE"}}
+
+        result = self._recovery_tick(driver, db, execute=fake)
+        # The SAME original execution identity and prompt were reconciled.
+        self.assertEqual(calls, [(ident, "Analyze source")])
+        decision = self._decision()
+        self.assertEqual(decision["classification"], team_recovery.READ_TRANSPORT)
+        self.assertEqual(decision["decision"], team_recovery.RESUME_READ)
+        self.assertTrue(decision["auto_resume"])
+        self.assertEqual(decision["provenance"]["source_head"], A)
+        self.assertEqual(decision["provenance"]["claim_id"], 1)
+        self.assertEqual(
+            team._required("squad", self.env)["recovery"]["resumed"][ident], 1)
+        self.assertEqual(result["recovery"][0]["auto_resume"], True)
+        # No new claim and no prompt replay ever happened.
+        self.assertEqual(self._claim_count(db), 1)
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_recovery_duplicate_tick_holds_after_one_bounded_resume(self):
+        driver, db, ident, _ = self._recovery_setup()
+
+        def fake(**kwargs):
+            return {"status": "unknown",
+                    "error": {"code": "TEAM_RESULT_UNREADABLE"}}
+
+        self._recovery_tick(driver, db, execute=fake)
+        second = self._recovery_tick(driver, db, execute=fake)
+        record = team._required("squad", self.env)
+        self.assertEqual(record["slots"]["inspect"]["status"], "unknown")
+        self.assertEqual(record["recovery"]["resumed"][ident], 1)
+        self.assertEqual(record["recovery"]["decisions"]["inspect"]["decision"],
+                         team_recovery.HOLD)
+        self.assertEqual(second["recovery"][0]["decision"], team_recovery.HOLD)
+        self.assertEqual(self._claim_count(db), 1)
+
+    def test_recovery_receipt_is_idempotent_across_ticks(self):
+        driver, db, ident, _ = self._recovery_setup()
+        # A stale head keeps the slot UNKNOWN across ticks without resuming.
+        self._recovery_tick(driver, db, head=B)
+        first = self._decision()
+        self.assertEqual(first["classification"], team_recovery.GIT_DRIFT)
+        self.assertEqual(first["decision"], team_recovery.HOLD)
+        self._recovery_tick(driver, db, head=B)
+        second = self._decision()
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+        self.assertEqual(first["at"], second["at"])
+        self.assertEqual(team._required("squad", self.env)
+                         ["slots"]["inspect"]["status"], "unknown")
+        self.assertNotIn(ident, team._required("squad", self.env)["recovery"]["resumed"])
+
+    def test_recovery_tool_refusal_blocks_and_changes_no_claim(self):
+        driver, db, ident, _ = self._recovery_setup(error="TEAM_TOOL_DENIED")
+        before = self._claim_count(db)
+        self._recovery_tick(driver, db)
+        decision = self._decision()
+        self.assertEqual(decision["classification"], team_recovery.SECURITY_FAILURE)
+        self.assertEqual(decision["decision"], team_recovery.BLOCK)
+        self.assertFalse(decision["auto_resume"])
+        self.assertEqual(team._required("squad", self.env)
+                         ["slots"]["inspect"]["status"], "unknown")
+        self.assertEqual(self._claim_count(db), before)
+
+    def test_recovery_provider_denial_holds_without_claim(self):
+        self.init(self.spec([task("a", self.paths[0], mode="read")]))
+        ident = team._execution_id("squad", "a", "work", 0)
+        record = team._required("squad", self.env)
+        record["slots"]["a"].update(
+            status="unknown", error="PROVIDER_DENIED", execution_id=ident,
+            prompt="Analyze source")
+        team._save(record, self.env)
+        result = self._recovery_tick(None, product_config.registry_db_path(self.env))
+        decision = self._decision("squad", "a")
+        self.assertEqual(decision["classification"], team_recovery.INTERACTIVE_GATE)
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+        self.assertFalse(decision["auto_resume"])
+        self.assertEqual(team._required("squad", self.env)
+                         ["slots"]["a"]["status"], "unknown")
+
+    def test_recovery_absent_task_record_holds(self):
+        driver, db, ident, _ = self._recovery_setup()
+        with mock.patch("cao.product_state.read_task", return_value=None):
+            self._recovery_tick(driver, db)
+        decision = self._decision()
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+        self.assertFalse(decision["auto_resume"])
+        self.assertEqual(team._required("squad", self.env)
+                         ["slots"]["inspect"]["status"], "unknown")
+        self.assertEqual(self._claim_count(db), 1)
+
+    def test_recovery_no_matched_pane_holds(self):
+        driver, db, ident, _ = self._recovery_setup()
+        driver.agent_present = False
+        self._recovery_tick(driver, db)
+        decision = self._decision()
+        self.assertEqual(decision["classification"], team_recovery.READ_TRANSPORT)
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+        self.assertFalse(decision["auto_resume"])
+
+    def test_recovery_stale_branch_holds(self):
+        driver, db, ident, _ = self._recovery_setup()
+        self._recovery_tick(driver, db, branch="release")
+        decision = self._decision()
+        self.assertEqual(decision["classification"], team_recovery.GIT_DRIFT)
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+
+    def test_recovery_competing_worker_conflict_holds(self):
+        driver, db, ident, _ = self._recovery_setup()
+        self._recovery_tick(driver, db, writers=1,
+                            worktrees={os.path.realpath(self.paths[0])})
+        decision = self._decision()
+        self.assertEqual(decision["classification"], team_recovery.REGISTRY_CONFLICT)
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+        self.assertFalse(decision["auto_resume"])
+
+    def test_recovery_concurrent_dispatch_lock_refuses_second_tick(self):
+        driver, db, ident, _ = self._recovery_setup()
+        with team.dispatch_lock(self.env):
+            with self.assertRaises(team.TeamError):
+                self._recovery_tick(driver, db)
+
+    def test_recovery_source_complete_write_is_never_replayed(self):
+        self.init(self.spec([task("ship", self.paths[0], mode="write")]))
+        ident = team._execution_id("squad", "ship", "work", 0)
+        record = team._required("squad", self.env)
+        record["slots"]["ship"].update(
+            status="unknown", error="TASK_RELEASE_UNVERIFIED",
+            execution_id=ident, prompt="Implement a bounded change")
+        team._save(record, self.env)
+        self._recovery_tick(None, product_config.registry_db_path(self.env))
+        decision = self._decision("squad", "ship")
+        self.assertEqual(decision["classification"], team_recovery.WRITE_UNVERIFIED)
+        self.assertEqual(decision["decision"], team_recovery.HOLD)
+        self.assertFalse(decision["auto_resume"])
+        self.assertEqual(team._required("squad", self.env)
+                         ["slots"]["ship"]["status"], "unknown")
+
+    def test_recovery_malformed_receipt_is_refused(self):
+        driver, db, ident, _ = self._recovery_setup()
+        self._recovery_tick(driver, db, head=B)
+        path = Path(team.team_path("squad", self.env))
+        record = json.loads(path.read_text())
+        record["recovery"] = {"schema": "cao.team.recovery.v0", "decisions": {},
+                              "resumed": {}}
+        path.write_text(json.dumps(record))
+        # A receipt of the wrong schema is refused, never reinterpreted.
+        with self.assertRaises(team.TeamError):
+            team.status("squad", env=self.env)
+        with self.assertRaises(team.TeamError):
+            self._recovery_tick(driver, db, head=B)
+
+    def test_recovery_no_egress_modules_are_used(self):
+        driver, db, ident, _ = self._recovery_setup()
+        import socket
+        with mock.patch.object(socket, "socket",
+                               side_effect=AssertionError("egress")) as net, \
+                mock.patch.object(socket, "create_connection",
+                                  side_effect=AssertionError("egress")):
+            self._recovery_tick(driver, db)
+        net.assert_not_called()
 
 
 if __name__ == "__main__":

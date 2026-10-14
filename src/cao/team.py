@@ -20,7 +20,8 @@ from datetime import datetime
 from typing import Any
 
 from . import (agent_profiles, evidence, product_config, product_driver,
-               product_state, product_task, registry, state, team_approval)
+               product_state, product_task, registry, state, team_approval,
+               team_recovery)
 
 SPEC_SCHEMA = "cao.team.v1"
 STATE_SCHEMA = "cao.team.state.v1"
@@ -220,6 +221,7 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
     expected_fields = {"phase", "round", "status", "execution_id",
                        "prompt", "head", "feedback", "output", "error"}
     liveness_fields = {"started_at", "progress_at", "progress_key"}
+    pin_fields = {"pinned_head", "pinned_branch"}
     for task in spec["tasks"]:
         slot = slots[task["id"]]
         if type(slot) is not dict:
@@ -228,7 +230,7 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
         round_no = slot.get("round")
         retry_no = slot.get("retry_no", 0)
         if (not expected_fields.issubset(slot)
-                or set(slot) - expected_fields - liveness_fields - {"retry_no"}
+                or set(slot) - expected_fields - liveness_fields - pin_fields - {"retry_no"}
                 or type(retry_no) is not int or not 0 <= retry_no <= 1
                 # Only a READ execution may be retried. A review is always run
                 # as a READ execution, so a review-phase retry is bounded by
@@ -246,6 +248,14 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
         head = slot.get("head")
         if head is not None and (type(head) is not str or not _HEAD.fullmatch(head)):
             raise TeamError("malformed team task revision")
+        pinned_head = slot.get("pinned_head")
+        if (pinned_head is not None
+                and (type(pinned_head) is not str or not _HEAD.fullmatch(pinned_head))):
+            raise TeamError("malformed team task revision pin")
+        pinned_branch = slot.get("pinned_branch")
+        if (pinned_branch is not None
+                and (type(pinned_branch) is not str or not 0 < len(pinned_branch) <= 200)):
+            raise TeamError("malformed team task branch pin")
         if phase in ("review", "correction") and head is None:
             raise TeamError("review/correction lacks accepted source revision")
         if current == "complete" and (
@@ -276,7 +286,22 @@ def _read(team_id: str, env: Mapping[str, str] | None = None) -> dict[str, Any] 
                 raise TeamError("started task lacks its original bounded prompt")
         elif current in ("running", "complete"):
             raise TeamError("active/completed task has no execution identity")
+    _validate_recovery(record.get("recovery"))
     return record
+
+
+def _validate_recovery(value: Any) -> None:
+    """Validate the bounded per-team recovery receipt, or refuse it."""
+
+    if value is None:
+        return
+    if (type(value) is not dict
+            or value.get("schema") != team_recovery.SCHEMA
+            or type(value.get("decisions")) is not dict
+            or type(value.get("resumed")) is not dict
+            or len(value["decisions"]) > team_recovery.MAX_DECISIONS
+            or len(value["resumed"]) > team_recovery.MAX_DECISIONS * 8):
+        raise TeamError("malformed team recovery receipt")
 
 
 def _save(record: dict[str, Any], env: Mapping[str, str] | None) -> None:
@@ -307,6 +332,18 @@ def summary(record: Mapping[str, Any]) -> dict[str, Any]:
         result["approval"] = {"method": proof.get("method"),
                               "spec_sha256": proof.get("spec_sha256"),
                               "routes_sha256": proof.get("routes_sha256")}
+    recovery = record.get("recovery")
+    if isinstance(recovery, Mapping) and recovery.get("decisions"):
+        result["recovery"] = {
+            name: {"classification": decision.get("classification"),
+                   "decision": decision.get("decision"),
+                   "reason": decision.get("reason"),
+                   "next_action": decision.get("next_action"),
+                   "fingerprint": decision.get("fingerprint"),
+                   "at": decision.get("at")}
+            for name, decision in recovery["decisions"].items()
+            if isinstance(decision, Mapping)
+        }
     return result
 
 
@@ -593,7 +630,8 @@ def initialize(spec: Any, *, env: Mapping[str, str] | None = None,
                                 "execution_id": None, "prompt": None, "head": None,
                                 "feedback": None, "output": None, "error": None,
                                 "started_at": None, "progress_at": None,
-                                "progress_key": None}
+                                "progress_key": None, "pinned_head": None,
+                                "pinned_branch": None}
                       for t in selected["tasks"]},
         }
         if admission is not None:
@@ -639,14 +677,24 @@ def resume(team_id: str, task_id: str, *,
     """
     with dispatch_lock(env):
         record = _required(team_id, env)
-        slot = record["slots"].get(_ident(task_id))
-        if (slot is None or slot["status"] != "unknown"
-                or not slot.get("execution_id") or not slot.get("prompt")):
-            raise TeamError("only a checkpointed UNKNOWN task can be resumed")
-        slot["status"] = "running"
-        slot["error"] = None
+        _resume_unknown_slot(record, _ident(task_id))
         _save(record, env)
         return summary(record)
+
+
+def _resume_unknown_slot(record: dict[str, Any], task_id: str) -> None:
+    """Flip only the original UNKNOWN execution identity back to RUNNING.
+
+    The execution id, original prompt and any claim are all preserved; this
+    never derives a new identity, so the next reconciliation resumes the same
+    durable task instead of dispatching a replacement worker.
+    """
+    slot = record["slots"].get(task_id)
+    if (slot is None or slot["status"] != "unknown"
+            or not slot.get("execution_id") or not slot.get("prompt")):
+        raise TeamError("only a checkpointed UNKNOWN task can be resumed")
+    slot["status"] = "running"
+    slot["error"] = None
 
 
 def retry_read(team_id: str, task_id: str, *,
@@ -730,6 +778,10 @@ def retry_read(team_id: str, task_id: str, *,
         else:
             slot.update(status="pending", execution_id=None, prompt=None, head=None,
                         feedback=None, output=None, error=None, retry_no=1)
+        # The retry is a NEW execution identity: it must pin the checkout anew
+        # instead of inheriting the failed attempt's revision pin.
+        slot["pinned_head"] = None
+        slot["pinned_branch"] = None
         _save(record, env)
         return summary(record)
 
@@ -768,6 +820,21 @@ def _git_head(repo: str) -> str | None:
         return None
     value = result.stdout.strip()
     return value if result.returncode == 0 and _HEAD.fullmatch(value) else None
+
+
+def _git_branch(repo: str) -> str | None:
+    """The checkout's current branch name, or ``None`` when unverifiable."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    if result.returncode != 0 or not 0 < len(value) <= 200 or "\n" in value:
+        return None
+    return value
 
 
 def _active_writes(db: str) -> tuple[int, set[str]]:
@@ -1255,6 +1322,232 @@ def _stall_reason(backing: Any, slot: Mapping[str, Any], *,
     return "TEAM_TASK_STALLED"
 
 
+def _recovery_claim_row(db: str, claim_id: int) -> dict[str, Any] | None:
+    """The normalized shared-Registry row for one durable claim id."""
+
+    try:
+        conn = registry.connect_readonly(db)
+        try:
+            row = conn.execute(
+                "SELECT claim_id, run_id, work_key, owner, mode, released_at, outcome "
+                "FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, registry.RegistryError) as exc:
+        raise TeamError("shared Registry claim evidence unavailable") from exc
+    if row is None:
+        return None
+    return {
+        "claim_id": row["claim_id"],
+        "run_id": row["run_id"],
+        "work_key": row["work_key"],
+        "owner": row["owner"],
+        "mode": row["mode"],
+        "released": row["released_at"] is not None,
+        "released_at": row["released_at"],
+        "outcome": row["outcome"],
+    }
+
+
+def _recovery_evidence(team_id: str, task: Mapping[str, Any],
+                       slot: Mapping[str, Any], *, driver: Any, db: str,
+                       head_reader: Callable[[str], str | None] | None,
+                       branch_reader: Callable[[str], str | None] | None,
+                       occupancy: Callable[[str], tuple[int, set[str]]] | None,
+                       env: Mapping[str, str] | None,
+                       clock: Callable[[], Any] | None,
+                       prior_resumes: int) -> dict[str, Any]:
+    """Read one bounded, read-only evidence snapshot for a single team slot.
+
+    Only durable task state, the read-only shared Registry and an optional
+    runtime observation are read here. Nothing is started, prompted, claimed,
+    released or written; the caller decides from the returned snapshot.
+    """
+
+    execution_id = slot.get("execution_id")
+    prompt = slot.get("prompt")
+    now = evidence.utc_now(clock)
+    if isinstance(execution_id, str) and execution_id:
+        record = product_state.read_task(execution_id, env)
+    else:
+        record = None
+    checkpoint = (record or {}).get("checkpoint") or {}
+    durable_claim = (record or {}).get("claim")
+    if not isinstance(durable_claim, Mapping):
+        durable_claim = None
+    mode = "READ" if slot["phase"] == "review" else str(task["mode"]).upper()
+    snapshot: dict[str, Any] = {
+        "task_id": task["id"],
+        "mode": mode,
+        "phase": slot["phase"],
+        "status": slot["status"],
+        "error": slot.get("error"),
+        "execution_id": execution_id if isinstance(execution_id, str) else None,
+        "prompt_present": isinstance(prompt, str) and bool(prompt),
+        "head": slot.get("head"),
+        "pinned_head": slot.get("pinned_head"),
+        "pinned_branch": slot.get("pinned_branch"),
+        "observed_head": None,
+        "observed_branch": None,
+        "durable_claim": dict(durable_claim) if durable_claim else None,
+        "registry_claim": None,
+        "registry_unreadable": False,
+        "checkout_conflict": False,
+        "worker_present": False,
+        "runtime_available": False,
+        "agent_checkpoint": False,
+        "receipt": "UNKNOWN",
+        "claim_id": None,
+        "prior_resumes": prior_resumes,
+        "expected_owner": product_task.OWNER,
+        "expected_run_id": "cao-team-" + team_id,
+        "expected_work_key": execution_id if isinstance(execution_id, str) else None,
+        "now": now,
+    }
+    agent = checkpoint.get("agent_name")
+    pane = checkpoint.get("pane_id")
+    snapshot["agent_checkpoint"] = bool(
+        isinstance(agent, str) and agent
+        and isinstance(pane, str) and pane
+        and checkpoint.get("agent_started") is True
+        and checkpoint.get("prompt_ack") == "accepted")
+    if (isinstance(durable_claim, Mapping)
+            and isinstance(durable_claim.get("claim_id"), int)
+            and not isinstance(durable_claim.get("claim_id"), bool)):
+        snapshot["claim_id"] = durable_claim["claim_id"]
+
+    # Qualified runtime availability: the exact original agent is resolvable.
+    if driver is not None and isinstance(agent, str) and agent:
+        try:
+            driver.agent_get(agent)
+        except product_driver.DriverNotFound:
+            snapshot["runtime_available"] = True
+        except product_driver.DriverError:
+            snapshot["runtime_available"] = False
+        else:
+            snapshot["runtime_available"] = True
+            snapshot["worker_present"] = True
+
+    # A read execution is only ever resumed against an unchanged pinned
+    # revision. Without a pin the checkout cannot be proven unchanged, so the
+    # snapshot honestly reports it as unverifiable and the decision holds.
+    if slot.get("pinned_head") is not None or slot.get("pinned_branch") is not None:
+        snapshot["observed_head"] = head_reader(task["repo"]) if head_reader else None
+        snapshot["observed_branch"] = (
+            branch_reader(task["repo"]) if branch_reader else None)
+
+    # The durable claim's live row and any conflicting writer, read only when a
+    # durable claim actually exists.
+    if snapshot["claim_id"] is not None:
+        try:
+            snapshot["registry_claim"] = _recovery_claim_row(db, snapshot["claim_id"])
+        except TeamError:
+            snapshot["registry_unreadable"] = True
+        if occupancy is not None:
+            try:
+                _, working = occupancy(db)
+            except TeamError:
+                snapshot["registry_unreadable"] = True
+            else:
+                snapshot["checkout_conflict"] = (
+                    os.path.realpath(task["repo"]) in working)
+
+    if isinstance(execution_id, str) and isinstance(prompt, str) and prompt:
+        output = (record or {}).get("output")
+        if _receipt_present(output, _receipt_for(execution_id, prompt)):
+            snapshot["receipt"] = "VERIFIED"
+        elif isinstance(output, str) and output:
+            snapshot["receipt"] = "MISSING"
+    return snapshot
+
+
+def _recovery_state(record: dict[str, Any]) -> dict[str, Any]:
+    value = record.get("recovery")
+    if not isinstance(value, dict):
+        value = {"schema": team_recovery.SCHEMA, "decisions": {}, "resumed": {}}
+        record["recovery"] = value
+    return value
+
+
+def _apply_recovery(team_id: str, record: dict[str, Any], *,
+                    driver: Any, db: str,
+                    head_reader: Callable[[str], str | None] | None,
+                    branch_reader: Callable[[str], str | None] | None,
+                    occupancy: Callable[[str], tuple[int, set[str]]] | None,
+                    env: Mapping[str, str] | None,
+                    clock: Callable[[], Any] | None) -> list[dict[str, Any]]:
+    """Classify every UNKNOWN slot and apply only a proven READ resume.
+
+    The decision receipt is written back into the existing team checkpoint,
+    idempotently: unchanged evidence keeps its original fingerprint and stamp
+    instead of rewriting the record. At most one bounded resume is admitted per
+    original execution identity; a WRITE or any uncertain slot only holds.
+    """
+
+    spec, slots = record["spec"], record["slots"]
+    state = _recovery_state(record)
+    decisions = state["decisions"]
+    resumed = state["resumed"]
+    report: list[dict[str, Any]] = []
+    for task in spec["tasks"]:
+        slot = slots[task["id"]]
+        if slot["status"] != "unknown":
+            continue
+        execution_id = slot.get("execution_id")
+        prior = 0
+        if isinstance(execution_id, str):
+            prior = resumed.get(execution_id)
+            prior = prior if isinstance(prior, int) and not isinstance(prior, bool) else 0
+        try:
+            snapshot = _recovery_evidence(
+                team_id, task, slot, driver=driver, db=db, head_reader=head_reader,
+                branch_reader=branch_reader, occupancy=occupancy, env=env,
+                clock=clock, prior_resumes=prior)
+            decision = team_recovery.classify(snapshot)
+        except (TeamError, state.StateError, OSError, ValueError, TypeError) as exc:
+            decision = {
+                "schema": team_recovery.SCHEMA, "task_id": task["id"],
+                "classification": team_recovery.REGISTRY_CONFLICT,
+                "decision": team_recovery.HOLD, "auto_resume": False,
+                "reason": _error_code(getattr(exc, "code", None), type(exc).__name__),
+                "next_action": "operator_inspection", "execution_id": execution_id,
+                "provenance": {"task_id": task["id"], "timestamp": evidence.utc_now(clock)},
+            }
+        digest = team_recovery.fingerprint(decision)
+        existing = decisions.get(task["id"])
+        if (isinstance(existing, Mapping)
+                and existing.get("fingerprint") == digest
+                and isinstance(existing.get("at"), str)):
+            stored = existing
+        else:
+            stored = dict(decision)
+            stored["fingerprint"] = digest
+            stored["at"] = evidence.utc_now(clock)
+            decisions[task["id"]] = stored
+        report.append({
+            "task_id": task["id"],
+            "classification": stored.get("classification"),
+            "decision": stored.get("decision"),
+            "auto_resume": bool(stored.get("auto_resume")),
+            "reason": stored.get("reason"),
+            "next_action": stored.get("next_action"),
+            "execution_id": stored.get("execution_id"),
+        })
+        if (stored.get("auto_resume")
+                and stored.get("decision") == team_recovery.RESUME_READ):
+            _resume_unknown_slot(record, task["id"])
+            slot["progress_at"] = evidence.utc_now(clock)
+            if isinstance(execution_id, str):
+                resumed[execution_id] = prior + 1
+    record["recovery"] = {
+        "schema": team_recovery.SCHEMA,
+        "decisions": decisions,
+        "resumed": resumed,
+    }
+    _save(record, env)
+    return report
+
+
 def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
              phase: str, config: product_config.ProductConfig, driver: Any,
              env: Mapping[str, str] | None, wait_ms: int, registry_db: str) -> dict[str, Any]:
@@ -1349,10 +1642,12 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
          execute: Callable[..., Mapping[str, Any]] | None = None,
          writer_snapshot: Callable[[str], tuple[int, set[str]]] | None = None,
          head_reader: Callable[[str], str | None] | None = None,
+         branch_reader: Callable[[str], str | None] | None = None,
          clock: Callable[[], Any] | None = None) -> dict[str, Any]:
     """Advance ready agents at most once per durable execution identity."""
     db = registry_db or product_config.registry_db_path(env)
     runner, occupancy, head = execute or _execute, writer_snapshot or _active_writes, head_reader or _git_head
+    branch = branch_reader or _git_branch
     with dispatch_lock(env):
         record = _required(team_id, env)
         if record["desired"] != "running":
@@ -1363,6 +1658,14 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
         freeze_legacy_pending = chat_mode and admission is None
         record["tick_count"] += 1
         changes = 0
+        # R3: classify every UNKNOWN slot and apply ONLY a proven READ resume.
+        # This reuses the existing team resume + product_task reconciliation
+        # under this same dispatch lock, so no second scheduler or ledger is
+        # introduced. A refused or uncertain slot only records a decision.
+        recovery_report = _apply_recovery(
+            team_id, record, driver=driver, db=db,
+            head_reader=head, branch_reader=branch, occupancy=occupancy,
+            env=env, clock=clock)
         # Reconcile ALL existing executions before starting any new ones.
         # Once one sibling is UNKNOWN/BLOCKED, drain the remaining workers
         # without launching more independent work.
@@ -1490,6 +1793,15 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     slot["started_at"] = stamp
                     slot["progress_at"] = stamp
                     slot["progress_key"] = None
+                    # Pin the exact checkout revision for a READ execution. It
+                    # is the only anchor a later bounded automatic resume can
+                    # prove the checkout against; a WRITE never auto-resumes.
+                    if slot["phase"] == "review" or task["mode"] == "read":
+                        slot["pinned_head"] = head(task["repo"])
+                        slot["pinned_branch"] = branch(task["repo"])
+                    else:
+                        slot["pinned_head"] = None
+                        slot["pinned_branch"] = None
                     _save(record, env)  # effect intent persisted before worker start
                 elif execute is None:
                     # An intent-only RUNNING slot is not an agent. After a
@@ -1666,7 +1978,7 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                                              type(exc).__name__)
                 halted = True
                 _save(record, env)
-        return dict(summary(record), advanced=changes)
+        return dict(summary(record), advanced=changes, recovery=recovery_report)
 
 
 def tick_all(*, config: product_config.ProductConfig, driver: Any,
@@ -1680,8 +1992,13 @@ def tick_all(*, config: product_config.ProductConfig, driver: Any,
             output.append(info)
             continue
         active = any(s["status"] == "running" for s in info["tasks"].values())
+        # A running team that holds an UNKNOWN slot is still ticked so R3 can
+        # classify it; a fully BLOCKED team without any UNKNOWN slot cannot
+        # progress and is left untouched.
+        recoverable = any(s["status"] == "unknown" for s in info["tasks"].values())
         if info["desired"] != "running" or (
-                not active and info["status"] in ("COMPLETE", "BLOCKED")):
+                not active and not recoverable
+                and info["status"] in ("COMPLETE", "BLOCKED")):
             continue
         try:
             output.append(tick(info["team_id"], config=config, driver=driver,
