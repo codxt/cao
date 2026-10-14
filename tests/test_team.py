@@ -341,6 +341,259 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(drifted["tasks"]["a"]["status"], "blocked")
         self.assertEqual(drifted["tasks"]["a"]["error"], "REVIEW_HEAD_DRIFT")
 
+    # --- retained durable observation windows ------------------------------
+    #
+    # A runtime pane is a scrolling window, so an earlier longer read can omit
+    # the receipt that a shorter later read carries. product_task retains every
+    # bounded observation with its prompt/terminal provenance; Team Execution
+    # must accept the receipt from any admissible window while still refusing a
+    # pre-prompt, unsized, echoed or cross-task text.
+
+    def observation(self, output, *, kept="all", limit=None, captured=None,
+                    dropped=0, prompt_ack="accepted", stage="prompted",
+                    terminal=True, observed_at="2026-01-01T00:00:00Z"):
+        """One observation entry exactly as product_task records it."""
+        captured = len(output) if captured is None else captured
+        return {
+            "output": output,
+            "bounds": {"kept": kept,
+                       "limit": len(output) if limit is None else limit,
+                       "captured_chars": captured,
+                       "dropped_chars": dropped},
+            "observed_at": observed_at,
+            "prompt_ack": prompt_ack,
+            "stage": stage,
+            "terminal": terminal,
+        }
+
+    def durable_payload(self, *, output, observations=(), truncated=False,
+                        bounds=None, released_head=A):
+        return {
+            "status": "complete",
+            "claim": {"released": True, "released_head": released_head},
+            "output": output,
+            "output_truncated": truncated,
+            "output_bounds": bounds,
+            "output_observations": list(observations),
+        }
+
+    def read_prompt(self, execution_id):
+        challenge = team._result_challenge(execution_id)
+        return ("Analyze source\nCAO_TEAM_NONCE_V2: " + challenge,
+                "CAO_TEAM_RESULT: " + challenge)
+
+    def execute_read(self, payload, execution_id, prompt):
+        record = {"checkpoint": {"agent_name": "reader",
+                                 "workspace_id": "w9", "pane_id": "w9:p1"}}
+        with mock.patch("cao.product_task.run_task", return_value=payload), \
+                mock.patch("cao.product_state.read_task", return_value=record), \
+                mock.patch("cao.product_task._close_owned_pane",
+                           return_value=("w9:p1", None)), \
+                mock.patch("cao.product_state.update_task"):
+            return team._execute(
+                execution_id=execution_id,
+                task={"repo": self.paths[0], "mode": "read", "write_scope": []},
+                prompt=prompt, phase="work", config=self.config,
+                driver=FakeDriver(), env=self.env, wait_ms=1000,
+                registry_db="unused")
+
+    def test_durable_receipt_in_a_shorter_later_window_is_accepted(self):
+        """Falsification 1: longer earlier receipt-free, shorter later valid."""
+        ident = "ct-squad-reader-work-0"
+        prompt, receipt = self.read_prompt(ident)
+        long_read = "".join(f"scrollback line {i:04d}\n" for i in range(200))
+        short_read = "final answer\n" + receipt + "\n"
+        payload = self.durable_payload(
+            output=long_read[-400:], truncated=True,
+            bounds={"kept": "tail", "limit": 400, "captured_chars": 400,
+                    "dropped_chars": 9000},
+            observations=[
+                self.observation(long_read[-400:], kept="tail", limit=400,
+                                 captured=400, dropped=9000),
+                self.observation(short_read),
+            ])
+        result = self.execute_read(payload, ident, prompt)
+        self.assertEqual(result["status"], "complete")
+        # The verified capture, not merely the longest one, is what is used.
+        self.assertEqual(result["output"], short_read)
+
+    def test_earlier_valid_receipt_is_not_lost_to_a_later_short_invalid(self):
+        """Falsification 2: earlier valid then later short invalid."""
+        ident = "ct-squad-reader-work-0"
+        prompt, receipt = self.read_prompt(ident)
+        valid = "done\n" + receipt + "\n"
+        invalid = "still working, no proof yet\n"
+        payload = self.durable_payload(
+            output=invalid,
+            observations=[self.observation(valid), self.observation(invalid)])
+        result = self.execute_read(payload, ident, prompt)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["output"], valid)
+
+    def test_wrong_nonce_is_never_a_durable_receipt(self):
+        """Falsification 3: a changed nonce is refused in every window."""
+        ident = "ct-squad-reader-work-0"
+        prompt, _ = self.read_prompt(ident)
+        forged = "done\nCAO_TEAM_RESULT: " + ("f" * 16) + "\n"
+        payload = self.durable_payload(
+            output="receipt-free scrollback",
+            observations=[self.observation(forged)])
+        result = self.execute_read(payload, ident, prompt)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"],
+                         "TEAM_DURABLE_RESULT_UNVERIFIED")
+
+    def test_prompt_echo_is_not_a_receipt(self):
+        """Falsification 4: the prompt's own nonce line is not a result."""
+        ident = "ct-squad-reader-work-0"
+        prompt, _ = self.read_prompt(ident)
+        echo = "echoed prompt\n" + prompt + "\n"
+        payload = self.durable_payload(
+            output="receipt-free scrollback",
+            observations=[self.observation(echo)])
+        result = self.execute_read(payload, ident, prompt)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"],
+                         "TEAM_DURABLE_RESULT_UNVERIFIED")
+
+    def test_provenance_unknown_window_is_never_terminal_proof(self):
+        """Falsification 5: truncated output whose provenance is unknown."""
+        ident = "ct-squad-reader-work-0"
+        prompt, receipt = self.read_prompt(ident)
+        text = "".join(f"line {i:04d}\n" for i in range(120)) + receipt + "\n"
+        for label, broken in (
+            ("no prompt provenance",
+             self.observation(text, prompt_ack=None)),
+            ("not a terminal state",
+             self.observation(text, terminal=False)),
+            ("no recorded bounds",
+             {"output": text, "observed_at": "2026-01-01T00:00:00Z"}),
+            ("claimed size lies",
+             self.observation(text, captured=1, dropped=5)),
+        ):
+            with self.subTest(label=label):
+                payload = self.durable_payload(
+                    output="receipt-free scrollback",
+                    observations=[broken])
+                result = self.execute_read(payload, ident, prompt)
+                self.assertEqual(result["status"], "unknown")
+                self.assertEqual(result["error"]["code"],
+                                 "TEAM_DURABLE_RESULT_UNVERIFIED")
+
+    def test_another_tasks_receipt_never_verifies_this_task(self):
+        """Falsification 6a: a sibling execution's receipt is not ours."""
+        ident = "ct-squad-reader-work-0"
+        prompt, _ = self.read_prompt(ident)
+        foreign = ("done\nCAO_TEAM_RESULT: "
+                   + team._result_challenge("ct-squad-reader-work-0-sibling")
+                   + "\n")
+        payload = self.durable_payload(
+            output="receipt-free scrollback",
+            observations=[self.observation(foreign)])
+        result = self.execute_read(payload, ident, prompt)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"],
+                         "TEAM_DURABLE_RESULT_UNVERIFIED")
+
+    def test_repeat_evaluation_reuses_the_exact_execution_identity(self):
+        """Falsification 6b/7: evaluation is read-only and idempotent."""
+        ident = "ct-squad-reader-work-0"
+        prompt, receipt = self.read_prompt(ident)
+        payload = self.durable_payload(
+            output=("x" * 400), truncated=True,
+            bounds={"kept": "tail", "limit": 400, "captured_chars": 400,
+                    "dropped_chars": 9000},
+            observations=[self.observation("done\n" + receipt + "\n")])
+        record = {"checkpoint": {"agent_name": "reader",
+                                 "workspace_id": "w9", "pane_id": "w9:p1"}}
+        with mock.patch("cao.product_task.run_task",
+                        return_value=payload) as runner, \
+                mock.patch("cao.product_state.read_task", return_value=record), \
+                mock.patch("cao.product_task._close_owned_pane",
+                           return_value=("w9:p1", None)), \
+                mock.patch("cao.product_state.update_task"):
+            for _ in range(3):
+                result = team._execute(
+                    execution_id=ident,
+                    task={"repo": self.paths[0], "mode": "read",
+                          "write_scope": []},
+                    prompt=prompt, phase="work", config=self.config,
+                    driver=FakeDriver(), env=self.env, wait_ms=1000,
+                    registry_db="unused")
+                self.assertEqual(result["status"], "complete")
+            # One run per evaluation, always the same task identity: no
+            # re-prompt and never a replacement claim.
+            self.assertEqual(runner.call_count, 3)
+            self.assertEqual(runner.call_args.kwargs["task_id"], ident)
+
+    def test_review_accepts_a_receipt_from_a_retained_shorter_window(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        receipt = "CAO_TEAM_RESULT: " + challenge
+        long_read = "".join(f"inspected line {i:04d}\n" for i in range(200))
+        short_read = ("findings\nCAO_REVIEW_VERDICT: APPROVED\n"
+                      "CAO_REVIEWED_HEAD: " + A + "\n" + receipt + "\n")
+
+        def fake(**kwargs):
+            if kwargs["phase"] != "review":
+                return self.done()
+            return self.durable_payload(
+                output=long_read[-400:], truncated=True,
+                bounds={"kept": "tail", "limit": 400, "captured_chars": 400,
+                        "dropped_chars": 9000},
+                observations=[
+                    self.observation(long_read[-400:], kept="tail", limit=400,
+                                     captured=400, dropped=9000),
+                    self.observation(short_read),
+                ])
+
+        self.tick(fake)
+        result = self.tick(fake, heads={self.paths[0]: A})
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(result["tasks"]["a"]["status"], "complete")
+
+    def test_retained_window_receipt_still_blocks_on_head_drift(self):
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        receipt = "CAO_TEAM_RESULT: " + challenge
+        short_read = ("findings\nCAO_REVIEW_VERDICT: APPROVED\n"
+                      "CAO_REVIEWED_HEAD: " + A + "\n" + receipt + "\n")
+
+        def fake(**kwargs):
+            if kwargs["phase"] != "review":
+                return self.done()
+            return self.durable_payload(
+                output="receipt-free scrollback",
+                observations=[self.observation(short_read)])
+
+        self.tick(fake)
+        drifted = self.tick(fake, heads={self.paths[0]: B})
+        self.assertEqual(drifted["tasks"]["a"]["status"], "blocked")
+        self.assertEqual(drifted["tasks"]["a"]["error"], "REVIEW_HEAD_DRIFT")
+
+    def test_completed_retained_receipt_issues_no_further_dispatch(self):
+        self.init(self.spec([task("a", self.paths[0], mode="read")]))
+        ident = team._execution_id("squad", "a", "work", 0)
+        receipt = "CAO_TEAM_RESULT: " + team._result_challenge(ident)
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["execution_id"])
+            return self.durable_payload(
+                output=("scrollback " * 60)[-400:], truncated=True,
+                bounds={"kept": "tail", "limit": 400, "captured_chars": 400,
+                        "dropped_chars": 9000},
+                observations=[self.observation("done\n" + receipt + "\n")])
+
+        self.tick(fake)
+        self.assertEqual(team.status("squad", env=self.env)["status"],
+                         "COMPLETE")
+        dispatched = len(calls)
+        self.tick(fake)
+        self.assertEqual(len(calls), dispatched)
+
     def test_bounded_review_requests_correction_from_the_kept_suffix(self):
         self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
                                   corrections=1)]))

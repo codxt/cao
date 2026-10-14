@@ -534,6 +534,28 @@ class WriteCompletionScopeTests(TaskCase):
         self.assertEqual(self.driver.names().count("agent_prompt"), 1)
         self.assertEqual(self.driver.names().count("agent_start"), 1)
 
+    def test_repeated_runs_never_duplicate_a_write_claim_or_prompt(self):
+        """Falsification 7: retained observations never re-claim or re-prompt."""
+        first = self.begin()
+        resumed = product_task.run_task(**self.kwargs, wait_ms=0)
+        self.assertEqual(resumed["status"], "running")
+        self.assertEqual(resumed["claim"]["claim_id"],
+                         first["claim"]["claim_id"])
+        self.assertEqual(self.driver.names().count("agent_start"), 1)
+        self.assertEqual(self.driver.names().count("agent_prompt"), 1)
+        record = product_state.read_task("scope-case", self.env)
+        self.assertTrue(record["output_observations"])
+        self.assertTrue(all(entry["post_prompt"]
+                            for entry in record["output_observations"]))
+        conn = registry.connect(db=self.db)
+        try:
+            rows = conn.execute(
+                "SELECT claim_id FROM claims WHERE work_key='scope-case'"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 1)
+
     def test_out_of_scope_commit_cannot_complete_and_retains_claim(self):
         self.begin()
         (self.write_repo / "unscoped.txt").write_text("escaped\n")
@@ -1114,6 +1136,130 @@ class BoundedOutputTests(TaskCase):
         self.assertEqual(logs["output"], "agent output")
         self.assertFalse(logs["truncated"])
         self.assertEqual(logs["output_bounds"]["dropped_chars"], 0)
+
+
+class ObservationRetentionTests(TaskCase):
+    """A task retains both directions of a scrolling pane, with provenance.
+
+    Generic capture deliberately cannot know the task's completion nonce, so it
+    never guesses which of two windows proves completion. An earlier longer read
+    that missed the receipt and a later shorter read that carries it must both
+    survive, and the converse must not lose a receipt already proved.
+    """
+
+    LIMIT = 120
+    RECEIPT = "CAO_TEAM_RESULT: 0123456789abcdef"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.defaults = product_config.task_defaults(product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "task": {"max_output_chars": self.LIMIT},
+        }))
+
+    def record(self, **checkpoint) -> dict:
+        base = {"agent_name": "cao-agent", "prompt_issued": True,
+                "prompt_ack": "accepted", "stage": "prompted"}
+        base.update(checkpoint)
+        return {
+            "schema": product_state.TASK_SCHEMA, "task_id": "obs-task",
+            "output": None, "output_truncated": False, "output_bounds": None,
+            "output_observations": [], "checkpoint": base,
+        }
+
+    def observe(self, record, text, *, terminal=False):
+        driver = FakeDriver()
+        driver.read_text = text
+        product_task._observe(driver, record, self.env, None, self.defaults,
+                              terminal=terminal)
+        return record
+
+    @staticmethod
+    def scrollback(lines=40, tail=""):
+        return "".join(
+            f"line {index:04d} of the analysis\n" for index in range(lines)
+        ) + tail
+
+    def test_later_shorter_receipt_is_retained_alongside_the_longer_window(self):
+        long_read = self.scrollback(lines=40)
+        short_read = "analysis complete\n" + self.RECEIPT + "\n"
+        record = self.record()
+        self.observe(record, long_read)
+        self.observe(record, short_read, terminal=True)
+        # The longer receipt-free read stays the primary capture ...
+        self.assertNotIn(self.RECEIPT, record["output"])
+        self.assertEqual(len(record["output"]), self.LIMIT)
+        # ... but the shorter read that carries the receipt is not discarded.
+        texts = [entry["output"] for entry in record["output_observations"]]
+        self.assertIn(record["output"], texts)
+        self.assertIn(short_read, texts)
+        short = next(entry for entry in record["output_observations"]
+                     if entry["output"] == short_read)
+        self.assertTrue(short["post_prompt"])
+        self.assertEqual(short["prompt_ack"], "accepted")
+        self.assertEqual(short["stage"], "prompted")
+        self.assertTrue(short["terminal"])
+        self.assertEqual(short["bounds"]["kept"], "all")
+        self.assertEqual(short["bounds"]["dropped_chars"], 0)
+        self.assertIsInstance(short["observed_at"], str)
+
+    def test_earlier_receipt_is_not_lost_when_a_longer_read_arrives(self):
+        short_read = "done\n" + self.RECEIPT + "\n"
+        long_read = self.scrollback(lines=40)
+        record = self.record()
+        self.observe(record, short_read, terminal=True)
+        self.observe(record, long_read)
+        # The longer later read becomes primary, but the proved receipt stays.
+        self.assertNotIn(self.RECEIPT, record["output"])
+        texts = [entry["output"] for entry in record["output_observations"]]
+        self.assertIn(short_read, texts)
+
+    def test_observations_are_bounded_and_the_longest_survives(self):
+        record = self.record()
+        self.observe(record, "L" * 400)
+        longest = record["output"]
+        self.assertEqual(len(longest), self.LIMIT)
+        for index in range(10):
+            self.observe(record, "short read " + str(index))
+        windows = record["output_observations"]
+        self.assertLessEqual(len(windows), product_task._MAX_OBSERVATIONS)
+        for entry in windows:
+            self.assertLessEqual(len(entry["output"]), self.LIMIT)
+            self.assertIsInstance(entry["observed_at"], str)
+        self.assertIn(longest, [entry["output"] for entry in windows])
+
+    def test_receipt_retention_does_not_duplicate_a_prompt_or_claim(self):
+        first = FakeDriver()
+        first.read_text = self.scrollback(lines=40)
+        product_task.run_task(
+            driver=first, repo=str(self.repo), prompt="Review this repository",
+            config=product_config.validate_config({
+                "schema": product_config.SCHEMA,
+                "provider": {"cli": "opencode", "model": "m"},
+                "task": {"max_output_chars": self.LIMIT},
+            }), env=self.env, registry_db=self.db, wait_ms=0)
+        second = FakeDriver()
+        second.read_text = "analysis complete\n" + self.RECEIPT + "\n"
+        product_task.run_task(
+            driver=second, repo=str(self.repo), prompt="Review this repository",
+            config=product_config.validate_config({
+                "schema": product_config.SCHEMA,
+                "provider": {"cli": "opencode", "model": "m"},
+                "task": {"max_output_chars": self.LIMIT},
+            }), env=self.env, registry_db=self.db, wait_ms=0)
+        # The exact task resumes: one start, one prompt, one claim, and the
+        # second observation never re-issues the prompt.
+        self.assertEqual(first.names().count("agent_start"), 1)
+        self.assertEqual(first.names().count("agent_prompt"), 1)
+        self.assertEqual(second.names().count("agent_start"), 0)
+        self.assertEqual(second.names().count("agent_prompt"), 0)
+        conn = registry.connect(db=self.db)
+        try:
+            claims = conn.execute("SELECT claim_id FROM claims").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(claims), 1)
 
 
 class ClaimAcquisitionCrashTests(TaskCase):

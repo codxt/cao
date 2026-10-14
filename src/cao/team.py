@@ -791,6 +791,71 @@ def _bounded_tail_verified(output: Any, bounds: Any, receipt: str) -> bool:
     return _receipt_present(output, receipt)
 
 
+def _observation_admissible(entry: Any) -> bool:
+    """Whether one durable observation proves a post-prompt terminal capture.
+
+    A product task retains every bounded window of a scrolling pane with the
+    prompt and terminal provenance current when it was read. Only a window this
+    task's prompt was already accepted for, captured while the runtime reported
+    a terminal state, is admissible; a pre-prompt, unsized or provenance-unknown
+    window can never be read as terminal proof, so an arbitrary document that
+    merely happens to contain a matching line is refused.
+    """
+
+    if not isinstance(entry, Mapping):
+        return False
+    return entry.get("prompt_ack") == "accepted" and entry.get("terminal") is True
+
+
+def _window_self_consistent(text: Any, bounds: Any, receipt: str) -> bool:
+    """Whether text is exactly the bounded window its own bounds claim."""
+
+    if not isinstance(text, str) or not isinstance(bounds, Mapping):
+        return False
+    if bounds.get("kept") == "tail":
+        return _bounded_tail_verified(text, bounds, receipt)
+    return (bounds.get("kept") == "all"
+            and bounds.get("dropped_chars") == 0
+            and type(bounds.get("captured_chars")) is int
+            and bounds["captured_chars"] == len(text)
+            and _receipt_present(text, receipt))
+
+
+def _verified_result_window(payload: Mapping[str, Any],
+                            receipt: str) -> dict[str, Any] | None:
+    """The durable bounded window that carries this task's exact receipt.
+
+    A longer earlier read can omit the final receipt while a shorter later one
+    carries it, so the primary retained window alone is not authoritative. The
+    task's own bounded observations are evaluated in order; each is admitted
+    only when its recorded provenance proves a post-prompt terminal capture,
+    its text is exactly the window its own bounds describe, and this task's
+    exact task-bound receipt line is present. A window belonging to another
+    task, a wrong or echoed nonce, a truncated window of unknown provenance and
+    a fabricated size are all refused. The primary window remains a fallback
+    for records written before observations were retained.
+    """
+
+    observations = payload.get("output_observations")
+    if isinstance(observations, list):
+        for entry in observations:
+            if not _observation_admissible(entry):
+                continue
+            text = entry.get("output")
+            bounds = entry.get("bounds")
+            if not _window_self_consistent(text, bounds, receipt):
+                continue
+            return {"output": text,
+                    "truncated": bounds.get("kept") == "tail",
+                    "bounds": dict(bounds)}
+    text = payload.get("output")
+    if _receipt_present(text, receipt):
+        return {"output": text,
+                "truncated": bool(payload.get("output_truncated")),
+                "bounds": payload.get("output_bounds")}
+    return None
+
+
 def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
             slot: Mapping[str, Any], slots: Mapping[str, Any]) -> str:
     role_id = task["reviewer"] if slot["phase"] == "review" else task["role"]
@@ -1041,17 +1106,24 @@ def _progress_key(backing: Any) -> str:
     """A durable fingerprint of what one task execution observably produced.
 
     Only durable state counts: the task's own status, its bounded captured
-    output, whether its CAO-owned pane was closed and what was last observed.
-    A bookkeeping timestamp is deliberately excluded, so a tick that merely
-    rewrites a record is never mistaken for the agent making progress.
+    output, every retained observation window, whether its CAO-owned pane was
+    closed and what was last observed. A bookkeeping timestamp is deliberately
+    excluded, so a tick that merely rewrites a record is never mistaken for the
+    agent making progress, while newly observed evidence still is.
     """
 
     if not isinstance(backing, Mapping):
         return ""
     observation = backing.get("observation")
+    windows = backing.get("output_observations")
+    observed = (
+        [entry.get("output") for entry in windows if isinstance(entry, Mapping)]
+        if isinstance(windows, list) else []
+    )
     return evidence.fingerprint([
         str(backing.get("status") or ""),
         backing.get("output") if isinstance(backing.get("output"), str) else "",
+        observed,
         str(backing.get("pane_closed") or ""),
         (str(observation.get("status") or "")
          if isinstance(observation, Mapping) else ""),
@@ -1177,10 +1249,17 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
             registry_db=registry_db, observation=None, wait_ms=wait_ms)
     if payload.get("status") == "complete":
         receipt = _receipt_for(execution_id, prompt)
-        text = payload.get("output")
-        if not _receipt_present(text, receipt):
+        window = _verified_result_window(payload, receipt)
+        if window is None:
             return dict(payload, status="unknown",
                         error={"code": "TEAM_DURABLE_RESULT_UNVERIFIED"})
+        # Evaluate the handoff and any review verdict against the retained
+        # window that actually carries this task's receipt, not merely the
+        # longest retained capture.
+        if window["output"] != payload.get("output"):
+            payload = dict(payload, output=window["output"],
+                           output_truncated=window["truncated"],
+                           output_bounds=window["bounds"])
     if mode == "read" and payload.get("status") == "complete":
         record = product_state.read_task(execution_id, env)
         if record is None:
@@ -1413,6 +1492,19 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     _save(record, env)
                     continue
                 outcome = result.get("status")
+                if (outcome == "complete" and slot.get("execution_id")
+                        and isinstance(slot.get("prompt"), str)):
+                    # A longer earlier read can omit the receipt a shorter
+                    # later read carries. Before deciding this result, evaluate
+                    # the task's own retained observation windows so the
+                    # verified capture, not merely the longest one, is used.
+                    receipt = _receipt_for(slot["execution_id"], slot["prompt"])
+                    if not _receipt_present(result.get("output"), receipt):
+                        rescue = _verified_result_window(result, receipt)
+                        if rescue is not None:
+                            result = {**result, "output": rescue["output"],
+                                      "output_truncated": rescue["truncated"],
+                                      "output_bounds": rescue["bounds"]}
                 if outcome == "complete":
                     released = (result.get("claim") or {}).get("released_head")
                     if not isinstance(released, str) or not _HEAD.fullmatch(released) or not (result.get("claim") or {}).get("released"):
