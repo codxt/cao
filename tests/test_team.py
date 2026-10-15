@@ -2470,6 +2470,165 @@ class TeamTests(unittest.TestCase):
             c.close()
 
 
+    # -- B9 recovery claim-row safety -------------------------------------
+
+    def _b9_open_write(self):
+        repo = str(git_repo(self.root, "b9-checkout", files=("README.md",)))
+        db = str(self.root / "b9-registry.sqlite3")
+        identity = team._execution_id("b9", "fix", "work", 0)
+        conn = registry.connect(db)
+        try:
+            claim_id = conn.execute(
+                "INSERT INTO claims "
+                "(run_id, work_key, issue, owner, mode, branch, worktree, claimed_at) "
+                "VALUES (?, ?, '', ?, 'WRITE', 'main', ?, ?)",
+                ("cao-team-b9", identity, product_task.OWNER,
+                 repo, "2026-10-15T00:00:00Z")).lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+        git_head = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+        durable = {"claim": {"claim_id": claim_id, "mode": "WRITE",
+                             "base_branch": "main", "base_head": git_head},
+                   "checkpoint": {}}
+        slot = {"phase": "work", "status": "unknown",
+                "error": "TASK_STATUS_UNVERIFIED", "execution_id": identity,
+                "prompt": "Fix safely", "head": None,
+                "pinned_head": git_head, "pinned_branch": "main"}
+        spec = task("fix", repo, mode="write")
+
+        def observe(*, backing=None, rev=None, branch="main"):
+            with mock.patch("cao.product_state.read_task",
+                            return_value=durable if backing is None else backing):
+                return team._recovery_evidence(
+                    "b9", spec, slot, driver=None, db=db,
+                    head_reader=lambda _: git_head if rev is None else rev,
+                    branch_reader=lambda _: branch,
+                    occupancy=team._active_writes,
+                    env=self.env, clock=None, prior_resumes=0)
+        return db, repo, claim_id, durable, observe
+
+    def test_b9_self_only_write_is_not_foreign_or_resumable(self):
+        db, repo, claim_id, durable, observe = self._b9_open_write()
+        for _ in range(2):
+            snapshot = observe()
+            verdict = team_recovery.classify(snapshot)
+            self.assertFalse(snapshot["checkout_conflict"])
+            self.assertFalse(snapshot["registry_unreadable"])
+            self.assertEqual(snapshot["registry_claim"]["claim_id"], claim_id)
+            self.assertEqual(verdict["classification"], team_recovery.WRITE_UNVERIFIED)
+            self.assertEqual(verdict["decision"], team_recovery.HOLD)
+            self.assertFalse(verdict["auto_resume"])
+        self.assertEqual(self._claim_count(db), 1)
+
+    def test_b9_foreign_claim_same_checkout_still_conflicts(self):
+        db, repo, claim_id, durable, observe = self._b9_open_write()
+        conn = registry.connect(db)
+        try:
+            conn.execute(
+                "INSERT INTO claims "
+                "(run_id, work_key, issue, owner, mode, branch, worktree, claimed_at) "
+                "VALUES ('foreign', 'work', '', 'other', 'WRITE', 'main', ?, "
+                "'2026-10-15T00:00:01Z')", (repo,))
+            conn.commit()
+        finally:
+            conn.close()
+        for _ in range(2):
+            snapshot = observe()
+            verdict = team_recovery.classify(snapshot)
+            self.assertTrue(snapshot["checkout_conflict"])
+            self.assertEqual(verdict["classification"],
+                             team_recovery.REGISTRY_CONFLICT)
+            self.assertEqual(verdict["decision"], team_recovery.HOLD)
+            self.assertFalse(verdict["auto_resume"])
+        self.assertEqual(self._claim_count(db), 2)
+
+
+    def test_b9_mismatched_released_exclusive_and_unreadable_hold(self):
+        db, repo, claim_id, durable, observe = self._b9_open_write()
+        for changed in (
+            {**durable["claim"], "base_branch": "other"},
+            {**durable["claim"], "mode": "READ"},
+            {**durable["claim"], "claim_id": claim_id + 1},
+        ):
+            snap = observe(backing={"claim": changed, "checkpoint": {}})
+            self.assertTrue(snap["checkout_conflict"])
+            self.assertEqual(team_recovery.classify(snap)["decision"],
+                             team_recovery.HOLD)
+        self.assertEqual(team_recovery.classify(
+            observe(rev="b" * 40))["classification"], team_recovery.GIT_DRIFT)
+        self.assertEqual(team_recovery.classify(
+            observe(branch="unexpected"))["classification"],
+            team_recovery.GIT_DRIFT)
+        conn = registry.connect(db)
+        try:
+            conn.execute(
+                "INSERT INTO claims "
+                "(run_id, work_key, issue, owner, mode, branch, worktree, claimed_at) "
+                "VALUES ('separate', 'lock', '', 'other', 'EXCLUSIVE', 'other', "
+                "?, '2026-10-15T00:00:02Z')", (str(self.root / "other"),))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertTrue(observe()["checkout_conflict"])
+        self.assertEqual(team_recovery.classify(observe())["classification"],
+                         team_recovery.REGISTRY_CONFLICT)
+        Path(db).write_bytes(b"not a database")
+        unreadable = observe()
+        self.assertTrue(unreadable["registry_unreadable"])
+        self.assertEqual(team_recovery.classify(unreadable)["decision"],
+                         team_recovery.HOLD)
+
+    def test_b9_released_original_does_not_trigger_write_retry(self):
+        db, repo, claim_id, durable, observe = self._b9_open_write()
+        conn = registry.connect(db)
+        try:
+            conn.execute(
+                "UPDATE claims SET released_at='2026-10-15T00:01:00Z', "
+                "outcome='abandon' WHERE claim_id=?", (claim_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        snapshot = observe()
+        result = team_recovery.classify(snapshot)
+        self.assertTrue(snapshot["registry_claim"]["released"])
+        self.assertEqual(result["decision"], team_recovery.HOLD)
+        self.assertFalse(result["auto_resume"])
+        self.assertEqual(self._claim_count(db), 1)
+
+    def test_b9_corrupt_cached_decision_cannot_resume_write(self):
+        self.init(self.spec([task("ship", self.paths[0], mode="write")]))
+        record = team._required("squad", self.env)
+        slot = record["slots"]["ship"]
+        identity = team._execution_id("squad", "ship", "work", 0)
+        slot.update(status="unknown", error="TASK_STATUS_UNVERIFIED",
+                    execution_id=identity, prompt="Test unsafe saved receipt")
+        evidence_snapshot = {
+            "task_id": "ship", "mode": "WRITE", "phase": "work",
+            "status": "unknown", "error": "TASK_STATUS_UNVERIFIED",
+            "execution_id": identity, "now": "2026-10-15T00:00:00Z",
+        }
+        fresh = team_recovery.classify(evidence_snapshot)
+        forged = {**fresh, "decision": team_recovery.RESUME_READ,
+                  "auto_resume": True,
+                  "fingerprint": team_recovery.fingerprint(fresh),
+                  "at": "2026-10-15T00:00:00Z"}
+        record["recovery"] = {
+            "schema": team_recovery.SCHEMA,
+            "decisions": {"ship": forged}, "resumed": {},
+        }
+        with mock.patch("cao.team._recovery_evidence",
+                        return_value=evidence_snapshot):
+            report = team._apply_recovery(
+                "squad", record, driver=None, db="unused", head_reader=None,
+                branch_reader=None, occupancy=None, env=self.env,
+                clock=None)
+        self.assertEqual(report[0]["decision"], team_recovery.HOLD)
+        self.assertFalse(report[0]["auto_resume"])
+        self.assertEqual(slot["status"], "unknown")
+        self.assertEqual(record["recovery"]["resumed"], {})
+
     # -- R3 automatic safe recovery ---------------------------------------
 
     def _recovery_setup(self, *, team_id="squad", task_id="inspect",
