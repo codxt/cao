@@ -463,6 +463,17 @@ class ConsumptionCardinalityTests(unittest.TestCase):
     TOKEN = "b" * 64
     TEAM_ID = "intake-read-" + TOKEN[:16]
 
+    def setUp(self) -> None:
+        # Consumption also derives quota evidence from the Work Registry, so
+        # the fixture provisions an isolated real, empty governed ledger
+        # instead of depending on whatever Registry the host happens to have.
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        ledger = Path(self._temp.name) / "registry.sqlite3"
+        conn = registry.connect(str(ledger))
+        conn.close()
+        self.env = {"CAO_REGISTRY_DB": str(ledger)}
+
     def _views(self, eligible_at: int, corrupt: bool = False) -> list[dict]:
         mapped: list[dict] = [
             {"team_id": f"zzz{index:07d}", "status": "PAUSED"}
@@ -501,7 +512,7 @@ class ConsumptionCardinalityTests(unittest.TestCase):
                 mock.patch.object(intake_authority.team, "_required",
                                   return_value=self._record()):
             return intake_authority.consumption(
-                env={}, envelope=self._envelope())
+                env=self.env, envelope=self._envelope())
 
     def test_eligible_team_at_1025_is_counted_never_truncated(self) -> None:
         result = self._consume(self._views(eligible_at=1024))
@@ -516,7 +527,7 @@ class ConsumptionCardinalityTests(unittest.TestCase):
         with mock.patch.object(intake_authority.team, "list_teams",
                                return_value=[None] * 5000):
             result = intake_authority.consumption(
-                env={}, envelope=self._envelope())
+                env=self.env, envelope=self._envelope())
         self.assertEqual(result["verdict"], "UNKNOWN")
         self.assertIn("inspection bound", result["reason"])
 
