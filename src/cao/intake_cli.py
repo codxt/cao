@@ -24,6 +24,12 @@ trusts a principal or scope asserted through process environment or CLI input.
 only a deterministic ``--dry-run`` or an explicit ``--mock`` run of the built-in
 no-egress simulation, and only after a separate operator authorizing event.
 
+``queue`` is the B7 durable execution queue: ``enqueue`` persists one
+prequalified, source-bound READ intent (it never ticks the queue, never builds a
+team and never constructs an operator authority), and ``list``/``show`` read
+bounded metadata and one full record. Reconciliation belongs to the existing
+daemon, which supplies no operator authority of its own.
+
 Output is JSON on stdout. Exit codes are ``0`` success, ``2`` usage error and
 ``3`` explicit UNAVAILABLE/conflict, matching the rest of CAO's CLI.
 """
@@ -37,7 +43,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from . import (intake, intake_bridge, intake_compile, intake_handoff,
-               intake_resolution, intake_triage)
+               intake_queue, intake_resolution, intake_triage)
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -285,6 +291,91 @@ def _cmd_reply(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_queue_enqueue(args: argparse.Namespace) -> int:
+    """Queue one prequalified, source-bound READ intent (no work, no authority).
+
+    The CLI enqueues a durable intent only; it never ticks the queue, never
+    constructs an operator authority and never starts a team. Reconciliation
+    belongs to the existing daemon, which supplies no authority of its own.
+    """
+
+    submission_id = getattr(args, "id", None)
+    item_id = getattr(args, "item_id", None)
+    try:
+        if submission_id is not None and item_id is not None:
+            derived = intake.submission_id_for(item_id)
+            if derived != submission_id:
+                return _error("queue", "USAGE", "--id and --item-id name different items")
+        elif item_id is not None:
+            submission_id = intake.submission_id_for(item_id)
+        elif submission_id is None:
+            return _error("queue", "USAGE", "queue enqueue requires --id or --item-id")
+        result = intake_queue.enqueue(
+            submission_id,
+            repo=args.repo,
+            source_ref=getattr(args, "source_ref", None),
+            priority=(getattr(args, "priority", None)
+                      if getattr(args, "priority", None) is not None
+                      else intake_queue.DEFAULT_PRIORITY),
+            depends_on=getattr(args, "depends_on", None) or (),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except intake_queue.QueueRefused as exc:
+        return _refusal("queue", exc.code, str(exc), "REFUSED")
+    except (intake.IntakeError, intake_triage.TriageError,
+            intake_handoff.HandoffError, intake_queue.QueueError) as exc:
+        return _error("queue", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("queue", "INTAKE_QUEUE_ERROR", type(exc).__name__)
+    _emit(result)
+    if result["status"] in ("HOLD", "REFUSED"):
+        return EXIT_UNAVAILABLE
+    return EXIT_OK
+
+
+def _cmd_queue_list(args: argparse.Namespace) -> int:
+    """List bounded, public-safe intent metadata (never a raw body)."""
+
+    try:
+        intents = intake_queue.list_intents()
+    except intake_queue.QueueError as exc:
+        return _error("queue", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("queue", "INTAKE_QUEUE_ERROR", type(exc).__name__)
+    _emit({
+        "schema": "cao.intake.queue.list.v1",
+        "status": "OK",
+        "count": len(intents),
+        "intents": [
+            {
+                "intent_id": item["intent_id"],
+                "status": item["status"],
+                "priority": item["priority"],
+                "team_id": item["binding"].get("team_id"),
+                "submission_id": item["binding"].get("submission_id"),
+                "created_at": item["created_at"],
+            }
+            for item in intents
+        ],
+    })
+    return EXIT_OK
+
+
+def _cmd_queue_show(args: argparse.Namespace) -> int:
+    """Read one full intent record from the operator's own private state."""
+
+    try:
+        intent = intake_queue.read_intent(args.intent_id)
+    except intake_queue.QueueError as exc:
+        return _error("queue", exc.code, str(exc))
+    except (StateError, OSError, UnicodeError, ValueError) as exc:
+        return _error("queue", "INTAKE_QUEUE_ERROR", type(exc).__name__)
+    if intent is None:
+        return _error("queue", "INTAKE_QUEUE_STATE", "no queue intent with that id")
+    _emit({"schema": "cao.intake.queue.show.v1", "status": "OK", "intent": intent})
+    return EXIT_OK
+
+
 def _cmd_handoff(args: argparse.Namespace) -> int:
     """Derive one governed Intake-to-CAO READ handoff plan (no dispatch).
 
@@ -469,6 +560,42 @@ def build_parser() -> argparse.ArgumentParser:
                                   "UNAVAILABLE in this build (no in-process "
                                   "authenticated operator authority exists)")
     handoff_cmd.set_defaults(handler=_cmd_handoff)
+
+    queue_cmd = commands.add_parser(
+        "queue",
+        help="durable opt-in Intake execution queue (enqueue/list/show only)",
+    )
+    queue_commands = queue_cmd.add_subparsers(dest="queue_command", metavar="COMMAND")
+
+    q_enqueue = queue_commands.add_parser(
+        "enqueue",
+        help="queue one prequalified, source-bound READ intent (no dispatch)",
+    )
+    q_enqueue.add_argument("--id", metavar="SUBMISSION_ID",
+                           help="durable submission id to queue")
+    q_enqueue.add_argument("--item-id", metavar="ITEM_ID",
+                           help="stable item id; its submission id is derived")
+    q_enqueue.add_argument("--repo", required=True, metavar="PATH",
+                           help="scoped checkout whose HEAD the intent binds")
+    q_enqueue.add_argument("--source-ref", metavar="REF",
+                           help="ref or commit id to bind as the source")
+    q_enqueue.add_argument("--priority", type=int, metavar="N",
+                           help="lower advances first (0..1000)")
+    q_enqueue.add_argument("--depends-on", action="append", metavar="INTENT_ID",
+                           help="intent id that must reach COMPLETE first "
+                                "(repeatable)")
+    q_enqueue.add_argument("--dry-run", action="store_true",
+                           help="validate the intent and persist nothing")
+    q_enqueue.set_defaults(handler=_cmd_queue_enqueue)
+
+    q_list = queue_commands.add_parser(
+        "list", help="list bounded, public-safe intent metadata"
+    )
+    q_list.set_defaults(handler=_cmd_queue_list)
+
+    q_show = queue_commands.add_parser("show", help="read one full queue intent")
+    q_show.add_argument("intent_id", metavar="INTENT_ID")
+    q_show.set_defaults(handler=_cmd_queue_show)
     return parser
 
 

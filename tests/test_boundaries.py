@@ -109,6 +109,18 @@ SEPARATION_RULES = {
         "contracts",
         "cao.contracts",
     ),
+    # B7 queue persists prequalified READ intents and reconciles them into the
+    # existing CAO team owner API, but must not reach the runtime contract,
+    # policy or the generic execution entry points; its Registry access is
+    # separately restricted to read-only calls below.
+    "intake_queue.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
 }
 
 # The ONLY Registry attributes advisory triage may touch. Every mutating entry
@@ -723,6 +735,105 @@ class IntakeHandoffBoundaryTests(unittest.TestCase):
             "import team",
         ):
             self.assertNotIn(forbidden, cli)
+
+
+class IntakeQueueBoundaryTests(unittest.TestCase):
+    """B7 queue: read-only Registry, no egress, no shell, no shadow work.
+
+    The queue persists prequalified READ intents and reconciles them into the
+    existing CAO team owner API, but it must never reach a generic execution
+    entry point, write a Registry row, touch canonical Company State or open an
+    egress surface, and it must start a team only from the single advance path.
+    """
+
+    def _tree(self) -> ast.AST:
+        return ast.parse((CAO_ROOT / "intake_queue.py").read_text("utf-8"))
+
+    def test_registry_access_is_readonly_only(self) -> None:
+        offenders: set[str] = set()
+        for node in ast.walk(self._tree()):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "registry"
+            ):
+                if node.attr not in TRIAGE_REGISTRY_ALLOWED:
+                    offenders.add(node.attr)
+        self.assertEqual(offenders, set())
+
+    def test_no_egress_modules(self) -> None:
+        imported = _imports(CAO_ROOT / "intake_queue.py")
+        offenders = sorted(
+            module for module in imported if module in EGRESS_MODULES
+        )
+        self.assertEqual(offenders, [])
+
+    def test_no_shell_eval_or_dynamic_import(self) -> None:
+        offenders: list[str] = []
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in {
+                "eval", "exec", "__import__", "compile",
+            }:
+                offenders.append(func.id)
+            if isinstance(func, ast.Attribute):
+                if (
+                    func.attr in {"system", "popen"}
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    offenders.append(f"os.{func.attr}")
+                if func.attr in {"run", "call", "check_output", "Popen"}:
+                    for keyword in node.keywords:
+                        if keyword.arg == "shell":
+                            offenders.append("subprocess shell=True")
+        self.assertEqual(offenders, [])
+        self.assertNotIn("subprocess",
+                         (CAO_ROOT / "intake_queue.py").read_text("utf-8"))
+
+    def test_team_start_is_reached_only_from_the_advance_path(self) -> None:
+        # The only team mutation entry point is ``team.set_desired`` inside
+        # ``_advance``, called only once every fail-closed gate has proven.
+        tree = self._tree()
+        offenders: list[str] = []
+        seen: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            calls = {
+                inner.func.attr
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and isinstance(inner.func.value, ast.Name)
+                and inner.func.value.id == "team"
+                and inner.func.attr in {"initialize", "set_desired"}
+            }
+            if not calls:
+                continue
+            seen |= calls
+            if node.name != "_advance":
+                offenders.append(node.name)
+        self.assertEqual(offenders, [])
+        self.assertEqual(seen, {"set_desired"})
+
+    def test_no_registry_write_product_task_or_canonical_write(self) -> None:
+        source = (CAO_ROOT / "intake_queue.py").read_text("utf-8")
+        for forbidden in (
+            "registry.connect(",
+            "registry.propose",
+            "registry.claim(",
+            "registry.release",
+            "registry.handoff",
+            "registry.write_gate",
+            "registry.record_observation",
+            "product_task.run",
+            "team.tick(",
+            "team.tick_all(",
+        ):
+            self.assertNotIn(forbidden, source)
 
 
 class IntakeCliGuestBoundaryTests(unittest.TestCase):

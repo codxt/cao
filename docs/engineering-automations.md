@@ -165,6 +165,18 @@ comment, this automation refuses to arm. A valid user message, source text,
 local manifest, model answer, Work Registry claim, or successful CI never
 substitutes for the external GitHub operator grant.
 
+### Relationship to the Intake execution queue (B7)
+
+The opt-in Intake execution queue (`daemon.intake_queue`, see
+[`intake.md`](intake.md)) is a **separate concern** that reuses the same daemon
+tick. It never merges, deploys, publishes, releases or changes credentials or
+permissions, and it dispatches no WRITE. It persists prequalified READ intents
+and holds every first dispatch behind an in-process authenticated operator
+authority; the daemon itself supplies none, so a first dispatch is held. It is
+default-disabled, so enabling the engineering automations above never enables
+the Intake queue, and enabling the Intake queue never enables an engineering
+merge.
+
 ## Behavior and unknowns
 
 - NEEDS_IMPROVEMENT: no green measured result; investigate with the existing

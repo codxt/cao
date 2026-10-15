@@ -561,6 +561,128 @@ team completion and verified outcome stay distinct, and nothing here closes a
 request. B6 adds no queue, no scheduler, no second ledger, no network call and no
 credential.
 
+## Durable Intake execution queue (B7): opt-in, daemon-reconciled
+
+`cao intake queue` is the B7 path. B6 can derive one gated READ handoff plan,
+but a plan that cannot be dispatched yet is not remembered. B7 persists bounded,
+prequalified READ **intents** and reconciles them on the **existing** CAO
+daemon's own tick into the **existing** CAO team owner API. It adds no
+scheduler, no service, no database, no second ledger, no Registry, no
+coordinator, no credential and no network egress.
+
+The queue is **opt-in and default-disabled**: nothing is reconciled unless the
+product configuration's `daemon.intake_queue` is explicitly `true`, and the
+existing feedback/engineering watches keep their own independent defaults.
+
+```sh
+cao intake queue enqueue --id <submission-id> --repo /path/repo   # queue an intent
+cao intake queue enqueue --item-id <item-id> --repo /path/repo --priority 10
+cao intake queue enqueue --id <id> --repo /path/repo --dry-run   # validate only
+cao intake queue list                                            # metadata only
+cao intake queue show <intent-id>                                # one full record
+```
+
+The CLI **enqueues and reads only**. It never ticks the queue, never constructs
+an operator authority and never starts a team: reconciliation belongs to the
+existing daemon. An intent is queued only for a request that B6 derives as
+`ELIGIBLE_READ` and for which an exact source ref/HEAD is readable; anything
+else is reported truthfully and **nothing is persisted**.
+
+### A queue intent is never its own approval
+
+An intent records an immutable, source-bound **binding** and a mutable, derived
+**decision receipt**; it never records authority. The only path that creates new
+work is an **in-process** authenticated operator-authority adapter (the B6
+contract). A CLI flag, a process-environment value or a JSON file is
+caller-controlled and is never proof, and the daemon supplies no such adapter,
+so a first dispatch is always held with the exact missing integration:
+
+> supply an in-process adapter through the library `operator_authority` argument
+> that (1) authenticates the operator on a host-owned channel outside
+> argv/env/JSON, (2) returns a grant bound to this intent's exact plan digest
+> with `read_only = true`, and (3) names the operator, the scoped repository, the
+> role, the model and the provider privacy qualification.
+
+### An already-approved team may re-verify and advance
+
+A persisted, already-approved immutable CAO team bound to an intent may move
+PAUSED -> RUNNING only after its approval/spec digest, its Intake binding, its
+exact source HEAD and its dependencies are all re-validated from authoritative
+evidence. The revalidation is delegated to the existing team owner API
+(`team.set_desired`), which recomputes the confirmation; a forged manifest or
+approval string is never trusted and the stored receipt is never consulted as
+authority.
+
+Any **preexisting** team -- PAUSED, RUNNING or COMPLETE -- is accepted as an
+intent's own audit only when (1) its immutable manifest is entirely READ and
+cites the submission, (2) **every** task targets the intent's **exact** bound
+source repository, and (3) it carries a persisted operator admission whose spec
+digest binds that exact manifest. An admission-less team (legacy approval mode,
+or a manifest initialized outside the governed handoff) is held as
+`team_unapproved` **before** the owner API is ever reached; a cross-source
+manifest is held as `source_mismatch`; and an admission that no longer binds the
+manifest is held as `approval_unverified`. A fake or foreign team, including one
+labeled COMPLETE, therefore never grants progress or terminal dependency
+acceptance: a COMPLETE label is terminal evidence only for the intent's exact
+bound HEAD, and any other completed revision is held as `source_head_drift`. The
+team manifest carries no per-task ref, so the exact ref/HEAD is re-verified from
+the binding rather than from the manifest.
+
+### Gates, isolation, fairness and a bounded budget
+
+Every pass re-derives the B6 eligibility and binding and re-reads the exact
+source HEAD, so a changed Intake binding, a moved HEAD, an unmet, missing or
+cyclic dependency, an unreadable Work Registry or an independent overlapping
+Registry claim **holds that item only**. A stored `COMPLETE` dependency status
+and its content digest are caller-writable and are never authority on their own:
+before it can release a dependent, the dependency's completion is re-derived
+from its own authoritative team checkpoint -- the bound team must resolve and
+report `COMPLETE`, its immutable manifest must be a fully READ, admission-bound
+audit of the dependency submission with every task on the dependency's exact
+bound source repository, every completed slot must sit at the dependency's exact
+bound HEAD and its source ref/HEAD must still match -- and any missing,
+unreadable or mismatched evidence holds the dependent as `dependency_unverified`.
+These gates run for every preexisting status, not only the PAUSED advance, so a
+RUNNING or COMPLETE label cannot bypass them. Every active Registry claim is
+compared (none is skipped), so a conflicting claim beyond any fixed cut is never
+missed. Items are ordered by
+priority, then age, then id; the per-tick budget is checked before any side
+effect (`team.set_desired` or the governed handoff dispatch), so a zero budget
+starts nothing and reports `advanced = 0`, at most one item advances per tick,
+and a held item never consumes that budget. Two concurrent passes are serialized
+by a kernel lock and the loser reports `LOCKED` and mutates nothing. A corrupt
+private record, a changed content digest or an unexpected store file fails the
+whole pass closed.
+
+### WRITE and every consequential effect stay held
+
+Only a fully READ manifest is ever started. WRITE, new corrective batches,
+PR/CI/merge/deploy, credentials, permission changes and canonical acceptance
+are never dispatched here, and an intent carries no authority to elevate a
+read-only triage. This build does **not** claim unattended portfolio
+management: a first dispatch, a WRITE, a corrective batch, a merge, a deploy, a
+credential or a permission change is held until a distinct, existing, qualified
+scope-specific operator authority is verifiably present.
+
+### Storage, idempotency and crash recovery
+
+Intents live under `$XDG_STATE_HOME/cao/intake-queue/` (`0700` directory,
+`0600` records), written through the existing CAO durable-state primitive with
+a recomputed content digest. The enqueue read/limit/write section runs under the
+same kernel pass lock as reconciliation, so a concurrent enqueue or pass can
+neither race the bounded size nor overwrite a receipt it just derived; the loser
+mutates nothing and reports `INTAKE_QUEUE_BUSY`. The intent id is a one-way
+digest of the immutable binding, so a replay with the exact same priority and
+dependencies is `DUPLICATE`, while a replay that keeps the binding but changes
+the priority or dependencies is refused deterministically rather than reported
+as identical, and the stored record and receipt are preserved. A receipt is
+deterministic: identical evidence yields
+the same receipt digest, so a repeated hold persists no new record. A crash
+between the team effect and the receipt write is recovered on the next pass:
+an already-running or paused team is re-observed from the team checkpoint, so no
+duplicate team, execution or claim is ever created. A held, merely-queued or
+refused intent creates no team, no agent and no Registry claim.
+
 ## Limitations and unresolved items
 
 - **Marketplace policy is unresolved.** Whether and how a marketplace app may
@@ -573,8 +695,12 @@ credential.
 - **CAO is not a service.** There is no listening socket, no inbound port and no
   background receiver. If nothing pipes a document to stdin, nothing is
   admitted.
-- **One item, one record.** There is no queue, no scheduler and no retry daemon;
-  a retry is the sender's action, and it reconciles by id.
+- **One item, one record.** The admission itself is one item and one record;
+  there is no scheduler and no retry daemon, and a retry is the sender's action
+  and reconciles by id. The opt-in B7 execution queue (above) is a separate,
+  default-disabled durable store that only remembers prequalified READ intents
+  for the existing daemon to reconcile; it is not an inbox and never admits a
+  submission.
 
 ## Tests
 
