@@ -42,8 +42,8 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from . import (intake, intake_bridge, intake_compile, intake_handoff,
-               intake_queue, intake_resolution, intake_triage)
+from . import (intake, intake_authority, intake_bridge, intake_compile,
+               intake_handoff, intake_queue, intake_resolution, intake_triage)
 from .state import StateError
 
 __all__ = ["main", "build_parser", "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
@@ -376,6 +376,25 @@ def _cmd_queue_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_authority(args: argparse.Namespace) -> int:
+    """Report the protected standing authority read-only (no dispatch).
+
+    It reads the fixed protected host grant and the existing consumption
+    evidence, and it never builds a dispatch adapter, so the CLI cannot assert
+    or construct authority. With no provisioned grant it truthfully reports
+    ``UNAVAILABLE``: the first dispatch is held.
+    """
+
+    try:
+        document = intake_authority.status()
+    except intake_authority.AuthorityError as exc:
+        return _error("authority", exc.code, str(exc))
+    except (OSError, ValueError, UnicodeError) as exc:
+        return _error("authority", "INTAKE_AUTHORITY_ERROR", type(exc).__name__)
+    _emit(document)
+    return EXIT_OK
+
+
 def _cmd_handoff(args: argparse.Namespace) -> int:
     """Derive one governed Intake-to-CAO READ handoff plan (no dispatch).
 
@@ -560,6 +579,12 @@ def build_parser() -> argparse.ArgumentParser:
                                   "UNAVAILABLE in this build (no in-process "
                                   "authenticated operator authority exists)")
     handoff_cmd.set_defaults(handler=_cmd_handoff)
+
+    authority_cmd = commands.add_parser(
+        "authority",
+        help="report the protected standing authority read-only (no dispatch)",
+    )
+    authority_cmd.set_defaults(handler=_cmd_authority)
 
     queue_cmd = commands.add_parser(
         "queue",

@@ -121,6 +121,28 @@ SEPARATION_RULES = {
         "contracts",
         "cao.contracts",
     ),
+    # B8 standing authority reads the protected operator grant and the existing
+    # work artifacts read-only; it must not reach the runtime contract, policy or
+    # the generic execution entry points, and it never writes a ledger.
+    "intake_authority.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
+    # B8 pipeline discovers/triages/enqueues only; it must not reach the runtime
+    # contract, policy or the generic execution entry points, and it never
+    # dispatches work itself.
+    "intake_pipeline.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
 }
 
 # The ONLY Registry attributes advisory triage may touch. Every mutating entry
@@ -834,6 +856,88 @@ class IntakeQueueBoundaryTests(unittest.TestCase):
             "team.tick_all(",
         ):
             self.assertNotIn(forbidden, source)
+
+
+class IntakeAuthorityBoundaryTests(unittest.TestCase):
+    """B8 standing authority: read-only, no egress, no shell, no write.
+
+    The authority reads the protected operator grant and the existing work
+    artifacts; it must never write a ledger, a private store, a Registry row or
+    canonical state, and it must open no egress surface.
+    """
+
+    def _tree(self) -> ast.AST:
+        return ast.parse((CAO_ROOT / "intake_authority.py").read_text("utf-8"))
+
+    def test_registry_access_is_readonly_only(self) -> None:
+        offenders: set[str] = set()
+        for node in ast.walk(self._tree()):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "registry"
+            ):
+                if node.attr not in TRIAGE_REGISTRY_ALLOWED:
+                    offenders.add(node.attr)
+        self.assertEqual(offenders, set())
+
+    def test_no_egress_modules_or_shell(self) -> None:
+        imported = _imports(CAO_ROOT / "intake_authority.py")
+        offenders = sorted(m for m in imported if m in EGRESS_MODULES)
+        self.assertEqual(offenders, [])
+        text = (CAO_ROOT / "intake_authority.py").read_text("utf-8")
+        self.assertNotIn("subprocess", text)
+        for forbidden in ("os.system", "os.popen", "eval(", "exec("):
+            self.assertNotIn(forbidden, text)
+
+    def test_authority_writes_nothing(self) -> None:
+        text = (CAO_ROOT / "intake_authority.py").read_text("utf-8")
+        for forbidden in (
+            "write_state",
+            "state.write",
+            "open_private_dir(",
+            "write_private_record(",
+            "os.makedirs",
+            "os.chmod",
+            "team.initialize(",
+            "team.set_desired(",
+            "registry.connect(",
+            "registry.propose",
+            "registry.claim(",
+            "product_task.run",
+        ):
+            self.assertNotIn(forbidden, text)
+
+    def test_quota_consumption_reads_the_existing_artifacts(self) -> None:
+        text = (CAO_ROOT / "intake_authority.py").read_text("utf-8")
+        self.assertIn("team.list_teams(", text)
+        self.assertIn("registry.list_active_claims(", text)
+
+
+class IntakePipelineBoundaryTests(unittest.TestCase):
+    """B8 pipeline: discover/triage/enqueue only, never dispatch."""
+
+    def test_no_egress_modules_or_shell(self) -> None:
+        imported = _imports(CAO_ROOT / "intake_pipeline.py")
+        offenders = sorted(m for m in imported if m in EGRESS_MODULES)
+        self.assertEqual(offenders, [])
+        text = (CAO_ROOT / "intake_pipeline.py").read_text("utf-8")
+        self.assertNotIn("subprocess", text)
+
+    def test_never_dispatches_or_touches_a_ledger(self) -> None:
+        text = (CAO_ROOT / "intake_pipeline.py").read_text("utf-8")
+        for forbidden in (
+            "team.initialize(",
+            "team.set_desired(",
+            "team.tick(",
+            "team.tick_all(",
+            "product_task.run",
+            "registry.",
+            "write_state",
+            "open_private_dir(",
+            "os.makedirs",
+        ):
+            self.assertNotIn(forbidden, text)
 
 
 class IntakeCliGuestBoundaryTests(unittest.TestCase):

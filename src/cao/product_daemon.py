@@ -547,6 +547,7 @@ class Daemon:
         identity: Callable[[int], dict[str, Any] | None] | None = None,
         max_ticks: int | None = None,
         relay_state_path: str | None = None,
+        authority_reader: Callable[..., Any] | None = None,
     ) -> None:
         if max_ticks is not None and (
             isinstance(max_ticks, bool) or not isinstance(max_ticks, int) or max_ticks < 0
@@ -567,6 +568,11 @@ class Daemon:
         self._terminate = terminate
         self._identity = identity if identity is not None else _process_identity
         self._max_ticks = max_ticks
+        # ``authority_reader`` is an in-process seam: the production default
+        # resolves the protected standing-authority grant, while a hermetic test
+        # can inject a host-shaped reader. It is never set from argv or the
+        # environment, so a caller cannot assert authority through it.
+        self._authority_reader = authority_reader
         self._defaults = product_config.daemon_defaults(config, env)
         self._relay_state_path = (
             relay_state_path
@@ -925,19 +931,88 @@ class Daemon:
                     "action": "engineering_queue_hold", "status": "UNKNOWN",
                     "reason": getattr(exc, "code", type(exc).__name__),
                 })
+        # The opt-in B8 Intake pipeline runs first on this same tick: it
+        # discovers bounded eligible admissions, triages them deterministically
+        # and enqueues prequalified READ intents against the *trusted* standing
+        # authority scope. It adds no scheduler, no service and no second ledger.
+        # The verified in-process operator authority is resolved from the
+        # protected host grant; when no valid grant exists the pipeline and the
+        # queue both hold honestly rather than inventing one.
+        standing: dict[str, Any] | None = None
+        if self._config is not None and self._defaults.intake_pipeline:
+            from . import intake, intake_authority, intake_pipeline, intake_queue
+            from . import intake_triage
+            reader = (
+                self._authority_reader
+                if self._authority_reader is not None
+                else intake_authority.standing_authority
+            )
+            try:
+                standing = reader(self._env, self._clock)
+            except Exception as exc:  # noqa: BLE001 - unreadable grant is UNKNOWN
+                standing = {
+                    "verdict": "UNKNOWN", "code": "authority_error",
+                    "reason": type(exc).__name__, "envelope": None, "adapter": None,
+                }
+            effects.append({
+                "action": "intake_authority",
+                "status": standing.get("verdict"),
+                "code": standing.get("code"),
+                "reason": standing.get("reason"),
+            })
+            try:
+                # The daemon's durable tick count is the only cursor the
+                # pipeline needs for fair discovery; no scheduler or ledger.
+                try:
+                    cursor = int(record.get("ticks") or 0)
+                except (TypeError, ValueError):
+                    cursor = 0
+                pipeline_report = intake_pipeline.tick(
+                    env=self._env, clock=self._clock,
+                    registry_db=self._registry_db, authority=standing,
+                    cursor=cursor)
+                effects.append({
+                    "action": "intake_pipeline",
+                    "status": pipeline_report["status"],
+                    "code": pipeline_report.get("code"),
+                    "discovered": pipeline_report["discovered"],
+                    "enqueued": pipeline_report["enqueued"],
+                })
+                engineering_exceptions.extend(
+                    pipeline_report.get("exceptions") or [])
+            except (intake.IntakeError, intake_triage.TriageError,
+                    intake_queue.QueueError, StateError, OSError, ValueError,
+                    TypeError, UnicodeError) as exc:
+                record["errors"] = int(record.get("errors") or 0) + 1
+                effects.append({
+                    "action": "intake_pipeline_hold", "status": "UNKNOWN",
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                })
         # The opt-in B7 Intake execution queue reuses this same daemon tick and
         # the existing CAO team owner API. It adds no scheduler and no second
-        # ledger. No in-process authenticated operator authority is available
-        # inside the daemon, so it may only re-verify and start an already
-        # approved immutable READ team; a first dispatch is held with an
-        # explicit, actionable exception and mutates nothing.
-        if self._config is not None and self._defaults.intake_queue:
+        # ledger. Without a verified standing authority the daemon supplies no
+        # authority, so it may only re-verify and start an already approved
+        # immutable READ team; a first dispatch is held with an explicit,
+        # actionable exception and mutates nothing.
+        if self._config is not None and (
+                self._defaults.intake_queue or self._defaults.intake_pipeline):
             from . import intake_queue
+            authority = None
+            if (standing is not None and self._defaults.intake_pipeline
+                    and standing.get("verdict") == "SUPPORTED"):
+                authority = standing.get("adapter")
             try:
-                queue_report = intake_queue.tick(
-                    env=self._env, clock=self._clock,
-                    registry_db=self._registry_db,
-                )
+                if authority is not None:
+                    queue_report = intake_queue.tick(
+                        env=self._env, clock=self._clock,
+                        registry_db=self._registry_db,
+                        operator_authority=authority,
+                    )
+                else:
+                    queue_report = intake_queue.tick(
+                        env=self._env, clock=self._clock,
+                        registry_db=self._registry_db,
+                    )
                 for item in queue_report["items"]:
                     effects.append({
                         "action": "intake_queue",

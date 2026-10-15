@@ -683,6 +683,44 @@ an already-running or paused team is re-observed from the team checkpoint, so no
 duplicate team, execution or claim is ever created. A held, merely-queued or
 refused intent creates no team, no agent and no Registry claim.
 
+## Standing Intake authority and the autonomous pipeline (B8): opt-in, default-disabled
+
+B8 is the first *safe end-to-end capability*: the existing daemon, when
+explicitly enabled (`daemon.intake_pipeline = true`; the fresh-install default
+is off), resolves a verified standing READ authority and runs bounded
+deterministic discovery → B3 triage → B6 eligibility → B7 queue on one tick.
+B4 stays draft-only and B5 stays a projection; a B3 disposition or a B4 draft is
+never permission.
+
+- **The authority is external, never caller-asserted.** An ``authenticated``
+  bit, a CLI flag, an environment value or a user-owned JSON file is never
+  proof. The only authority source is a single operator-provisioned, root-owned
+  grant document in the fixed protected directory ``/etc/cao``
+  (``intake-authority.json``), read descriptor-relative with ``O_NOFOLLOW`` on
+  every component and owner/mode checks; CAO never creates or writes there. On
+  a host with no provisioned grant every first dispatch is ``HOLD`` honestly.
+- **Effective validity is mandatory.** The grant must carry a mandatory,
+  future ``expires_at`` within a bounded TTL, must not be revoked and must not
+  begin in the future; a revoked, expired or future grant is ``REFUSED`` before
+  anything is discovered or queued.
+- **Quota evidence is complete or nothing moves.** Consumption is re-derived
+  from the existing durable work artifacts (bound READ teams and Registry
+  claims) before every first dispatch, inspecting every team record; a missing,
+  symlinked, corrupt or unreadable Registry is ``UNKNOWN``, and a truncated
+  state is never re-interpreted as a fresh quota.
+- **Policy and privacy stay checked.** The granted model must be explicitly
+  listed in the configured model allowlist (a missing allowlist grants nothing)
+  and the grant must be privacy-qualified; an unlisted or unqualified model is
+  refused.
+- **Discovery is fair and bounded.** The grant scope is honored before the
+  per-tick bound, unrelated or held candidates can never silence authorized
+  work behind a truncated prefix, and the daemon's durable tick count rotates
+  the window so every authorized submission is eventually processed.
+
+``cao intake authority`` reports the resolved standing authority read-only
+(status only; it never dispatches). The in-process adapter lives only in the
+library API and is never reachable from argv or the environment.
+
 ## Limitations and unresolved items
 
 - **Marketplace policy is unresolved.** Whether and how a marketplace app may

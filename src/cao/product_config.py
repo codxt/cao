@@ -774,6 +774,11 @@ class DaemonDefaults:
     #: Intake execution queue on its own tick. It defaults to ``False`` so a
     #: fresh or unconfigured product performs no Intake reconciliation at all.
     intake_queue: bool = False
+    #: Opt-in, default-disabled B8 flag: the existing daemon runs the bounded
+    #: deterministic Intake pipeline (discovery/triage/enqueue) and supplies the
+    #: verified standing authority when the host has provisioned one. It defaults
+    #: to ``False`` so a fresh or unconfigured product discovers nothing.
+    intake_pipeline: bool = False
 
 
 def daemon_defaults(
@@ -839,11 +844,15 @@ def daemon_defaults(
     intake_queue = raw.get("intake_queue", False)
     if type(intake_queue) is not bool:
         raise ProductConfigError("daemon.intake_queue must be true or false")
+    intake_pipeline = raw.get("intake_pipeline", False)
+    if type(intake_pipeline) is not bool:
+        raise ProductConfigError("daemon.intake_pipeline must be true or false")
     return DaemonDefaults(
         engineering_queue_dir=queue_dir,
         engineering_watch_file=engineering_watch,
         feedback_watch_file=watch,
         intake_queue=intake_queue,
+        intake_pipeline=intake_pipeline,
         tick_interval=interval,
         min_tick_interval=min_interval,
         max_tick_interval=max_interval,
