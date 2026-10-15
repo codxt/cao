@@ -742,6 +742,7 @@ def _observe(
 def _model_policy_refusal(
     config: product_config.ProductConfig | None,
     defaults: product_config.TaskDefaults,
+    mode: Any = None,
 ) -> str | None:
     """The model-allowlist refusal reason for this task's NEW dispatch route.
 
@@ -750,7 +751,9 @@ def _model_policy_refusal(
     the operator's opt-out and permits everything; a configured one denies an
     unresolved or unlisted selection with no silent fallback. The resolved
     agent kind and provider CLI are supplied so an allowlisted OpenCode model
-    id also binds the actual OpenCode runtime identity.
+    id also binds the actual OpenCode runtime identity, and ``mode`` carries
+    this task's declared READ/WRITE mode so a read-only runtime reached for a
+    WRITE task — or a non-zero-data-retention provider at all — is refused.
     """
 
     policy = product_config.team_model_policy(config)
@@ -763,7 +766,7 @@ def _model_policy_refusal(
          "provider": {"cli": provider.cli if provider is not None else None,
                       "model": (provider.model
                                 if provider is not None else None)}},
-        policy)
+        policy, mode=mode)
 
 
 def run_task(
@@ -833,7 +836,8 @@ def run_task(
             and record.get("claim_intent") is None
             and not checkpoint.get("agent_started")
             and not checkpoint.get("prompt_issued")):
-        reason = _model_policy_refusal(config, defaults)
+        reason = _model_policy_refusal(
+            config, defaults, mode=effective_mode)
         if reason is not None:
             record["status"] = "refused"
             record["refusal"] = {
@@ -890,7 +894,8 @@ def run_task(
                 checkpoint = record.get("checkpoint") or {}
                 if (not checkpoint.get("agent_started")
                         and not checkpoint.get("prompt_issued")):
-                    reason = _model_policy_refusal(config, defaults)
+                    reason = _model_policy_refusal(
+                        config, defaults, mode=effective_mode)
                     if reason is not None:
                         record["status"] = "refused"
                         record["refusal"] = {

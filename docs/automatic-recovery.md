@@ -84,6 +84,44 @@ already-started execution keeps its exact identity, prompt and claim and is
 still reconciled and released; changing the allowlist therefore stops new work
 instead of freezing work already in flight.
 
+#### Read-only Codex routes
+
+A listed `codex/` model id binds a Codex agent-profile route identity, not just
+a model string. A profile's native `--model` token resolves to the canonical
+allowlist identity `<provider>/<model>` — for example a native
+`--model gpt-6.1-sol` under `agent_kind`/`provider.cli` `codex` is the
+allowlist entry `codex/gpt-6.1-sol` — and exactly one unambiguous `--model` is
+required. A repeated, `--model=`-formed, flag-trapped, divergent or unlisted
+selection is reported unresolved and refused. The resolved agent kind and the
+provider CLI must both be `codex`, so a foreign CLI can never dispatch on an
+allowed-looking model id (`TEAM_ROUTE_IDENTITY_MISMATCH`).
+
+A Codex route is a read-only reader/reviewer. Any dispatch bound to the Codex
+runtime — through its `codex/` identity or through its resolved agent kind /
+provider CLI — reached for a WRITE task is refused (`TEAM_ROUTE_READ_ONLY`) and
+is never escalated into a writer; a Codex agent profile that declares no
+`write_args` already cannot resolve a WRITE mode. Medium and High
+reasoning-effort profiles share one model
+and differ only by the bounded `-c model_reasoning_effort=medium` / `high`
+switch, so both resolve the same base identity. The pre-existing OpenCode
+routes and their role-profile invariants are unchanged.
+
+#### Non-zero-data-retention providers
+
+An allowlisted model id whose provider is known not to offer
+zero-data-retention (it may retain or train on submitted input) is refused at
+every NEW dispatch (`TEAM_ROUTE_PRIVACY_UNVERIFIED`), whether the task is READ
+or WRITE and regardless of the allowlist. `opencode-go/gemini-4-argon-contributor`
+is such a route for this build. CAO performs no automated provider-privacy
+classification, and this product adapter cannot technically prove that a
+checkout or prompt is clean public OSS or sanitized. The admission gate the
+route would require is therefore **unfulfilled**: an explicit operator-local
+public-repository restriction (never a prompt, and never hardcoded hosts or
+paths), a verified clean checkout, a READ-only mode and a declared owner
+qualification. Until such a proof is technically available the route stays
+unavailable, and the operator must never route private, client, tenant or
+secret material to it.
+
 ### Qualification states
 
 - **TEMPORARY.** Until the headless Codex transport is verified, the designated

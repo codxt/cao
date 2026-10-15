@@ -32,6 +32,26 @@ foreign, spoofed or missing agent kind or provider CLI is refused
 (`TEAM_ROUTE_IDENTITY_MISMATCH`) instead of dispatching on another runtime,
 even when the provider model and the verified argv `--model` look allowed.
 
+A listed `codex/` model id binds a Codex agent-profile route the same way: a
+native `--model` token resolves to the canonical allowlist identity
+`<provider>/<model>` (for example a native `--model gpt-6.1-sol` under
+`agent_kind`/`provider.cli` `codex` is `codex/gpt-6.1-sol`), the resolved agent
+kind and provider CLI must both be `codex`, and exactly one unambiguous
+`--model` is required. A repeated, flag-trapped, divergent or unlisted
+selection is unresolved and refused. A Codex route is READ-only: any dispatch
+bound to the Codex runtime — by its `codex/` identity or by its resolved agent
+kind / provider CLI — reached for a WRITE task is refused
+(`TEAM_ROUTE_READ_ONLY`) and is never escalated into a writer, and Medium/High
+effort variants differ only by the bounded `-c model_reasoning_effort=…`
+switch, so they share the base identity.
+
+An allowlisted model id whose provider is known not to offer
+zero-data-retention is refused at every NEW dispatch
+(`TEAM_ROUTE_PRIVACY_UNVERIFIED`), because this build cannot technically prove
+that a checkout or prompt is clean public OSS or sanitized. See the
+non-zero-data-retention note in docs/automatic-recovery.md; never route private,
+client, tenant or secret material to such a route.
+
 Example (replace checkout paths and illustrative model identifiers):
 
     {
@@ -422,10 +442,10 @@ than replacing its registry, provider or managed fields):
       "agent_kind": "claude",
       "read_args": ["--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]
     },
-    "codex_dev": {
+    "codex_review": {
       "agent_kind": "codex",
-      "read_args": ["--model", "gpt-example", "--sandbox", "read-only"],
-      "write_args": ["--model", "gpt-example", "--sandbox", "workspace-write"]
+      "read_args": ["--model", "gpt-example", "-c",
+                    "model_reasoning_effort=medium", "--sandbox", "read-only"]
     },
     "gemini_read": {"agent_kind": "gemini", "read_args": []}
   }

@@ -392,6 +392,12 @@ def _new_dispatch_possible(record: Mapping[str, Any]) -> bool:
     return any(slot["status"] == "pending" for slot in record["slots"].values())
 
 
+def _phase_mode(task: Mapping[str, Any], phase: str) -> str:
+    """The effective task mode one phase dispatches (a review is always READ)."""
+
+    return "read" if phase == "review" or task["mode"] == "read" else "write"
+
+
 def _verify_model_policy(config: product_config.ProductConfig | None,
                          spec: Mapping[str, Any], *,
                          bound: Mapping[str, Any] | None = None) -> None:
@@ -419,11 +425,13 @@ def _verify_model_policy(config: product_config.ProductConfig | None,
         for phase, permitted in entry.items():
             if not permitted:
                 # The exact route is reported with its real refusal code (a
-                # model that is not listed, or an allowlisted OpenCode model
-                # id reached through a foreign runtime identity) and never
-                # with a generic claim.
+                # model that is not listed, an allowlisted model id reached
+                # through a foreign runtime identity, a read-only runtime
+                # reached for WRITE, or a non-zero-data-retention provider)
+                # and never with a generic claim.
                 reason = product_config.model_policy_error(
-                    bound["routes"][task_id][phase], policy)
+                    bound["routes"][task_id][phase], policy,
+                    mode=bound["modes"][task_id][phase])
                 raise TeamAdmissionError(
                     f"team route {task_id}/{phase}: "
                     f"{reason or 'TEAM_MODEL_NOT_ALLOWED'}")
@@ -442,12 +450,18 @@ def _dispatchable_routes(config: product_config.ProductConfig,
     routes = _effective_routes(config, spec)
     policy = product_config.team_model_policy(config)
     allowed: dict[str, dict[str, bool]] = {}
+    modes: dict[str, dict[str, str]] = {}
+    tasks = {task["id"]: task for task in spec["tasks"]}
     for task_id, entry in routes.items():
-        allowed[task_id] = {
-            phase: product_config.model_policy_error(route, policy) is None
-            for phase, route in entry.items()
-        }
-    return {"routes": routes, "allowed": allowed}
+        allowed[task_id] = {}
+        modes[task_id] = {}
+        for phase, route in entry.items():
+            mode = _phase_mode(tasks[task_id], phase)
+            modes[task_id][phase] = mode
+            allowed[task_id][phase] = (
+                product_config.model_policy_error(route, policy, mode=mode)
+                is None)
+    return {"routes": routes, "allowed": allowed, "modes": modes}
 
 
 def _verify_admission(record: Mapping[str, Any],
