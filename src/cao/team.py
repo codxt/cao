@@ -1349,6 +1349,59 @@ def _recovery_claim_row(db: str, claim_id: int) -> dict[str, Any] | None:
     }
 
 
+def _foreign_recovery_write_claim(db: str, *, claim_id: int,
+                                  run_id: str, work_key: str, owner: str,
+                                  claim: Mapping[str, Any] | None,
+                                  repo: str) -> bool:
+    """Inspect individual open rows; only the exact original WRITE is self.
+
+    A path-set subtraction would hide a second, foreign claim on the same
+    checkout. This is a read-only diagnostic and never authorizes WRITE
+    recovery or claim release.
+    """
+    try:
+        conn = registry.connect_readonly(db)
+        try:
+            rows = conn.execute(
+                "SELECT claim_id, run_id, work_key, owner, mode, branch, worktree "
+                "FROM claims WHERE released_at IS NULL "
+                "AND mode IN ('WRITE','EXCLUSIVE')"
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, ValueError, sqlite3.Error, registry.RegistryError) as exc:
+        raise TeamError("authoritative Registry recovery occupancy unavailable") from exc
+
+    checkout = os.path.realpath(repo)
+    expected_branch = claim.get("base_branch") if isinstance(claim, Mapping) else None
+    original_verified = (
+        isinstance(claim, Mapping)
+        and type(claim.get("claim_id")) is int
+        and claim["claim_id"] == claim_id
+        and claim.get("mode") == "WRITE"
+        and isinstance(expected_branch, str)
+        and bool(expected_branch)
+    )
+    for row in rows:
+        if row["mode"] == "EXCLUSIVE":
+            return True
+        worktree = row["worktree"]
+        if not isinstance(worktree, str) or not worktree:
+            raise TeamError("open Registry writer has no verifiable checkout")
+        if (original_verified
+                and row["claim_id"] == claim_id
+                and row["run_id"] == run_id
+                and row["work_key"] == work_key
+                and row["owner"] == owner
+                and row["mode"] == "WRITE"
+                and row["branch"] == expected_branch
+                and os.path.realpath(worktree) == checkout):
+            continue
+        if os.path.realpath(worktree) == checkout:
+            return True
+    return False
+
+
 def _recovery_evidence(team_id: str, task: Mapping[str, Any],
                        slot: Mapping[str, Any], *, driver: Any, db: str,
                        head_reader: Callable[[str], str | None] | None,
@@ -1443,7 +1496,17 @@ def _recovery_evidence(team_id: str, task: Mapping[str, Any],
             snapshot["registry_claim"] = _recovery_claim_row(db, snapshot["claim_id"])
         except TeamError:
             snapshot["registry_unreadable"] = True
-        if occupancy is not None:
+        if mode == "WRITE":
+            try:
+                snapshot["checkout_conflict"] = _foreign_recovery_write_claim(
+                    db, claim_id=snapshot["claim_id"],
+                    run_id=snapshot["expected_run_id"],
+                    work_key=snapshot["expected_work_key"],
+                    owner=snapshot["expected_owner"],
+                    claim=durable_claim, repo=task["repo"])
+            except TeamError:
+                snapshot["registry_unreadable"] = True
+        elif occupancy is not None:
             try:
                 _, working = occupancy(db)
             except TeamError:
@@ -1517,7 +1580,18 @@ def _apply_recovery(team_id: str, record: dict[str, Any], *,
         existing = decisions.get(task["id"])
         if (isinstance(existing, Mapping)
                 and existing.get("fingerprint") == digest
-                and isinstance(existing.get("at"), str)):
+                and isinstance(existing.get("at"), str)
+                and all(
+                    existing.get(key) == value
+                    if key != "provenance" else (
+                        isinstance(existing.get(key), Mapping)
+                        and {k: v for k, v in existing.get(key, {}).items()
+                             if k != "timestamp"}
+                        == {k: v for k, v in value.items() if k != "timestamp"})
+                    for key, value in decision.items())):
+            # A saved receipt preserves its timestamp, not execution authority.
+            # Only the capture timestamp may advance between observations; any
+            # other drift means the evidence changed and the receipt restamps.
             stored = existing
         else:
             stored = dict(decision)
@@ -1533,8 +1607,10 @@ def _apply_recovery(team_id: str, record: dict[str, Any], *,
             "next_action": stored.get("next_action"),
             "execution_id": stored.get("execution_id"),
         })
-        if (stored.get("auto_resume")
-                and stored.get("decision") == team_recovery.RESUME_READ):
+        if (decision.get("auto_resume") is True
+                and decision.get("decision") == team_recovery.RESUME_READ
+                and (slot["phase"] == "review" or task["mode"] == "read")):
+            # Only the freshly classified READ execution may be resumed.
             _resume_unknown_slot(record, task["id"])
             slot["progress_at"] = evidence.utc_now(clock)
             if isinstance(execution_id, str):
