@@ -1058,6 +1058,104 @@ class ReconciliationTests(DaemonCase):
             (supervision[old_id], supervision[new_id])
         ))
 
+    def test_review_read_retry_preserves_current_and_historical_team_ownership(
+            self) -> None:
+        """A retried review stage keeps its original attempt historical.
+
+        Regression for a review READ retry whose previous attempt is stopped
+        (abandon-released) and whose successor is complete (released): neither
+        may be reported as HELD_UNKNOWN, and both exact deterministic
+        identities must resolve to their current/historical lanes.
+        """
+        team_id = "cao-step5-read-gate-20261016"
+        spec = {
+            "schema": "cao.team.v1", "team_id": team_id,
+            "max_parallel": 1, "max_writers": 1,
+            "roles": {
+                "writer": {"instruction": "Scoped implementation."},
+                "reviewer": {"instruction": "READ-only review."},
+            },
+            "tasks": [{
+                "id": "step5-read-enforcement", "role": "writer",
+                "repo": str(self.repo), "mode": "write",
+                "write_scope": ["a.txt"], "prompt": "Make one bounded change",
+                "reviewer": "reviewer", "max_corrections": 0,
+            }],
+        }
+        team.initialize(spec, env=self.env)
+        old_id = team._execution_id(
+            team_id, "step5-read-enforcement", "review", 0)
+        new_id = team._execution_id(
+            team_id, "step5-read-enforcement", "review", 0, 1)
+        # Exact identities observed in production for this retried review.
+        self.assertEqual(
+            old_id,
+            "ct-cao-step5-read-gate-20261016-step5-read-enforcement-review-0-"
+            "674ac19ba453d55251a5")
+        self.assertEqual(
+            new_id,
+            "ct-cao-step5-read-gate-20261016-step5-read-enforcement-review-0-"
+            "6f5e802f16484301984c")
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            text=True).strip()
+        # The stage advanced to a bounded retry: attempt0 stopped, attempt1
+        # complete; the checkpoint points at the retried identity only.
+        checkpoint = team._required(team_id, self.env)
+        checkpoint["slots"]["step5-read-enforcement"].update(
+            phase="review", round=0, status="complete",
+            execution_id=new_id, retry_no=1, head=head,
+            prompt="bounded review retry")
+        checkpoint["desired"] = "paused"
+        team._save(checkpoint, self.env)
+        team._required(team_id, self.env)  # validate the exact checkpoint
+        owners = product_daemon._team_execution_owners(self.env)
+        self.assertEqual(owners[old_id], (team_id, "historical"))
+        self.assertEqual(owners[new_id], (team_id, "current"))
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA, "task_id": old_id,
+            "run_id": "cao-team-" + team_id, "status": "stopped",
+            "updated_at": "2026-10-16T00:00:00Z",
+        }, self.env)
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA, "task_id": new_id,
+            "run_id": "cao-team-" + team_id, "status": "complete",
+            "updated_at": "2026-10-16T00:00:01Z",
+        }, self.env)
+        driver = FakeDriver()
+        daemon = self.build(driver)
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("team task was re-driven")):
+            first = daemon.tick()
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        self.assertEqual(supervision[old_id]["action"], "team_historical")
+        self.assertEqual(supervision[old_id]["status"], "stopped")
+        self.assertTrue(supervision[old_id]["terminal"])
+        self.assertEqual(supervision[new_id]["action"], "team_owned")
+        self.assertEqual(supervision[new_id]["status"], "complete")
+        self.assertNotEqual(supervision[old_id]["status"], "HELD_UNKNOWN")
+        self.assertNotEqual(supervision[new_id]["status"], "HELD_UNKNOWN")
+        self.assertFalse(any(
+            effect.get("action") == "team_ownership_hold"
+            for effect in first["effects"]))
+
+    def test_missing_team_checkpoint_refuses_review_retry_ownership(self) -> None:
+        # A review-shaped retry identity with no readable team checkpoint is
+        # never granted ownership; both attempts stay fail-closed UNKNOWN.
+        team_id = "cao-step5-read-gate-20261016"
+        old_id = team._execution_id(
+            team_id, "step5-read-enforcement", "review", 0)
+        new_id = team._execution_id(
+            team_id, "step5-read-enforcement", "review", 0, 1)
+        owners = product_daemon._team_execution_owners(self.env)
+        self.assertNotIn(old_id, owners)
+        self.assertNotIn(new_id, owners)
+        for ident in (old_id, new_id):
+            lane = product_daemon._task_owner_lane(
+                {"task_id": ident, "run_id": "cao-team-" + team_id}, owners)
+            self.assertEqual(lane, "unknown")
+
     def test_prior_review_and_correction_stages_preserve_team_ownership(self) -> None:
         # A reviewer/correction team retains durable per-phase task records
         # after the current checkpoint has moved on. Old complete stages are

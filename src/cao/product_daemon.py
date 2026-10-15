@@ -131,6 +131,10 @@ def _team_execution_owners(
                     ("review", r, 0)
                     for r in range(task["max_corrections"] + 1)
                 )
+                # A review is a READ execution too, so its admitted retry is a
+                # distinct identity at the same stage/round as the original.
+                if retry_no and slot["phase"] == "review":
+                    candidates.append(("review", slot["round"], retry_no))
                 candidates.extend(
                     ("correction", r, 0)
                     for r in range(1, task["max_corrections"] + 1)
@@ -146,7 +150,9 @@ def _team_execution_owners(
                     "current" if execution_id == slot["execution_id"]
                     else "historical" if (
                         stage_position < current_position
-                        or (phase == "work" and attempt < retry_no)
+                        # A previous attempt at the *current* stage/round is
+                        # historical; unlaunched later stages stay unlaunched.
+                        or (phase == slot["phase"] and attempt < retry_no)
                     )
                     else "unlaunched"
                 )
