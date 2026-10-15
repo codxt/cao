@@ -1,7 +1,7 @@
-# Intake roadmap (B3–B6): governed request intake
+# Intake roadmap (B3–B7): governed request intake
 
 > **Document status.** Accepted **owner plan** for the governed intake middle
-> (B3–B6). **B3 is implemented in source** (`src/cao/intake_triage.py`,
+> (B3–B7). **B3 is implemented in source** (`src/cao/intake_triage.py`,
 > `tests/test_intake_triage.py`), **merged to the default branch and
 > independently accepted**. **B4 is implemented in source**
 > (`src/cao/intake_compile.py`, `tests/test_intake_compile.py`) and is reported
@@ -13,8 +13,13 @@
 > (`src/cao/intake_handoff.py`, `tests/test_intake_handoff.py`) and is likewise
 > reported as `SOURCE_COMPLETE`; it is `PLAN_ONLY` in this build because the
 > authenticated operator identity gate is absent, and its independent acceptance
-> is a separate, later state and is not claimed here. B4, B5 and B6 are **not**
-> promoted past the state the repository actually records.
+> is a separate, later state and is not claimed here. **B7 is implemented in
+> source** (`src/cao/intake_queue.py`, `tests/test_intake_queue.py`) and is
+> likewise reported as `SOURCE_COMPLETE`; it is **default-disabled**, it adds no
+> operator-authority adapter, and its first dispatch is `HOLD` in this build,
+> while an already-approved immutable READ team can be re-verified and advanced.
+> B4, B5, B6 and B7 are **not** promoted past the state the repository actually
+> records.
 
 > **Owner.** The CAO repository owner. Shared-contract changes and anything
 > beyond the stated scope require an accountable integration decision, exactly as
@@ -472,7 +477,76 @@ boundaries in `tests/test_boundaries.py`.
 review proving the eligibility is source-attested, the operator gate is the only
 path to a dispatch, and no held, planned or refused handoff has any effect.
 
-## 8. Dependencies and gates
+## 8. Phase B7 — durable Intake execution queue
+
+**Status: implemented in source (`SOURCE_COMPLETE`); default-disabled. First
+dispatch is `HOLD` in this build; an already-approved immutable READ team may be
+re-verified and advanced. Independent acceptance pending.**
+
+**Goal.** Give the governed middle a durable, opt-in **queue** without adding a
+scheduler, a service, a database, a second ledger, a second Registry or a
+credential: remember bounded, prequalified, source-bound READ intents and
+reconcile them on the **existing** daemon tick into the **existing** CAO team
+owner API.
+
+**Implemented surface.** `src/cao/intake_queue.py`, the configuration key
+`daemon.intake_queue` (boolean, default `false`) and the CLI `cao intake queue
+enqueue|list|show`. The existing daemon owns reconciliation: when, and only
+when, `daemon.intake_queue` is `true`, its own tick calls
+`intake_queue.tick`. No new loop, timer, thread, socket or wake path exists.
+
+**Admission is evidence, not authority.** The queue derives the intent from B6:
+only a request B6 derives as `ELIGIBLE_READ` with a readable exact source
+ref/HEAD is queued; everything else is reported and persists nothing. An intent
+records an immutable binding (submission id/fingerprint, B3 packet
+id/fingerprint, B6 plan id/digest, source repo/ref/head, the derived immutable
+team/task ids) and a deterministic, derived decision/exception receipt. A queue
+intent is **never** its own approval.
+
+**Authority.** The only path that creates new work is an **in-process**
+authenticated operator-authority adapter (the B6 `operator_authority` contract).
+A CLI flag, an environment value or a JSON file is caller-controlled and is
+never proof. This build ships no such adapter and the daemon constructs none, so
+a first dispatch is held with the exact missing integration. A persisted,
+already-approved immutable CAO team bound to an intent may re-verify and advance
+PAUSED -> RUNNING only after its approval/spec digest, Intake binding, exact
+source HEAD and dependency terminal evidence are all re-validated; the
+revalidation is delegated to `team.set_desired`, so a forged manifest or
+approval string is never trusted.
+
+**Gates, isolation and bounds.** A changed Intake binding, a moved HEAD, an
+unmet, missing or cyclic dependency, an unreadable Work Registry or an
+independent overlapping Registry claim holds **that item only**. Items are
+ordered by priority, then age, then id; at most `ADVANCES_PER_TICK` (one) item
+advances per pass and held items never consume that budget. Two concurrent
+passes are serialized by a kernel lock; the loser reports `LOCKED`. A corrupt
+record or a changed content digest fails the whole pass closed. A held,
+queued or refused intent creates no team, no agent and no Registry claim.
+
+**Explicitly not in B7.** No scheduler, service, database, second ledger,
+second Registry, coordinator, credential, network egress, provider or LLM
+authority. No WRITE, new corrective batch, PR/CI/merge/deploy, credential,
+permission change or canonical acceptance is ever dispatched by the queue. B7
+does **not** claim unattended portfolio management.
+
+**Tests (synthetic only).** `tests/test_intake_queue.py` is the runnable check
+and covers forge/replay, tamper and a corrupt private store, a stale source
+head, a changed binding, missed/cyclic dependencies, duplicate execution and
+crash-restart idempotency, concurrent passes, the absence of any authority
+(CLI, environment or JSON) and of any model/privacy qualification, self-blocking
+isolation with priority fairness, a bounded budget, the auto-advance of an
+already-approved team and the refusal of a forged approval, the daemon opt-in
+(default disabled) and zero team/Registry mutation while held;
+`tests/test_boundaries.py` additionally guards that the queue reaches the
+Registry read-only, opens no egress surface, uses no shell and starts a team
+only from its single advance path.
+
+**Acceptance gate.** B7 is accepted only after B6 acceptance, on independent
+review proving the intent binds the exact source and evidence, the daemon owns
+reconciliation, no queue intent grants authority, and no held, queued or refused
+intent has any effect.
+
+## 9. Dependencies and gates
 
 ```text
 B2 final security approval
@@ -484,6 +558,8 @@ B2 final security approval
   → B5 independent acceptance    [pending]
   → B6 implementation            [done: SOURCE_COMPLETE; PLAN_ONLY]
   → B6 independent acceptance    [pending]
+  → B7 implementation            [done: SOURCE_COMPLETE; default-disabled]
+  → B7 independent acceptance    [pending]
 ```
 
 - No phase begins before the **previous gate is accepted**. B3's independent
@@ -501,7 +577,7 @@ B2 final security approval
   test suites. Git, CI and release state are verified **separately** — a commit
   is not a merge, a merge is not a deploy, and a deploy is not live acceptance.
 
-## 9. Completion-state vocabulary
+## 10. Completion-state vocabulary
 
 Five distinct states, never collapsed:
 
@@ -516,7 +592,7 @@ Five distinct states, never collapsed:
 Reports must name the exact state reached and must not promote a lower state to
 a higher one.
 
-## 10. Pilot and acceptance criteria; smallest first steps
+## 11. Pilot and acceptance criteria; smallest first steps
 
 **Pilot posture.** Every phase is piloted **synthetic-only**: invented
 submissions, invented repos, invented identities. No real client or private
@@ -545,13 +621,18 @@ payload is used in a pilot or a test.
    and one gated, idempotent READ handoff plan. **Done (`SOURCE_COMPLETE`);
    `PLAN_ONLY`,** because the authenticated operator identity gate is absent; no
    held, planned or refused handoff has any effect.
+9. **B7 durable execution queue** — remember prequalified READ intents and
+   reconcile them, opt-in, on the existing daemon tick. **Done
+   (`SOURCE_COMPLETE`);** default-disabled, first dispatch held (the
+   authenticated operator identity gate is still absent), and an
+   already-approved immutable READ team is re-verified before it advances.
 
 **Acceptance criteria per phase:** full normal and `-S` test suites pass; the
 phase's tests pass; the foundation CLI smoke passes; `git diff --check` is
 clean; an independent reviewer confirms the phase's evidence and the absence of
 disallowed effects.
 
-## 11. Doctrine admission gate
+## 12. Doctrine admission gate
 
 Before any future cross-project work-admission doctrine change is made, the
 implementation must first rehearse a **synthetic standing-Plan** end to end:
@@ -559,15 +640,19 @@ proposal → matched accepted Plan/work package → compiled manifest → derive
 status. Only after that rehearsal passes may a doctrine change be proposed.
 This roadmap makes **no** doctrine change itself.
 
-## 12. Explicit non-goals
+## 13. Explicit non-goals
 
-B3–B6 do **not** introduce: a universal task database; a new authority concept;
-a dispatcher, scheduler or queue; a second Registry or a second ledger; a custom
-marketplace MCP server; a presumed external status API; automatic execution on
-intake; automatic or unapproved outbound messaging; or any fabricated
-completion, sent or closed state.
+B3–B6 do **not** introduce a universal task database, a new authority concept,
+a dispatcher, scheduler or queue, a second Registry or a second ledger, a custom
+marketplace MCP server, a presumed external status API, automatic execution on
+intake, automatic or unapproved outbound messaging, or any fabricated
+completion, sent or closed state. **B7** adds the one deliberate, separately
+gated exception: an **opt-in, default-disabled** durable queue of prequalified
+READ intents, reconciled by the existing daemon and holding every first dispatch
+behind an in-process authenticated operator authority. It introduces no new
+authority concept, no scheduler, no second Registry and no second ledger.
 
-## 13. Open questions and research debt
+## 14. Open questions and research debt
 
 - **Request/event intake remains research debt.** The shape of a generic
   request/event intake beyond the current operator submission is unsettled.
@@ -584,7 +669,7 @@ completion, sent or closed state.
 - **B3 provider path is unbuilt.** The AI triage step stays behind the provider
   privacy gate and is not implemented in this build.
 
-## 14. Provenance
+## 15. Provenance
 
 | Item | Source | Standing |
 |---|---|---|
@@ -594,11 +679,12 @@ completion, sent or closed state.
 | B4 routing compiler | `src/cao/intake_compile.py`, `tests/test_intake_compile.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
 | B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
 | B6 governed execution handoff | `src/cao/intake_handoff.py`, `tests/test_intake_handoff.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; `PLAN_ONLY` (no authenticated operator gate); acceptance pending |
+| B7 durable Intake execution queue | `src/cao/intake_queue.py`, `tests/test_intake_queue.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; **opt-in, default-disabled**; first dispatch held (no authenticated operator gate); acceptance pending |
 | Team Execution manifest `cao.team.v1` | `docs/team-execution.md` | shipped |
 | Performer/authority/evidence semantics | owner's cross-project work-execution contract (owner-referenced v0.4) | owner planning reference; re-verify against canonical home |
 | B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending; the owner plan below is its authority, not operating fact |
 
-## 15. Navigation
+## 16. Navigation
 
 - Current shipped intake contract: [`docs/intake.md`](intake.md)
 - Team execution contract: [`docs/team-execution.md`](team-execution.md)

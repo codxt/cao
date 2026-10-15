@@ -770,6 +770,10 @@ class DaemonDefaults:
     feedback_watch_file: str | None = None
     engineering_watch_file: str | None = None
     engineering_queue_dir: str | None = None
+    #: Opt-in, default-disabled: the existing daemon reconciles the B7 durable
+    #: Intake execution queue on its own tick. It defaults to ``False`` so a
+    #: fresh or unconfigured product performs no Intake reconciliation at all.
+    intake_queue: bool = False
 
 
 def daemon_defaults(
@@ -832,10 +836,14 @@ def daemon_defaults(
         raise ProductConfigError("daemon.engineering_queue_dir must be a normalized absolute path")
     if queue_dir is not None and engineering_watch is not None:
         raise ProductConfigError("choose one engineering watch or engineering queue")
+    intake_queue = raw.get("intake_queue", False)
+    if type(intake_queue) is not bool:
+        raise ProductConfigError("daemon.intake_queue must be true or false")
     return DaemonDefaults(
         engineering_queue_dir=queue_dir,
         engineering_watch_file=engineering_watch,
         feedback_watch_file=watch,
+        intake_queue=intake_queue,
         tick_interval=interval,
         min_tick_interval=min_interval,
         max_tick_interval=max_interval,

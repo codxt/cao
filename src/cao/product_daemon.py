@@ -925,6 +925,40 @@ class Daemon:
                     "action": "engineering_queue_hold", "status": "UNKNOWN",
                     "reason": getattr(exc, "code", type(exc).__name__),
                 })
+        # The opt-in B7 Intake execution queue reuses this same daemon tick and
+        # the existing CAO team owner API. It adds no scheduler and no second
+        # ledger. No in-process authenticated operator authority is available
+        # inside the daemon, so it may only re-verify and start an already
+        # approved immutable READ team; a first dispatch is held with an
+        # explicit, actionable exception and mutates nothing.
+        if self._config is not None and self._defaults.intake_queue:
+            from . import intake_queue
+            try:
+                queue_report = intake_queue.tick(
+                    env=self._env, clock=self._clock,
+                    registry_db=self._registry_db,
+                )
+                for item in queue_report["items"]:
+                    effects.append({
+                        "action": "intake_queue",
+                        "intent_id": item["intent_id"],
+                        "status": item["status"],
+                        "decision": item["decision"],
+                        "reason": item.get("reason"),
+                    })
+                engineering_exceptions.extend(queue_report.get("exceptions") or [])
+                if queue_report["status"] == "LOCKED":
+                    effects.append({
+                        "action": "intake_queue_hold", "status": "UNKNOWN",
+                        "reason": "INTAKE_QUEUE_BUSY",
+                    })
+            except (intake_queue.QueueError, StateError, OSError, ValueError,
+                    TypeError, UnicodeError) as exc:
+                record["errors"] = int(record.get("errors") or 0) + 1
+                effects.append({
+                    "action": "intake_queue_hold", "status": "UNKNOWN",
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                })
         # Teams reuse this daemon and the existing Registry/task runner. No
         # second wake daemon, queue or WRITE authority is introduced.
         if self._config is not None and self._driver is not None:
