@@ -104,7 +104,18 @@ is never escalated into a writer; a Codex agent profile that declares no
 reasoning-effort profiles share one model
 and differ only by the bounded `-c model_reasoning_effort=medium` / `high`
 switch, so both resolve the same base identity. The pre-existing OpenCode
-routes and their role-profile invariants are unchanged.
+routes and their role-profile invariants are otherwise unchanged.
+
+#### Read-only Step-5 Preview Free route
+
+The canonical owner policy additionally restricts the Step-5 Preview Free base
+model id to privacy-qualified READ. Under a configured allowlist, a dispatch
+whose resolved base model is `opencode/step-5-preview-free` — reached through
+its canonical identity, the bare `--model` token, a non-canonical spelling, a
+foreign provider prefix or a bounded `#effort` variant — is refused for a WRITE
+task (`TEAM_ROUTE_READ_ONLY`) before any Registry claim or agent effect, so no
+alias spelling or provider prefix restores write access. The route is
+READ-admitted as before, and every other OpenCode route keeps both modes.
 
 #### Non-zero-data-retention providers
 

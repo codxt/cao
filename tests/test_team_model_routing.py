@@ -9,7 +9,9 @@ Pins the fail-closed additions to the optional ``team_model_allowlist`` gate:
 * the Gemini Argon Contributor route is known not to be zero-data-retention
   and is refused at every NEW dispatch, because the clean-public-input
   admission gate this build requires is not technically verifiable;
-* every pre-existing OpenCode route keeps its exact behavior.
+* the canonical Step-5 Preview Free route is READ-only under a configured
+  allowlist, and every pre-existing other OpenCode route keeps its exact
+  behavior.
 """
 import tempfile
 import unittest
@@ -235,10 +237,70 @@ class NonZdrRouteTests(unittest.TestCase):
             "TEAM_ROUTE_PRIVACY_UNVERIFIED")
 
 
+class Step5PreviewFreeReadOnlyTests(unittest.TestCase):
+    """The canonical owner policy restricts Step-5 Preview Free to READ.
+
+    The route may read its own bounded checkout but must never be escalated
+    into a writer; a WRITE or absent/unknown mode is refused before any claim
+    or agent effect, and no alias spelling or provider prefix restores write.
+    """
+
+    ROUTE = "opencode/step-5-preview-free"
+
+    def selected(self, pol, model, mode="read", cli="opencode",
+                 kind="opencode"):
+        args = ["mini", "--standalone", "--model", model]
+        return product_config.model_policy_error(
+            route(kind, cli, model, args), pol, mode=mode)
+
+    def test_read_is_admitted_including_bounded_effort_variants(self):
+        pol = policy([self.ROUTE])
+        for model in (self.ROUTE, self.ROUTE + "#high", self.ROUTE + "#xhigh"):
+            with self.subTest(model=model):
+                self.assertIsNone(self.selected(pol, model, "read"))
+
+    def test_write_and_unknown_mode_are_refused_closed(self):
+        pol = policy([self.ROUTE])
+        for model in (self.ROUTE, self.ROUTE + "#high"):
+            for mode in ("write", None):
+                with self.subTest(model=model, mode=mode):
+                    self.assertEqual(self.selected(pol, model, mode),
+                                     "TEAM_ROUTE_READ_ONLY")
+
+    def test_alias_spelling_or_foreign_prefix_cannot_restore_write(self):
+        # A bare token qualified by the runtime CLI, a non-canonical casing and
+        # a foreign-prefixed alias all resolve to the same restricted base
+        # model: each is READ-admitted and each WRITE dispatch stays refused.
+        for listed, model, cli in (
+                (self.ROUTE, "step-5-preview-free", "opencode"),
+                ("opencode/Step-5-Preview-Free",
+                 "opencode/Step-5-Preview-Free", "opencode"),
+                ("claude/step-5-preview-free",
+                 "claude/step-5-preview-free", "claude")):
+            with self.subTest(model=model):
+                pol = policy([listed])
+                self.assertIsNone(self.selected(pol, model, "read", cli=cli))
+                self.assertEqual(
+                    self.selected(pol, model, "write", cli=cli),
+                    "TEAM_ROUTE_READ_ONLY")
+
+    def test_other_opencode_routes_keep_write(self):
+        routes = ("opencode-go/glm-5.3-flash",
+                  "opencode-go/deepseek-v4.1-flash")
+        pol = policy(routes)
+        for model in routes:
+            with self.subTest(model=model):
+                self.assertIsNone(self.selected(pol, model, "write"))
+
+
 class OpenCodeRoutesUnchangedTests(unittest.TestCase):
     def test_owner_routes_resolve_for_read_and_write(self):
-        pol = policy(OPENCODE_ROUTES)
-        for selected in OPENCODE_ROUTES:
+        # The pre-existing OpenCode routes other than the READ-only Step-5
+        # Preview Free route keep both modes.
+        routes = ("opencode-go/glm-5.3-flash",
+                  "opencode-go/deepseek-v4.1-flash")
+        pol = policy(routes)
+        for selected in routes:
             for mode in ("read", "write"):
                 args = ["mini", "--standalone", "--model", selected]
                 with self.subTest(route=selected, mode=mode):
@@ -358,6 +420,37 @@ class TeamCodexRoutingTests(unittest.TestCase):
                             approved=True)
         self.assertIn("TEAM_ROUTE_PRIVACY_UNVERIFIED", str(caught.exception))
         self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_step5_read_role_is_admitted_and_bound(self):
+        self.raw["team_model_allowlist"] = ["opencode/step-5-preview-free"]
+        self.configure()
+        spec = self.read_spec("step5-read", "step5_reader")
+        spec["roles"]["reviewer"] = {"instruction": "Inspect source",
+                                     "model": "opencode/step-5-preview-free"}
+        record = team.initialize(spec, env=self.env, config=self.config,
+                                 approved=True)
+        self.assertEqual(record["status"], "PAUSED")
+        bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
+        self.assertIs(bound["allowed"]["read"]["work"], True)
+
+    def test_step5_write_role_is_refused_before_any_effect(self):
+        # The canonical policy restricts Step-5 Preview Free to READ, so a
+        # team WRITE task bound to it is refused at initialization with no
+        # team, Registry claim or agent effect, exactly like the Codex route.
+        self.raw["team_model_allowlist"] = ["opencode/step-5-preview-free",
+                                            "opencode/default"]
+        self.configure()
+        spec = self.write_spec("step5-write")
+        spec["roles"]["worker"] = {"instruction": "Implement the change",
+                                   "model": "opencode/step-5-preview-free"}
+        with self.assertRaises(team.TeamAdmissionError) as caught:
+            team.initialize(spec, env=self.env, config=self.config,
+                            approved=True)
+        self.assertIn("TEAM_ROUTE_READ_ONLY", str(caught.exception))
+        self.assertEqual(team.list_teams(env=self.env), [])
+        bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
+        self.assertIs(bound["allowed"]["impl"]["work"], False)
+        self.assertIs(bound["allowed"]["impl"]["review"], True)
 
 
 if __name__ == "__main__":

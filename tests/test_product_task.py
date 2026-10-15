@@ -1570,6 +1570,47 @@ class TeamModelPolicyTests(TaskCase):
         self.assertEqual(payload["status"], "running")
         self.assertEqual(driver.names().count("agent_start"), 1)
 
+    def test_step5_write_task_is_refused_with_zero_effects(self):
+        # The canonical policy restricts Step-5 Preview Free to READ: a direct
+        # WRITE task bound to it is refused before any Registry claim, leaving
+        # zero claim rows and no workspace, pane or agent effect.
+        write_repo = git_repo(self.root, name="step5-write", files=("a.txt",))
+        config = self.policy_config(["opencode/step-5-preview-free"])
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(write_repo), prompt="Edit a.txt",
+            mode="write", write_scope=("a.txt",), config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["stage"], "model_policy")
+        self.assertEqual(payload["refusal"]["errors"], ["TEAM_ROUTE_READ_ONLY"])
+        self.assertEqual(driver.names(), [])
+        self.assertIsNone(payload["claim"])
+        self.assertEqual(self.claim_rows(), [])
+
+    def test_step5_write_effort_variant_is_refused(self):
+        # A bounded #effort variant never changes the base route, so it cannot
+        # restore write access to the READ-only Step-5 Preview Free route.
+        write_repo = git_repo(self.root, name="step5-effort",
+                              files=("a.txt",))
+        selected = "opencode/step-5-preview-free#high"
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": selected},
+            "task": {"agent_args": ["mini", "--standalone",
+                                    "--model", selected]},
+            "team_model_allowlist": ["opencode/step-5-preview-free"],
+        })
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(write_repo), prompt="Edit a.txt",
+            mode="write", write_scope=("a.txt",), config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["errors"], ["TEAM_ROUTE_READ_ONLY"])
+        self.assertEqual(driver.names(), [])
+        self.assertEqual(self.claim_rows(), [])
+
     def test_effort_suffix_is_accepted_as_an_effort_variant(self):
         # A fleet configured at base effort admits the same base id carrying an
         # accepted #effort variant; the variant is never a different route.
