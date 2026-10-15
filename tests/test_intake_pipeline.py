@@ -98,11 +98,24 @@ class PipelineCase(unittest.TestCase):
         os.chmod(self.protected, 0o755)
 
     # -- fixtures ------------------------------------------------------------
-    def submit(self, item_id: str, body: str = _READ_REQUEST) -> str:
+    def submit(self, item_id: str, body: str = _READ_REQUEST, clock=None) -> str:
         return intake.submit(
             {"schema": intake.REQUEST_SCHEMA, "item_id": item_id, "body": body,
-             "title": "synthetic", "source": "operator"}, env=self.env,
+             "title": "synthetic", "source": "operator"},
+            env=self.env, clock=clock,
         )["submission"]["submission_id"]
+
+    @staticmethod
+    def admitted(offset: int):
+        """A pinned admission instant for ``intake.submit``.
+
+        ``admitted_at`` is second-precision, so submission order alone never
+        proves chronological order; a test states the durable admission times
+        it expects discovery to honor.
+        """
+        moment = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(
+            seconds=offset)
+        return lambda: moment
 
     def write_grant(self, **overrides) -> str:
         document = grant_document(self.repo_real, **overrides)
@@ -125,9 +138,13 @@ class PipelineCase(unittest.TestCase):
 
 class DiscoveryTests(PipelineCase):
     def test_discovers_only_returns_bounded_admitted_ids(self) -> None:
-        first = self.submit("pipe-disc-a")
-        second = self.submit("pipe-disc-b")
-        ordered = sorted([first, second])
+        # Discovery follows durable admission order (admitted_at, then id).
+        # These two sha-derived ids sort opposite to their admission, so a
+        # lexicographic expectation would return them reversed.
+        first = self.submit("pipe-disc-a", clock=self.admitted(0))
+        second = self.submit("pipe-disc-b", clock=self.admitted(1))
+        self.assertGreater(first, second)  # sha order != admission order
+        ordered = [first, second]
         self.assertEqual(intake_pipeline.discover(self.env), ordered)
         self.assertEqual(intake_pipeline.discover(self.env, limit=1), ordered[:1])
 
@@ -279,8 +296,11 @@ class VerdictGateTests(PipelineCase):
         self.assertFalse(intake_queue.list_intents(self.env))
 
     def test_discovery_honors_the_scope_before_the_bound(self) -> None:
-        sids = self.submit("disc-a"), self.submit("disc-b")
-        earliest, latest = sorted(sids)
+        # Admission order, not lexicographic sha order, decides which of the
+        # two submissions is the earliest one the bound may return first.
+        earliest = self.submit("disc-a", clock=self.admitted(0))
+        latest = self.submit("disc-b", clock=self.admitted(1))
+        self.assertGreater(earliest, latest)  # sha order != admission order
         allowed = {latest}
         self.assertEqual(
             intake_pipeline.discover(self.env, limit=1, allowed=allowed),
