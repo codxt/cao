@@ -45,6 +45,14 @@ kind / provider CLI — reached for a WRITE task is refused
 effort variants differ only by the bounded `-c model_reasoning_effort=…`
 switch, so they share the base identity.
 
+One canonical owner route is additionally restricted to privacy-qualified
+READ: the Step-5 Preview Free base model id
+(`opencode/step-5-preview-free`), reached through its canonical identity, the
+bare `--model` token, a non-canonical spelling, a foreign provider prefix or a
+bounded `#effort` variant, is refused for a WRITE task (`TEAM_ROUTE_READ_ONLY`)
+before any Registry claim or agent effect, so an alias never restores write
+access. Every other OpenCode route keeps both modes.
+
 An allowlisted model id whose provider is known not to offer
 zero-data-retention is refused at every NEW dispatch
 (`TEAM_ROUTE_PRIVACY_UNVERIFIED`), because this build cannot technically prove

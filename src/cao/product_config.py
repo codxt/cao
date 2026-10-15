@@ -370,6 +370,21 @@ _TEAM_ROUTE_RUNTIME = {
 #: allowlisted, so the read-only role can never be escalated into a writer.
 _READ_ONLY_ROUTE_RUNTIMES = frozenset({"codex"})
 
+#: Route identities the canonical owner policy restricts to privacy-qualified
+#: READ. The Step-5 Preview Free route may read its own bounded checkout but
+#: must never become a writer, so a WRITE dispatch bound to it — by its
+#: canonical identity, by the base model id behind any provider prefix, or by a
+#: bounded ``#effort`` variant — is refused before any claim or agent effect.
+#: The bare model id and case-folded copies are matched so neither an alias nor
+#: a non-canonical spelling can restore write access.
+READ_ONLY_ROUTE_MODELS = frozenset({"opencode/step-5-preview-free"})
+_READ_ONLY_MODEL_IDS = frozenset(
+    route.rsplit("/", 1)[-1] for route in READ_ONLY_ROUTE_MODELS)
+_READ_ONLY_ROUTE_MODELS_FOLDED = frozenset(
+    route.lower() for route in READ_ONLY_ROUTE_MODELS)
+_READ_ONLY_MODEL_IDS_FOLDED = frozenset(
+    route.lower() for route in _READ_ONLY_MODEL_IDS)
+
 #: Route identities whose upstream provider is known not to offer
 #: zero-data-retention for submitted input (it may retain or train on it).
 #: CAO performs no automated provider-privacy classification and this product
@@ -433,9 +448,13 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     knows it. A route bound to a read-only runtime (Codex) — through its
     canonical identity prefix or through its resolved agent kind / provider CLI
     — is refused unless the mode is exactly READ; an unknown mode is refused
-    rather than assumed safe. A route whose provider is known not to be
-    zero-data-retention is always refused: the public-input admission gate this
-    build would require is not technically verifiable.
+    rather than assumed safe. A route the canonical owner policy restricts to
+    privacy-qualified READ (the Step-5 Preview Free base model id, matched
+    through its canonical identity, any provider prefix or a bounded
+    ``#effort`` variant) is likewise refused unless the mode is exactly READ. A
+    route whose provider is known not to be zero-data-retention is always
+    refused: the public-input admission gate this build would require is not
+    technically verifiable.
     """
 
     if policy is None:
@@ -488,9 +507,15 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
         _, mentions, trap = _argv_model(route.get("agent_args"))
         if mentions != 1 or trap:
             return "TEAM_MODEL_UNRESOLVED"
-    # A Codex route is READ-only: a WRITE dispatch on it is refused even when
-    # its model id is allowlisted, so the reader can never be escalated.
-    if codex_bound and _route_mode(mode) != "read":
+    # A route the canonical owner policy restricts to privacy-qualified READ is
+    # refused unless the mode is exactly READ, so the reader can never be
+    # escalated into a writer. The restriction follows the base model id
+    # (case-folded, behind any provider prefix and any bounded ``#effort``
+    # variant), so an alias or a foreign prefix cannot restore write access.
+    if ((codex_bound
+            or base_identity in _READ_ONLY_ROUTE_MODELS_FOLDED
+            or base_model_id in _READ_ONLY_MODEL_IDS_FOLDED)
+            and _route_mode(mode) != "read"):
         return "TEAM_ROUTE_READ_ONLY"
     return None
 
