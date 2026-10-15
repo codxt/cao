@@ -633,10 +633,19 @@ the binding rather than from the manifest.
 Every pass re-derives the B6 eligibility and binding and re-reads the exact
 source HEAD, so a changed Intake binding, a moved HEAD, an unmet, missing or
 cyclic dependency, an unreadable Work Registry or an independent overlapping
-Registry claim **holds that item only**. These gates run for every preexisting
-status, not only the PAUSED advance, so a RUNNING or COMPLETE label cannot
-bypass them. Every active Registry claim is compared (none is skipped), so a
-conflicting claim beyond any fixed cut is never missed. Items are ordered by
+Registry claim **holds that item only**. A stored `COMPLETE` dependency status
+and its content digest are caller-writable and are never authority on their own:
+before it can release a dependent, the dependency's completion is re-derived
+from its own authoritative team checkpoint -- the bound team must resolve and
+report `COMPLETE`, its immutable manifest must be a fully READ, admission-bound
+audit of the dependency submission with every task on the dependency's exact
+bound source repository, every completed slot must sit at the dependency's exact
+bound HEAD and its source ref/HEAD must still match -- and any missing,
+unreadable or mismatched evidence holds the dependent as `dependency_unverified`.
+These gates run for every preexisting status, not only the PAUSED advance, so a
+RUNNING or COMPLETE label cannot bypass them. Every active Registry claim is
+compared (none is skipped), so a conflicting claim beyond any fixed cut is never
+missed. Items are ordered by
 priority, then age, then id; the per-tick budget is checked before any side
 effect (`team.set_desired` or the governed handoff dispatch), so a zero budget
 starts nothing and reports `advanced = 0`, at most one item advances per tick,

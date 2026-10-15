@@ -773,6 +773,173 @@ class AutoAdvanceTests(QueueCase):
         self.assertEqual(report["items"][0]["code"], "source_head_drift")
 
 
+class DependencyEvidenceTests(QueueCase):
+    """A COMPLETE dependency is re-derived from its team, never from its status.
+
+    The stored queue status and its ordinary content digest are caller-writable,
+    so a forged terminal status with no authoritative CAO team -- or a foreign
+    or stale team -- must hold the dependent only and never release it or create
+    a child team or Registry claim.
+    """
+
+    def _approved_dependency(self, item_id: str) -> tuple[str, str, dict]:
+        """Admit a dependency whose approved team is marked COMPLETE at HEAD."""
+
+        self.write_config({"team_approval": {"mode": "chat"}})
+        sid = self.admitted(item_id)
+        dep_id = intake_queue.enqueue(
+            sid, repo=str(self.repo), env=self.env, priority=200)["intent_id"]
+        manifest = self.bound_manifest(sid)
+        config = product_config.load_config(
+            product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        head = run_git(self.repo, "rev-parse", "HEAD").strip()
+        self.complete_team(manifest, head=head)
+        return sid, dep_id, manifest
+
+    def _enqueue_child(self, item_id: str, dep_id: str) -> tuple[str, str]:
+        child = self.admitted(item_id)
+        child_id = intake_queue.enqueue(
+            child, repo=str(self.repo), env=self.env,
+            priority=1, depends_on=[dep_id])["intent_id"]
+        return child, child_id
+
+    def _forge_complete_status(self, intent_id: str) -> None:
+        """Set a stored terminal status with its ordinary content digest."""
+
+        record = intake_queue.read_intent(intent_id, self.env)
+        record["status"] = "COMPLETE"
+        record["digest"] = intake_queue._intent_digest(record)
+        intake_queue._write_intent(record, self.env)
+
+    def test_forged_complete_dependency_without_a_team_never_releases_a_child(self):
+        # The synthetic bypass: store COMPLETE and recompute the digest with no
+        # CAO team at all, then tick the child with an authenticated READ
+        # authority. The child must be held, and no child team or claim created.
+        dep = self.admitted("dep-forged")
+        dep_id = intake_queue.enqueue(
+            dep, repo=str(self.repo), env=self.env, priority=200)["intent_id"]
+        child, _child_id = self._enqueue_child("dep-forged-child", dep_id)
+        self._forge_complete_status(dep_id)
+        report = intake_queue.tick(
+            env=self.env,
+            operator_authority=self.generic_authority(str(self.repo)))
+        by_sid = {item["submission_id"]: item for item in report["items"]}
+        self.assertEqual(by_sid[child]["decision"], "HOLD")
+        self.assertEqual(by_sid[child]["code"], "dependency_unverified")
+        self.assertIsNone(team._read(by_sid[child]["team_id"], self.env))
+        self.assertEqual(self.teams(), [])
+        self.assertFalse(self.ledger_exists())
+
+    def test_foreign_complete_dependency_stays_held(self):
+        other = make_repo(self.root, "foreign")
+        self.write_config({"team_approval": {"mode": "chat"}})
+        dep = self.admitted("dep-foreign")
+        dep_id = intake_queue.enqueue(
+            dep, repo=str(self.repo), env=self.env, priority=200)["intent_id"]
+        manifest = self.bound_manifest(dep)
+        manifest["tasks"][0]["repo"] = str(other)
+        config = product_config.load_config(
+            product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        self.complete_team(manifest,
+                           head=run_git(other, "rev-parse", "HEAD").strip())
+        child, _child_id = self._enqueue_child("dep-foreign-child", dep_id)
+        self._forge_complete_status(dep_id)
+        report = intake_queue.tick(
+            env=self.env,
+            operator_authority=self.generic_authority(str(self.repo)))
+        by_sid = {item["submission_id"]: item for item in report["items"]}
+        self.assertEqual(by_sid[child]["decision"], "HOLD")
+        self.assertEqual(by_sid[child]["code"], "dependency_unverified")
+        self.assertIsNone(team._read(by_sid[child]["team_id"], self.env))
+        self.assertFalse(self.ledger_exists())
+
+    def test_bound_but_not_complete_dependency_stays_held(self):
+        # An approved, bound READ team that is only PAUSED is not terminal
+        # evidence, even when the dependency's stored status claims COMPLETE.
+        self.write_config({"team_approval": {"mode": "chat"}})
+        dep = self.admitted("dep-paused")
+        dep_id = intake_queue.enqueue(
+            dep, repo=str(self.repo), env=self.env, priority=200)["intent_id"]
+        manifest = self.bound_manifest(dep)
+        config = product_config.load_config(
+            product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        child, _child_id = self._enqueue_child("dep-paused-child", dep_id)
+        self._forge_complete_status(dep_id)
+        report = intake_queue.tick(
+            env=self.env,
+            operator_authority=self.generic_authority(str(self.repo)))
+        by_sid = {item["submission_id"]: item for item in report["items"]}
+        self.assertEqual(by_sid[child]["decision"], "HOLD")
+        self.assertEqual(by_sid[child]["code"], "dependency_unverified")
+        self.assertIsNone(team._read(by_sid[child]["team_id"], self.env))
+        self.assertFalse(self.ledger_exists())
+
+    def test_complete_dependency_after_a_source_move_stays_held(self):
+        dep, dep_id, _manifest = self._approved_dependency("dep-stale")
+        child, _child_id = self._enqueue_child("dep-stale-child", dep_id)
+        # First tick proves the dependency complete at its bound HEAD.
+        first = intake_queue.tick(env=self.env)
+        self.assertEqual(
+            {item["submission_id"]: item["status"]
+             for item in first["items"]}[dep], "COMPLETE")
+        # The audited source then moves; the stored COMPLETE is now stale and
+        # the dependency's own team evidence no longer matches its bound HEAD.
+        (self.repo / "a.txt").write_text("two\n", encoding="utf-8")
+        commit_all(self.repo, "move")
+        report = intake_queue.tick(
+            env=self.env,
+            operator_authority=self.generic_authority(str(self.repo)))
+        by_sid = {item["submission_id"]: item for item in report["items"]}
+        self.assertEqual(by_sid[child]["decision"], "HOLD")
+        self.assertEqual(by_sid[child]["code"], "dependency_unverified")
+        self.assertIsNone(team._read(by_sid[child]["team_id"], self.env))
+        self.assertFalse(self.ledger_exists())
+
+    def test_approved_complete_dependency_unlocks_a_child_on_the_next_tick(self):
+        dep, dep_id, _manifest = self._approved_dependency("dep-ok")
+        child, _child_id = self._enqueue_child("dep-ok-child", dep_id)
+        first = intake_queue.tick(env=self.env)
+        by_sid = {item["submission_id"]: item for item in first["items"]}
+        self.assertEqual(by_sid[child]["code"], "dependency_unmet")
+        self.assertEqual(by_sid[dep]["status"], "COMPLETE")
+        # Next tick: the dependency's team checkpoint proves completion and the
+        # eligible child advances through the one bounded path.
+        second = intake_queue.tick(
+            env=self.env,
+            operator_authority=self.generic_authority(str(self.repo)))
+        by_sid = {item["submission_id"]: item for item in second["items"]}
+        self.assertEqual(by_sid[child]["decision"], "ADVANCE")
+        self.assertEqual(by_sid[child]["status"], "STARTED")
+        self.assertIsNotNone(team._read(by_sid[child]["team_id"], self.env))
+        self.assertFalse(self.ledger_exists())
+
+    def test_independent_work_advances_while_a_forged_dependency_holds(self):
+        dep = self.admitted("dep-iso")
+        dep_id = intake_queue.enqueue(
+            dep, repo=str(self.repo), env=self.env, priority=200)["intent_id"]
+        child, _child_id = self._enqueue_child("dep-iso-child", dep_id)
+        ready = self.admitted("dep-iso-ready")
+        intake_queue.enqueue(ready, repo=str(self.repo), env=self.env,
+                             priority=50)
+        self._forge_complete_status(dep_id)
+        report = intake_queue.tick(
+            env=self.env,
+            operator_authority=self.generic_authority(str(self.repo)),
+            budget=1)
+        by_sid = {item["submission_id"]: item for item in report["items"]}
+        self.assertEqual(by_sid[child]["decision"], "HOLD")
+        self.assertEqual(by_sid[child]["code"], "dependency_unverified")
+        advanced = [item for item in report["items"]
+                    if item["decision"] == "ADVANCE"]
+        self.assertEqual([item["submission_id"] for item in advanced], [ready])
+        self.assertEqual(len(self.teams()), 1)
+        self.assertIsNone(team._read(by_sid[child]["team_id"], self.env))
+        self.assertFalse(self.ledger_exists())
+
+
 class DaemonOptInTests(QueueCase):
     """The queue is reconciled by the existing daemon and is opt-in."""
 

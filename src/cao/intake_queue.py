@@ -38,7 +38,10 @@ Load-bearing rules this module enforces:
   canonical acceptance are never dispatched here.
 * **Fail closed.** A corrupt private record, a drifted source, a changed Intake
   binding, an unmet or missing dependency, a dependency cycle, an unreadable
-  Work Registry or a conflicting Registry claim holds. An unapproved, stale or
+  Work Registry or a conflicting Registry claim holds. A stored ``COMPLETE``
+  status and its content digest are caller-writable and are never authority on
+  their own: a dependency's completion is re-derived from its own authoritative
+  team checkpoint before it releases a dependent. An unapproved, stale or
   conflicted item blocks only itself; independent eligible items still advance.
 * **Isolation, priority and a bounded budget.** Items are ordered by priority,
   then age, then id; at most ``ADVANCES_PER_TICK`` items advance per pass and
@@ -767,29 +770,17 @@ def _cycle_members(by_id: Mapping[str, Mapping[str, Any]]) -> set[str]:
     return members
 
 
-def _gates(
-    intent: Mapping[str, Any],
-    by_id: Mapping[str, Mapping[str, Any]],
-    *,
-    env: Mapping[str, str] | None,
-    clock: Any,
-    registry_db: str | None,
+def _source_gates(
+    intent: Mapping[str, Any], *, env: Mapping[str, str] | None, clock: Any
 ) -> dict[str, Any] | None:
-    """Every pre-advance gate, or ``None`` when the intent may advance.
+    """Re-derive eligibility, the exact HEAD and the unchanged Intake binding.
 
-    Each gate fails closed and blocks only the item being reconciled.
+    Shared by the intent under reconciliation and by a dependency whose stored
+    terminal status must be re-derived rather than trusted, so the exact same
+    fail-closed source checks guard both without any recursive gate dispatch.
     """
 
     binding = intent["binding"]
-    for dep in intent["depends_on"]:
-        dep_intent = by_id.get(dep)
-        if dep_intent is None:
-            return _hold("dependency_missing",
-                         f"dependency {dep[:12]} is not in the queue")
-        if dep_intent["status"] != "COMPLETE":
-            return _hold("dependency_unmet",
-                         f"dependency {dep[:12]} is {dep_intent['status']}")
-
     source = binding["source"]
     try:
         preflight = intake_handoff.handoff_plan(
@@ -810,6 +801,102 @@ def _gates(
     if current != binding:
         return _hold("intake_binding_changed",
                      "the Intake/triage binding changed after the intent was queued")
+    return None
+
+
+def _dependency_unverified(dep_intent: Mapping[str, Any], detail: str) -> dict[str, Any]:
+    """A precise hold on the dependent when its dependency's evidence fails."""
+
+    return _hold(
+        "dependency_unverified",
+        f"dependency {dep_intent['intent_id'][:12]} completion is not proven by "
+        f"its authoritative team checkpoint: {detail}",
+    )
+
+
+def _dependency_complete_hold(
+    dep_intent: Mapping[str, Any], *, env: Mapping[str, str] | None, clock: Any
+) -> dict[str, Any] | None:
+    """Re-derive a ``COMPLETE`` dependency, or a precise hold on the dependent.
+
+    A stored queue ``status == "COMPLETE"`` and its ordinary content digest are
+    caller-writable, so neither is authority. The dependency is accepted as
+    complete only when its bound CAO team resolves and proves the whole chain on
+    the dependency's own binding: a fully READ admission-bound manifest citing
+    the dependency submission, every task on the dependency's exact bound source
+    repository, an overall COMPLETE team status, every completed slot at the
+    dependency's exact bound HEAD and the source ref/HEAD still matching. Any
+    missing, unreadable or mismatched evidence holds this dependent only.
+    """
+
+    binding = dep_intent["binding"]
+    team_id = binding["team_id"]
+    try:
+        record = team._read(team_id, env)
+    except team.TeamError as exc:
+        return _dependency_unverified(
+            dep_intent,
+            f"the bound team checkpoint is not usable ({type(exc).__name__})")
+    if record is None:
+        return _dependency_unverified(
+            dep_intent, "the bound team ID resolves to no CAO team checkpoint")
+    hold = _bound_read_team_hold(record, binding, binding["submission_id"])
+    if hold is not None:
+        return _dependency_unverified(
+            dep_intent, f"{hold['code']}: {hold['reason']}")
+    try:
+        summary = team.status(team_id, env=env)
+    except team.TeamError as exc:
+        return _dependency_unverified(
+            dep_intent,
+            f"the bound team status could not be read ({type(exc).__name__})")
+    if summary.get("status") != "COMPLETE":
+        return _dependency_unverified(
+            dep_intent,
+            f"the bound team reports {summary.get('status')}, not COMPLETE")
+    hold = _terminal_provenance_hold(record, binding)
+    if hold is not None:
+        return _dependency_unverified(
+            dep_intent, f"{hold['code']}: {hold['reason']}")
+    source_hold = _source_gates(dep_intent, env=env, clock=clock)
+    if source_hold is not None:
+        return _dependency_unverified(
+            dep_intent, f"{source_hold['code']}: {source_hold['reason']}")
+    return None
+
+
+def _gates(
+    intent: Mapping[str, Any],
+    by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    env: Mapping[str, str] | None,
+    clock: Any,
+    registry_db: str | None,
+) -> dict[str, Any] | None:
+    """Every pre-advance gate, or ``None`` when the intent may advance.
+
+    Each gate fails closed and blocks only the item being reconciled. A stored
+    ``COMPLETE`` dependency status is never itself authority: it is re-derived
+    from the dependency's authoritative team checkpoint (see
+    :func:`_dependency_complete_hold`) before it can release a dependent.
+    """
+
+    binding = intent["binding"]
+    for dep in intent["depends_on"]:
+        dep_intent = by_id.get(dep)
+        if dep_intent is None:
+            return _hold("dependency_missing",
+                         f"dependency {dep[:12]} is not in the queue")
+        if dep_intent["status"] != "COMPLETE":
+            return _hold("dependency_unmet",
+                         f"dependency {dep[:12]} is {dep_intent['status']}")
+        hold = _dependency_complete_hold(dep_intent, env=env, clock=clock)
+        if hold is not None:
+            return hold
+
+    source_hold = _source_gates(intent, env=env, clock=clock)
+    if source_hold is not None:
+        return source_hold
 
     conflict = _registry_conflict(binding, env=env, registry_db=registry_db)
     if conflict["verdict"] == "UNKNOWN":

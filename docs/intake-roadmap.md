@@ -523,7 +523,15 @@ evidence only for the intent's exact bound HEAD.
 unmet, missing or cyclic dependency, an unreadable Work Registry or an
 independent overlapping Registry claim holds **that item only**; every active
 Registry claim is compared and the same gates run for every preexisting status,
-not only the PAUSED advance. Items are ordered by priority, then age, then id;
+not only the PAUSED advance. A stored `COMPLETE` dependency status and its
+content digest are caller-writable and are never authority: before it releases a
+dependent, the dependency's completion is re-derived from its own authoritative
+team checkpoint (bound team resolves and reports `COMPLETE`, fully READ
+admission-bound manifest of the dependency submission on the dependency's exact
+bound repository, every completed slot at the dependency's exact bound HEAD, and
+its source ref/HEAD still matching), and any missing, unreadable or mismatched
+evidence holds the dependent as `dependency_unverified`. Items are ordered by
+priority, then age, then id;
 the per-tick budget is checked before any side effect, at most
 `ADVANCES_PER_TICK` (one) item advances per pass and held items never consume
 that budget. Two concurrent passes are serialized by a kernel lock; the loser
@@ -547,7 +555,10 @@ crash-restart idempotency, concurrent passes, the absence of any authority
 isolation with priority fairness, a bounded budget (including a zero budget that
 starts nothing), the auto-advance of an already-approved team and the refusal of
 a forged approval, an unapproved, cross-source or drifted-revision team that is
-held rather than accepted as progress or terminal evidence, a conflicting claim
+held rather than accepted as progress or terminal evidence, a forged/stale/
+foreign `COMPLETE` dependency whose completion cannot be re-derived from its own
+team checkpoint (which holds the dependent as `dependency_unverified` and starts
+no child team or Registry claim), a conflicting claim
 beyond any fixed cut, serialized enqueue with a deterministic changed-input
 refusal, the daemon opt-in
 (default disabled) and zero team/Registry mutation while held;
