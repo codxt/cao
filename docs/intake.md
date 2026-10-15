@@ -611,20 +611,39 @@ exact source HEAD and its dependencies are all re-validated from authoritative
 evidence. The revalidation is delegated to the existing team owner API
 (`team.set_desired`), which recomputes the confirmation; a forged manifest or
 approval string is never trusted and the stored receipt is never consulted as
-authority. Only a fully READ `cao.team.v1` manifest that cites the submission is
-ever started.
+authority.
+
+Any **preexisting** team -- PAUSED, RUNNING or COMPLETE -- is accepted as an
+intent's own audit only when (1) its immutable manifest is entirely READ and
+cites the submission, (2) **every** task targets the intent's **exact** bound
+source repository, and (3) it carries a persisted operator admission whose spec
+digest binds that exact manifest. An admission-less team (legacy approval mode,
+or a manifest initialized outside the governed handoff) is held as
+`team_unapproved` **before** the owner API is ever reached; a cross-source
+manifest is held as `source_mismatch`; and an admission that no longer binds the
+manifest is held as `approval_unverified`. A fake or foreign team, including one
+labeled COMPLETE, therefore never grants progress or terminal dependency
+acceptance: a COMPLETE label is terminal evidence only for the intent's exact
+bound HEAD, and any other completed revision is held as `source_head_drift`. The
+team manifest carries no per-task ref, so the exact ref/HEAD is re-verified from
+the binding rather than from the manifest.
 
 ### Gates, isolation, fairness and a bounded budget
 
 Every pass re-derives the B6 eligibility and binding and re-reads the exact
 source HEAD, so a changed Intake binding, a moved HEAD, an unmet, missing or
 cyclic dependency, an unreadable Work Registry or an independent overlapping
-Registry claim **holds that item only**. Items are ordered by priority, then
-age, then id; at most one item advances per tick and a held item never consumes
-that budget, so a blocked head never starves an independent eligible item. Two
-concurrent passes are serialized by a kernel lock and the loser reports
-`LOCKED` and mutates nothing. A corrupt private record, a changed content digest
-or an unexpected store file fails the whole pass closed.
+Registry claim **holds that item only**. These gates run for every preexisting
+status, not only the PAUSED advance, so a RUNNING or COMPLETE label cannot
+bypass them. Every active Registry claim is compared (none is skipped), so a
+conflicting claim beyond any fixed cut is never missed. Items are ordered by
+priority, then age, then id; the per-tick budget is checked before any side
+effect (`team.set_desired` or the governed handoff dispatch), so a zero budget
+starts nothing and reports `advanced = 0`, at most one item advances per tick,
+and a held item never consumes that budget. Two concurrent passes are serialized
+by a kernel lock and the loser reports `LOCKED` and mutates nothing. A corrupt
+private record, a changed content digest or an unexpected store file fails the
+whole pass closed.
 
 ### WRITE and every consequential effect stay held
 
@@ -640,9 +659,15 @@ scope-specific operator authority is verifiably present.
 
 Intents live under `$XDG_STATE_HOME/cao/intake-queue/` (`0700` directory,
 `0600` records), written through the existing CAO durable-state primitive with
-a recomputed content digest. The intent id is a one-way digest of the immutable
-binding, so an identical replay is `DUPLICATE`, and a reused id for different
-content is a conflict. A receipt is deterministic: identical evidence yields
+a recomputed content digest. The enqueue read/limit/write section runs under the
+same kernel pass lock as reconciliation, so a concurrent enqueue or pass can
+neither race the bounded size nor overwrite a receipt it just derived; the loser
+mutates nothing and reports `INTAKE_QUEUE_BUSY`. The intent id is a one-way
+digest of the immutable binding, so a replay with the exact same priority and
+dependencies is `DUPLICATE`, while a replay that keeps the binding but changes
+the priority or dependencies is refused deterministically rather than reported
+as identical, and the stored record and receipt are preserved. A receipt is
+deterministic: identical evidence yields
 the same receipt digest, so a repeated hold persists no new record. A crash
 between the team effect and the receipt write is recovered on the next pass:
 an already-running or paused team is re-observed from the team checkpoint, so no

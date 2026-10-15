@@ -512,16 +512,26 @@ already-approved immutable CAO team bound to an intent may re-verify and advance
 PAUSED -> RUNNING only after its approval/spec digest, Intake binding, exact
 source HEAD and dependency terminal evidence are all re-validated; the
 revalidation is delegated to `team.set_desired`, so a forged manifest or
-approval string is never trusted.
+approval string is never trusted. Any preexisting team (PAUSED, RUNNING or
+COMPLETE) is accepted only when its manifest is fully READ, cites the
+submission, targets the intent's exact bound repository and carries a persisted
+admission that binds that exact manifest; an unapproved, legacy or cross-source
+team is held before the owner API is reached, and a COMPLETE label is terminal
+evidence only for the intent's exact bound HEAD.
 
 **Gates, isolation and bounds.** A changed Intake binding, a moved HEAD, an
 unmet, missing or cyclic dependency, an unreadable Work Registry or an
-independent overlapping Registry claim holds **that item only**. Items are
-ordered by priority, then age, then id; at most `ADVANCES_PER_TICK` (one) item
-advances per pass and held items never consume that budget. Two concurrent
-passes are serialized by a kernel lock; the loser reports `LOCKED`. A corrupt
-record or a changed content digest fails the whole pass closed. A held,
-queued or refused intent creates no team, no agent and no Registry claim.
+independent overlapping Registry claim holds **that item only**; every active
+Registry claim is compared and the same gates run for every preexisting status,
+not only the PAUSED advance. Items are ordered by priority, then age, then id;
+the per-tick budget is checked before any side effect, at most
+`ADVANCES_PER_TICK` (one) item advances per pass and held items never consume
+that budget. Two concurrent passes are serialized by a kernel lock; the loser
+reports `LOCKED`. Enqueue's own read/limit/write section is serialized by the
+same lock, and a replay that changes the priority or dependencies is refused
+deterministically rather than reported as identical. A corrupt record or a
+changed content digest fails the whole pass closed. A held, queued or refused
+intent creates no team, no agent and no Registry claim.
 
 **Explicitly not in B7.** No scheduler, service, database, second ledger,
 second Registry, coordinator, credential, network egress, provider or LLM
@@ -534,8 +544,12 @@ and covers forge/replay, tamper and a corrupt private store, a stale source
 head, a changed binding, missed/cyclic dependencies, duplicate execution and
 crash-restart idempotency, concurrent passes, the absence of any authority
 (CLI, environment or JSON) and of any model/privacy qualification, self-blocking
-isolation with priority fairness, a bounded budget, the auto-advance of an
-already-approved team and the refusal of a forged approval, the daemon opt-in
+isolation with priority fairness, a bounded budget (including a zero budget that
+starts nothing), the auto-advance of an already-approved team and the refusal of
+a forged approval, an unapproved, cross-source or drifted-revision team that is
+held rather than accepted as progress or terminal evidence, a conflicting claim
+beyond any fixed cut, serialized enqueue with a deterministic changed-input
+refusal, the daemon opt-in
 (default disabled) and zero team/Registry mutation while held;
 `tests/test_boundaries.py` additionally guards that the queue reaches the
 Registry read-only, opens no egress surface, uses no shell and starts a team

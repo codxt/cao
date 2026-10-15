@@ -24,7 +24,14 @@ Load-bearing rules this module enforces:
   only after its approval/spec digest, its Intake binding, its exact source HEAD
   and its dependencies are all re-validated from authoritative evidence. The
   revalidation is delegated to ``team.set_desired``, which recomputes the
-  confirmation; a forged manifest or approval string is never trusted.
+  confirmation; a forged manifest or approval string is never trusted. Any
+  preexisting team -- PAUSED, RUNNING or COMPLETE -- is accepted as this
+  intent's own audit only when it carries a persisted admission that binds its
+  exact immutable manifest and every READ task targets the intent's exact bound
+  source repository. An unapproved, legacy or cross-source team is held before
+  the owner API is reached and never grants progress or terminal dependency
+  acceptance, and a COMPLETE label is terminal evidence only for the intent's
+  exact bound HEAD.
 * **WRITE and every consequential effect stay held.** Only a fully READ
   ``cao.team.v1`` manifest for the bound submission is ever started; WRITE, new
   corrective batches, PR/CI/merge/deploy, credentials, permission changes and
@@ -491,16 +498,32 @@ def enqueue(
         result["reason"] = "dry run: the intent was validated and not persisted"
         return result
 
-    existing = read_intent(intent_id, env)
-    if existing is not None:
-        result.update(
-            {"status": "DUPLICATE", "persisted": True, "intent": existing,
-             "reason": "an identical intent already exists"}
-        )
-        return result
-    if len(list_intents(env)) >= MAX_ITEMS:
-        raise QueueRefused("the queue is full; no further intent is admitted")
-    stored = _write_intent(record, env)
+    # Read (duplicate check), bound check and write are one serialized section
+    # under the same kernel pass lock reconciliation uses: a concurrent enqueue
+    # or pass can neither race the bounded size (which would otherwise poison the
+    # store) nor overwrite a receipt it just derived. The loser mutates nothing
+    # and raises :class:`QueueBusy`.
+    with _queue_lock(queue_dir(env)):
+        existing = read_intent(intent_id, env)
+        if existing is not None:
+            # The intent id is a digest of the immutable binding, so a repeated
+            # enqueue that changes the mutable input (priority or dependencies)
+            # is never silently collapsed into the existing record and never
+            # interpreted as an identical replay: the exact immutable input must
+            # match, or the caller is refused deterministically.
+            if (existing.get("priority") == priority
+                    and existing.get("depends_on") == list(deps)):
+                result.update(
+                    {"status": "DUPLICATE", "persisted": True, "intent": existing,
+                     "reason": "an identical intent already exists"}
+                )
+                return result
+            raise QueueRefused(
+                "an intent with this exact binding already exists with different "
+                "priority or dependencies; the immutable input is never replaced")
+        if len(list_intents(env)) >= MAX_ITEMS:
+            raise QueueRefused("the queue is full; no further intent is admitted")
+        stored = _write_intent(record, env)
     result.update(
         {"status": "QUEUED", "persisted": True, "intent": stored,
          "reason": "the READ intent is queued and awaits the existing daemon"}
@@ -558,7 +581,11 @@ def _registry_conflict(
         ) if part
     )
     tokens = registry.objective_tokens({"objective": objective})
-    for claim in claims[:64]:
+    # Every active claim is compared. A bounded slice here would silently drop a
+    # conflicting claim past any fixed cut and advance the item, failing open in
+    # a claim gate. The queue's own bounded store raises instead of truncating,
+    # so this gate never skips an active claim.
+    for claim in claims:
         if not isinstance(claim, Mapping) or claim.get("run_id") == own_run:
             continue
         claim_repo = claim.get("repo")
@@ -632,6 +659,87 @@ def _approval_evidence(record: Mapping[str, Any]) -> dict[str, Any] | None:
         "spec_sha256": admission.get("spec_sha256"),
         "routes_sha256": admission.get("routes_sha256"),
     }
+
+
+def _team_source_hold(
+    spec: Any, binding: Mapping[str, Any], submission_id: str
+) -> dict[str, Any] | None:
+    """A bound existing team must be the fully READ, source-bound audit of the intent.
+
+    The immutable manifest itself must cite the submission and be entirely
+    READ, and every task must target the intent's **exact** bound source
+    repository. A team whose manifest lists any other checkout is a
+    cross-source audit and is never accepted as this intent's progress, even
+    when it is labeled COMPLETE. The team manifest carries no per-task ref, so
+    the exact ref/HEAD is re-verified separately from the binding.
+    """
+
+    if not _is_read_manifest_for(spec, submission_id):
+        return _hold("not_read_only",
+                     "the bound team manifest is not a fully READ audit of "
+                     "this submission and is never started by the queue")
+    bound_repo = (binding.get("source") or {}).get("repo")
+    tasks = spec.get("tasks") if isinstance(spec, Mapping) else None
+    repos = {
+        os.path.normpath(str(task.get("repo")))
+        for task in (tasks if isinstance(tasks, list) else [])
+        if isinstance(task, Mapping)
+    }
+    if (not isinstance(bound_repo, str) or not bound_repo
+            or repos != {os.path.normpath(bound_repo)}):
+        return _hold("source_mismatch",
+                     "the bound READ team's tasks do not target this intent's "
+                     "exact bound source repository")
+    return None
+
+
+def _team_admission_hold(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Any preexisting team requires a persisted admission bound to its exact spec.
+
+    ``team.set_desired`` re-verifies an admission only when one exists, so the
+    queue excludes an admission-less team (legacy approval mode, or a manifest
+    initialized outside the governed handoff) **before** the owner API is ever
+    reached, and never reads a COMPLETE label as progress for a team the
+    operator never approved. An admission that does not bind the checkpoint's
+    exact manifest is equally refused.
+    """
+
+    admission = record.get("admission")
+    if not isinstance(admission, Mapping):
+        return _hold(
+            "team_unapproved",
+            "the bound team has no persisted operator admission; an unapproved "
+            "or legacy team is never started or accepted as progress by the queue")
+    if admission.get("spec_sha256") != record.get("spec_hash"):
+        return _hold(
+            "approval_unverified",
+            "the bound team's persisted admission does not bind its exact manifest")
+    return None
+
+
+def _bound_read_team_hold(
+    record: Mapping[str, Any], binding: Mapping[str, Any], submission_id: str
+) -> dict[str, Any] | None:
+    """The fail-closed linkage check for any existing bound team, or ``None``."""
+
+    return (_team_source_hold(record.get("spec"), binding, submission_id)
+            or _team_admission_hold(record))
+
+
+def _terminal_provenance_hold(
+    record: Mapping[str, Any], binding: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """A COMPLETE team is terminal evidence only for this intent's exact HEAD."""
+
+    bound_head = (binding.get("source") or {}).get("head")
+    for task in record["spec"]["tasks"]:
+        slot = record["slots"][task["id"]]
+        if slot["status"] == "complete" and slot.get("head") != bound_head:
+            return _hold(
+                "source_head_drift",
+                "the completed bound task accepted a revision that is not the "
+                "intent's exact bound source HEAD")
+    return None
 
 
 def _cycle_members(by_id: Mapping[str, Mapping[str, Any]]) -> set[str]:
@@ -739,10 +847,22 @@ def _advance(
                      f"the bound team checkpoint is not usable ({type(exc).__name__})")
 
     if record is not None:
-        if not _is_read_manifest_for(record.get("spec"), submission_id):
-            return _hold("not_read_only",
-                         "the bound team manifest is not a fully READ audit of "
-                         "this submission and is never started by the queue")
+        # Any preexisting team -- PAUSED, RUNNING or COMPLETE -- is accepted as
+        # this intent's own audit only when it is the exactly-admitted, fully
+        # READ, source-bound team the intent names. A cross-source manifest, an
+        # unapproved team or an admission that no longer binds the manifest is
+        # held before the owner API is reached, so a fake or foreign team (even
+        # one labeled COMPLETE) never grants progress or terminal dependency
+        # acceptance.
+        hold = _bound_read_team_hold(record, binding, submission_id)
+        if hold is not None:
+            return hold
+        # A changed binding, a moved HEAD or an overlapping Registry claim holds
+        # every preexisting status, not only the PAUSED advance, so a RUNNING or
+        # COMPLETE label can never bypass the same fail-closed gates.
+        gate = _gates(intent, by_id, env=env, clock=clock, registry_db=registry_db)
+        if gate is not None:
+            return gate
         try:
             summary = team.status(team_id, env=env)
         except team.TeamError as exc:
@@ -750,8 +870,12 @@ def _advance(
                          f"the bound team status could not be read ({type(exc).__name__})")
         overall = summary.get("status")
         if overall == "COMPLETE":
+            terminal = _terminal_provenance_hold(record, binding)
+            if terminal is not None:
+                return terminal
             return {"decision": COMPLETE, "status": "COMPLETE", "code": None,
-                    "reason": "the bound team reached COMPLETE",
+                    "reason": "the bound team reached COMPLETE on this intent's "
+                              "exact bound source HEAD",
                     "team_id": team_id}
         if overall in ("BLOCKED", "CORRUPT"):
             return {"decision": BLOCK, "status": "BLOCKED", "code": "team_blocked",
@@ -762,9 +886,6 @@ def _advance(
                               "by the existing daemon",
                     "team_id": team_id,
                     "approval": _approval_evidence(record)}
-        gate = _gates(intent, by_id, env=env, clock=clock, registry_db=registry_db)
-        if gate is not None:
-            return gate
         if budget_left <= 0:
             return deferred()
         try:

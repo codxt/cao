@@ -149,6 +149,18 @@ class QueueCase(unittest.TestCase):
             manifest["max_writers"] = 1
         return manifest
 
+    def complete_team(self, manifest: dict, *, head: str) -> None:
+        """Mark a bound team's single task COMPLETE at an accepted revision."""
+
+        record = team._read(manifest["team_id"], self.env)
+        task = manifest["tasks"][0]
+        record["slots"][task["id"]].update(
+            status="complete", head=head, prompt="synthetic",
+            execution_id=team._execution_id(
+                manifest["team_id"], task["id"], "work", 0),
+        )
+        team._save(record, self.env)
+
     def teams(self) -> list[dict]:
         return team.list_teams(env=self.env)
 
@@ -185,6 +197,25 @@ class EnqueueTests(QueueCase):
         second = intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
         self.assertEqual(second["status"], "DUPLICATE")
         self.assertEqual(first["intent_id"], second["intent_id"])
+        self.assertEqual(len(intake_queue.list_intents(self.env)), 1)
+
+    def test_replay_with_changed_input_is_refused_and_preserved(self) -> None:
+        # The intent id is a digest of the immutable binding, so a replay that
+        # keeps the binding but changes priority or dependencies is never
+        # silently reported as an identical duplicate; the stored record and its
+        # receipt are preserved untouched.
+        sid = self.admitted("queue-replay-diff")
+        first = intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        self.assertEqual(first["status"], "QUEUED")
+        with self.assertRaises(intake_queue.QueueRefused):
+            intake_queue.enqueue(sid, repo=str(self.repo), env=self.env,
+                                 priority=first["intent"]["priority"] + 1)
+        with self.assertRaises(intake_queue.QueueRefused):
+            intake_queue.enqueue(sid, repo=str(self.repo), env=self.env,
+                                 depends_on=["a" * 64])
+        stored = intake_queue.read_intent(first["intent_id"], self.env)
+        self.assertEqual(stored["priority"], intake_queue.DEFAULT_PRIORITY)
+        self.assertEqual(stored["depends_on"], [])
         self.assertEqual(len(intake_queue.list_intents(self.env)), 1)
 
     def test_non_read_request_is_held_and_persists_nothing(self) -> None:
@@ -516,6 +547,80 @@ class SafetyGateTests(QueueCase):
         self.assertEqual(report["items"][0]["code"], "registry_conflict")
         self.assertFalse(self.teams())
 
+    def test_conflicting_claim_past_the_former_cut_still_holds(self) -> None:
+        # A conflicting active claim beyond the former fixed cut must still be
+        # seen; a truncated scan would fail open and advance the item.
+        sid = self.admitted("safe-registry-past-cut")
+        intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        ledger = self.root / "registry.sqlite3"
+        ledger.write_bytes(b"")
+        unrelated = [
+            {"run_id": f"cao-team-unrelated-{n}", "work_key": f"other-{n}",
+             "repo": str(self.root / f"elsewhere-{n}"), "paths": [],
+             "mode": "READ", "objective": "unrelated"}
+            for n in range(70)
+        ]
+        conflict = {"run_id": "cao-team-other", "work_key": "other",
+                    "repo": str(self.repo), "paths": ["a.txt"], "mode": "WRITE",
+                    "objective": "unrelated"}
+        claims = unrelated[:64] + [conflict]
+        with mock.patch.object(intake_queue.registry, "connect_readonly",
+                               return_value=mock.Mock()), \
+             mock.patch.object(intake_queue.registry, "list_active_claims",
+                               return_value=claims):
+            report = intake_queue.tick(
+                env=self.env, registry_db=str(ledger),
+                operator_authority=self.generic_authority(str(self.repo)))
+        self.assertEqual(report["items"][0]["code"], "registry_conflict")
+        self.assertFalse(self.teams())
+
+    def test_concurrent_enqueue_is_serialized_by_the_pass_lock(self) -> None:
+        first = self.admitted("enqueue-lock-a")
+        second = self.admitted("enqueue-lock-b")
+        with mock.patch.object(intake_queue, "MAX_ITEMS", 1):
+            intake_queue.enqueue(first, repo=str(self.repo), env=self.env)
+            directory = intake_queue.queue_dir(self.env)
+            fd = os.open(os.path.join(directory, ".lock"),
+                         os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(intake_queue.QueueBusy):
+                    intake_queue.enqueue(second, repo=str(self.repo), env=self.env)
+            finally:
+                os.close(fd)
+        self.assertEqual(len(intake_queue.list_intents(self.env)), 1)
+
+    def test_paused_read_team_for_an_unrelated_repo_is_held(self) -> None:
+        # A PAUSED READ team whose manifest lists another checkout must never be
+        # started as this intent's audit: the source binding is exact.
+        self.write_config({"team_approval": {"mode": "chat"}})
+        sid = self.admitted("bind-repo-paused")
+        intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        other = make_repo(self.root, "unrelated")
+        manifest = self.bound_manifest(sid)
+        manifest["tasks"][0]["repo"] = str(other)
+        config = product_config.load_config(product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        report = intake_queue.tick(env=self.env)
+        self.assertEqual(report["items"][0]["decision"], "HOLD")
+        self.assertEqual(report["items"][0]["code"], "source_mismatch")
+        self.assertEqual(team.status(manifest["team_id"], env=self.env)["desired"],
+                         "paused")
+
+    def test_running_read_team_for_an_unrelated_repo_is_held(self) -> None:
+        self.write_config({"team_approval": {"mode": "chat"}})
+        sid = self.admitted("bind-repo-running")
+        intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        other = make_repo(self.root, "cross-source")
+        manifest = self.bound_manifest(sid)
+        manifest["tasks"][0]["repo"] = str(other)
+        config = product_config.load_config(product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        team.set_desired(manifest["team_id"], "running", env=self.env)
+        report = intake_queue.tick(env=self.env)
+        self.assertEqual(report["items"][0]["decision"], "HOLD")
+        self.assertEqual(report["items"][0]["code"], "source_mismatch")
+
     def test_budget_defers_an_eligible_item(self) -> None:
         first = self.admitted("budget-a")
         second = self.admitted("budget-b")
@@ -530,6 +635,31 @@ class SafetyGateTests(QueueCase):
                     if item["decision"] == "NONE" and item["code"] == "budget"]
         self.assertEqual(len(deferred), 1)
         self.assertEqual(len(self.teams()), 1)
+
+    def test_zero_budget_starts_no_team_and_reports_no_advance(self) -> None:
+        self.write_config({"team_approval": {"mode": "chat"}})
+        sid = self.admitted("budget-zero-team")
+        intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        manifest = self.bound_manifest(sid)
+        config = product_config.load_config(product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        report = intake_queue.tick(env=self.env, budget=0)
+        self.assertEqual(report["advanced"], 0)
+        self.assertEqual(report["items"][0]["decision"], "NONE")
+        self.assertEqual(report["items"][0]["code"], "budget")
+        self.assertEqual(team.status(manifest["team_id"], env=self.env)["desired"],
+                         "paused")
+
+    def test_zero_budget_dispatches_no_team(self) -> None:
+        sid = self.admitted("budget-zero-dispatch")
+        intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        report = intake_queue.tick(
+            env=self.env, budget=0,
+            operator_authority=self.generic_authority(str(self.repo)))
+        self.assertEqual(report["advanced"], 0)
+        self.assertEqual(report["items"][0]["decision"], "NONE")
+        self.assertEqual(report["items"][0]["code"], "budget")
+        self.assertFalse(self.teams())
 
     def test_concurrent_pass_reports_locked_and_mutates_nothing(self) -> None:
         sid = self.admitted("concurrent")
@@ -595,6 +725,52 @@ class AutoAdvanceTests(QueueCase):
         self.assertEqual(len(self.teams()), 1)
         self.assertTrue(team.status(manifest["team_id"], env=self.env)["desired"]
                         == "running")
+
+    def test_bound_but_unapproved_team_is_held(self) -> None:
+        # Legacy approval mode: a bound READ manifest is initialized with no
+        # persisted admission, so the queue holds it rather than start it.
+        sid = self.admitted("auto-unapproved")
+        intake_queue.enqueue(sid, repo=str(self.repo), env=self.env)
+        manifest = self.bound_manifest(sid)
+        team.initialize(manifest, env=self.env)
+        record = team._read(manifest["team_id"], self.env)
+        self.assertIsNone(record.get("admission"))
+        report = intake_queue.tick(env=self.env)
+        self.assertEqual(report["items"][0]["decision"], "HOLD")
+        self.assertEqual(report["items"][0]["code"], "team_unapproved")
+        self.assertEqual(team.status(manifest["team_id"], env=self.env)["desired"],
+                         "paused")
+
+    def test_unapproved_complete_team_never_grants_dependency_acceptance(self) -> None:
+        # A team the operator never approved, even one labeled COMPLETE, must
+        # not mark its intent terminal and so must not release a dependent.
+        dep = self.admitted("terminal-unapproved")
+        dep_id = intake_queue.enqueue(
+            dep, repo=str(self.repo), env=self.env, priority=200)["intent_id"]
+        child = self.admitted("terminal-child")
+        intake_queue.enqueue(child, repo=str(self.repo), env=self.env,
+                             priority=1, depends_on=[dep_id])
+        manifest = self.bound_manifest(dep)
+        team.initialize(manifest, env=self.env)  # legacy: no persisted admission
+        head = run_git(self.repo, "rev-parse", "HEAD").strip()
+        self.complete_team(manifest, head=head)
+        self.assertEqual(team.status(manifest["team_id"], env=self.env)["status"],
+                         "COMPLETE")
+        report = intake_queue.tick(env=self.env)
+        by_sid = {item["submission_id"]: item for item in report["items"]}
+        self.assertEqual(by_sid[dep]["decision"], "HOLD")
+        self.assertEqual(by_sid[dep]["code"], "team_unapproved")
+        self.assertEqual(by_sid[child]["code"], "dependency_unmet")
+
+    def test_completed_team_on_a_drifted_revision_is_held(self) -> None:
+        # A COMPLETE label is terminal evidence only for the intent's exact
+        # bound HEAD; a completed revision that is not that HEAD is not accepted
+        # and does not release a dependent.
+        sid, manifest = self._started_team("auto-drift")
+        self.complete_team(manifest, head="0" * 40)
+        report = intake_queue.tick(env=self.env)
+        self.assertEqual(report["items"][0]["decision"], "HOLD")
+        self.assertEqual(report["items"][0]["code"], "source_head_drift")
 
 
 class DaemonOptInTests(QueueCase):
