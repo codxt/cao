@@ -1730,6 +1730,57 @@ class TeamRouteIdentityTests(TaskCase):
                     self.assertEqual(driver.names().count("agent_start"), 1)
 
 
+class DirectCodexAndNonZdrModeTests(TaskCase):
+    """The direct task runner enforces the same route and mode decision."""
+
+    def codex_config(self):
+        return product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "codex"},
+            "task": {"agent_args": ["--model", "gpt-6.1-sol"]},
+            "team_model_allowlist": ["codex/gpt-6.1-sol"],
+        })
+
+    def test_read_codex_route_dispatches(self):
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Review this repository",
+            task_id="codex-read", config=self.codex_config(), env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(driver.names().count("agent_start"), 1)
+
+    def test_write_codex_route_is_refused_with_zero_effects(self):
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Edit a.txt",
+            task_id="codex-write", mode="write", write_scope=("a.txt",),
+            config=self.codex_config(), env=self.env, registry_db=self.db,
+            wait_ms=0)
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["errors"], ["TEAM_ROUTE_READ_ONLY"])
+        self.assertEqual(driver.names(), [])
+        self.assertEqual(self.claim_rows(), [])
+
+    def test_non_zdr_route_is_refused_even_when_allowlisted(self):
+        route = "opencode-go/gemini-4-argon-contributor"
+        config = product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": route},
+            "team_model_allowlist": [route],
+        })
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Review this repository",
+            task_id="gemini-read", config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["errors"],
+                         ["TEAM_ROUTE_PRIVACY_UNVERIFIED"])
+        self.assertEqual(driver.names(), [])
+        self.assertEqual(self.claim_rows(), [])
+
+
 class FailClosedTests(TaskCase):
     def test_corrupt_task_record_raises(self) -> None:
         task_id = product_task.task_id_for(str(self.repo), "Review this repository")

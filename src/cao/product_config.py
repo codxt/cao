@@ -47,6 +47,7 @@ __all__ = [
     "safe_route_token",
     "model_policy_error",
     "SUPPORTED_TEAM_ROUTES",
+    "NON_ZDR_ROUTES",
     "TASK_SECTION",
     "DEFAULT_WORKSPACE_LABEL_PREFIX",
     "DEFAULT_RUNNER_TIMEOUT",
@@ -350,29 +351,91 @@ def route_model(route: Any) -> tuple[str, str | None]:
     return ("resolved", model) if model is not None else ("unresolved", None)
 
 
-#: Allowed ``opencode/`` and ``opencode-go/`` model ids name the OpenCode
+#: Allowed ``opencode/``, ``opencode-go/`` and ``codex/`` model ids name the
 #: dispatch routes themselves, so a resolved route that lists one must carry
-#: the actual OpenCode agent kind and provider CLI. A model string alone never
-#: proves OpenCode routing or a paid provider, so a foreign or missing agent
-#: kind or provider CLI is refused before any effect instead of substituting
-#: another runtime. Routes for other provider prefixes keep generic behavior.
+#: the actual agent kind and provider CLI. A model string alone never proves a
+#: runtime identity or a paid provider, so a foreign or missing agent kind or
+#: provider CLI is refused before any effect instead of substituting another
+#: runtime. Routes for other provider prefixes keep generic behavior.
 _TEAM_ROUTE_RUNTIME = {
     "opencode": ("opencode", "opencode"),
     "opencode-go": ("opencode", "opencode"),
+    "codex": ("codex", "codex"),
 }
 
+#: Runtime identities whose allowlisted routes are authorized for READ only.
+#: A Codex profile is a read-only reader/reviewer in this policy: a WRITE
+#: dispatch bound to the Codex runtime — by its canonical identity prefix or by
+#: its resolved agent kind / provider CLI — is refused even when its model id is
+#: allowlisted, so the read-only role can never be escalated into a writer.
+_READ_ONLY_ROUTE_RUNTIMES = frozenset({"codex"})
 
-def model_policy_error(route: Any, policy: TeamModelPolicy | None) -> str | None:
+#: Route identities whose upstream provider is known not to offer
+#: zero-data-retention for submitted input (it may retain or train on it).
+#: CAO performs no automated provider-privacy classification and this product
+#: adapter cannot technically prove that a checkout or prompt is clean public
+#: OSS or sanitized, so these identities are refused at every NEW dispatch.
+#: The public-input admission gate is documented but unfulfilled by this build;
+#: a route is never silently substituted for them.
+#:
+#: Ceiling: this is a conservative build-time classification. A non-ZDR route
+#: that is not listed here, but is allowlisted, is governed only by the exact
+#: allowlist and the READ/WRITE and identity checks. Replacing it with an
+#: operator-declared, technically verified admission is the upgrade path.
+NON_ZDR_ROUTES = frozenset({"opencode-go/gemini-4-argon-contributor"})
+#: The bare model ids behind :data:`NON_ZDR_ROUTES`, matched regardless of a
+#: provider prefix so a foreign runtime cannot launder the same model name.
+_NON_ZDR_MODEL_IDS = frozenset(
+    route.rsplit("/", 1)[-1] for route in NON_ZDR_ROUTES)
+#: Case-folded copies used by the refusal comparison: a non-canonical spelling
+#: of the same route id must not launder the provider past the gate.
+_NON_ZDR_ROUTES_FOLDED = frozenset(route.lower() for route in NON_ZDR_ROUTES)
+_NON_ZDR_MODEL_IDS_FOLDED = frozenset(
+    route.lower() for route in _NON_ZDR_MODEL_IDS)
+
+
+def _canonical_route_identity(model: str, cli: Any) -> str:
+    """The canonical allowlist identity of one resolved route.
+
+    A bare ``--model`` token resolved through a named provider CLI is qualified
+    with that exact provider prefix, so a native Codex ``--model gpt-6.1-sol``
+    has the canonical allowlist identity ``codex/gpt-6.1-sol`` and a Medium or
+    High reasoning-effort variant of the same model is the same base identity.
+    A model that already carries a provider prefix is its own identity; a route
+    with no trustworthy CLI keeps the bare token, which cannot match the
+    ``provider/model`` allowlist shape and therefore fails closed.
+    """
+
+    if "/" in model:
+        return model
+    token = safe_route_token(cli)
+    return model if token is None else f"{token}/{model}"
+
+
+def _route_mode(value: Any) -> str | None:
+    return value.strip().lower() if type(value) is str else None
+
+
+def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
+                       mode: Any = None) -> str | None:
     """The refusal reason when a configured policy forbids this route.
 
     The model is read only from the provider entry and the verified agent argv,
     never from an untrusted prompt. With a configured policy an ambiguous,
     missing, malformed or unlisted selection is denied rather than silently
     substituted, and a ``#effort`` variant is accepted as the same base route.
-    A listed ``opencode/`` or ``opencode-go/`` model id additionally binds the
-    route identity: the resolved agent kind and the provider CLI must both be
-    the actual authorized OpenCode runtime, so a spoofed ``claude`` CLI can
-    never pass on an allowed-looking model id.
+    A listed ``opencode/``, ``opencode-go/`` or ``codex/`` model id additionally
+    binds the route identity: the resolved agent kind and the provider CLI must
+    both be the actual authorized runtime, so a spoofed foreign CLI can never
+    pass on an allowed-looking model id.
+
+    ``mode`` is the declared task mode (``read``/``write``) when the caller
+    knows it. A route bound to a read-only runtime (Codex) — through its
+    canonical identity prefix or through its resolved agent kind / provider CLI
+    — is refused unless the mode is exactly READ; an unknown mode is refused
+    rather than assumed safe. A route whose provider is known not to be
+    zero-data-retention is always refused: the public-input admission gate this
+    build would require is not technically verifiable.
     """
 
     if policy is None:
@@ -380,16 +443,55 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None) -> str | None
     status, model = route_model(route)
     if status != "resolved" or model is None:
         return "TEAM_MODEL_UNRESOLVED"
-    if not policy.permits(model):
+    provider = route.get("provider")
+    cli = (provider.get("cli")
+           if isinstance(provider, Mapping) else None)
+    identity = _canonical_route_identity(model, cli)
+    prefix = identity.split("/", 1)[0]
+    required = _TEAM_ROUTE_RUNTIME.get(prefix)
+    # A route whose canonical identity binds a known runtime is matched ONLY as
+    # that exact canonical identity, so a bare or foreign alias can never stand
+    # in for it. Routes for other provider prefixes keep the generic behavior
+    # (the resolved model or its qualified identity may be listed).
+    permitted = (policy.permits(identity) if required is not None
+                 else (policy.permits(model) or policy.permits(identity)))
+    if not permitted:
         return "TEAM_MODEL_NOT_ALLOWED"
-    required = _TEAM_ROUTE_RUNTIME.get(model.split("/", 1)[0])
     if required is not None:
-        provider = route.get("provider")
-        cli = (provider.get("cli")
-               if isinstance(provider, Mapping) else None)
         if (safe_route_token(route.get("agent_kind")) != required[0]
                 or safe_route_token(cli) != required[1]):
             return "TEAM_ROUTE_IDENTITY_MISMATCH"
+    # Compare on the base route, case-folded: a bounded ``#effort`` variant and
+    # a non-canonical spelling never change the upstream provider, so neither
+    # may slip past the non-zero-data-retention refusal the canonical id is
+    # subject to.
+    base_model = _normalize_team_model(model)
+    base_identity = _normalize_team_model(identity).lower()
+    base_model_id = base_model.rsplit("/", 1)[-1].lower()
+    if (base_identity in _NON_ZDR_ROUTES_FOLDED
+            or base_model_id in _NON_ZDR_MODEL_IDS_FOLDED):
+        return "TEAM_ROUTE_PRIVACY_UNVERIFIED"
+    # A Codex route binds its runtime either through its canonical identity
+    # prefix or through its resolved agent kind / provider CLI, so a
+    # foreign-prefixed model id (which would otherwise take the generic path)
+    # still counts as Codex.
+    kind_token = safe_route_token(route.get("agent_kind"))
+    cli_token = safe_route_token(cli)
+    codex_bound = (prefix in _READ_ONLY_ROUTE_RUNTIMES
+                   or kind_token in _READ_ONLY_ROUTE_RUNTIMES
+                   or cli_token in _READ_ONLY_ROUTE_RUNTIMES)
+    # A Codex route must name its model through exactly one unambiguous native
+    # ``--model`` argument. A model that appears only in the provider entry
+    # would launch Codex with no explicit selection, letting its implicit
+    # default stand in for the allowlisted model, so it is unresolved.
+    if codex_bound:
+        _, mentions, trap = _argv_model(route.get("agent_args"))
+        if mentions != 1 or trap:
+            return "TEAM_MODEL_UNRESOLVED"
+    # A Codex route is READ-only: a WRITE dispatch on it is refused even when
+    # its model id is allowlisted, so the reader can never be escalated.
+    if codex_bound and _route_mode(mode) != "read":
+        return "TEAM_ROUTE_READ_ONLY"
     return None
 
 
