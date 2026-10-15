@@ -19,7 +19,11 @@
 > operator-authority adapter, and its first dispatch is `HOLD` in this build,
 > while an already-approved immutable READ team can be re-verified and advanced.
 > B4, B5, B6 and B7 are **not** promoted past the state the repository actually
-> records.
+> records. **B8 standing READ authority + autonomous pipeline** was recovered
+> from a preserved checksummed candidate and completed in source
+> (`src/cao/intake_authority.py`, `src/cao/intake_pipeline.py`); it is
+> **opt-in, default-disabled**, derives authority only from a root-owned grant
+> in `/etc/cao`, and holds every first dispatch when none is provisioned.
 
 > **Owner.** The CAO repository owner. Shared-contract changes and anything
 > beyond the stated scope require an accountable integration decision, exactly as
@@ -705,6 +709,7 @@ authority concept, no scheduler, no second Registry and no second ledger.
 | B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
 | B6 governed execution handoff | `src/cao/intake_handoff.py`, `tests/test_intake_handoff.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; `PLAN_ONLY` (no authenticated operator gate); acceptance pending |
 | B7 durable Intake execution queue | `src/cao/intake_queue.py`, `tests/test_intake_queue.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; **opt-in, default-disabled**; first dispatch held (no authenticated operator gate); acceptance pending |
+| B8 standing READ authority + autonomous pipeline | `src/cao/intake_authority.py`, `src/cao/intake_pipeline.py`, `tests/test_intake_authority.py`, `tests/test_intake_pipeline.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; **opt-in, default-disabled** (`daemon.intake_pipeline`); authority exists only via a root-owned `/etc/cao` grant; no grant on the host ⇒ all first dispatches `HOLD`; acceptance pending |
 | Team Execution manifest `cao.team.v1` | `docs/team-execution.md` | shipped |
 | Performer/authority/evidence semantics | owner's cross-project work-execution contract (owner-referenced v0.4) | owner planning reference; re-verify against canonical home |
 | B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending; the owner plan below is its authority, not operating fact |

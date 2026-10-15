@@ -222,7 +222,7 @@ class DaemonCase(unittest.TestCase):
             self.addCleanup(os.environ.pop, key, None)
 
     def build(self, driver, *, spawn=None, alive=None, config=None, max_ticks=None,
-              terminate=None, identity=None):
+              terminate=None, identity=None, authority_reader=None):
         return product_daemon.Daemon(
             driver=driver,
             config=config or self.config,
@@ -235,6 +235,7 @@ class DaemonCase(unittest.TestCase):
             terminate=terminate if terminate is not None else (lambda _pid: None),
             identity=identity,
             max_ticks=max_ticks,
+            authority_reader=authority_reader,
         )
 
     def run_read(self, driver, prompt="Review this repository", wait_ms=0):
@@ -1779,6 +1780,106 @@ class HandoffReconciliationTests(DaemonCase):
         self.assertEqual(result["status"], "HOLD")
         self.assertFalse(result["plan"]["dispatch"])
         self.assertEqual(team.list_teams(env=self.env), [])
+
+
+class StandingAuthorityDaemonTests(DaemonCase):
+    """The daemon runs the B8 pipeline and supplies the standing authority."""
+
+    def _config(self, **daemon):
+        return product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "daemon": daemon,
+        })
+
+    def _authority(self, verdict="SUPPORTED", adapter=None):
+        record = {"verdict": verdict, "code": None, "reason": "synthetic",
+                  "envelope": ({"scope": {"repo": str(self.repo), "paths": []},
+                                "source": {"ref": None}} if verdict == "SUPPORTED"
+                               else None),
+                  "adapter": adapter}
+        return lambda env, clock: record
+
+    def test_pipeline_is_disabled_by_default(self) -> None:
+        self.assertFalse(product_config.daemon_defaults(self._config()).intake_pipeline)
+        daemon = self.build(FakeDriver(), config=self._config())
+        daemon.start()
+        with mock.patch("cao.intake_pipeline.tick") as pipeline, \
+                mock.patch("cao.intake_queue.tick") as queue:
+            report = daemon.tick()
+        pipeline.assert_not_called()
+        queue.assert_not_called()
+        self.assertFalse(any(
+            item.get("action", "").startswith("intake_")
+            for item in report["effects"]))
+
+    def test_enabled_pipeline_without_authority_holds_and_passes_none(self) -> None:
+        daemon = self.build(
+            FakeDriver(), config=self._config(intake_pipeline=True),
+            authority_reader=self._authority("UNAVAILABLE"))
+        daemon.start()
+        report_view = {"schema": "x", "status": "IDLE", "items": [],
+                       "advanced": 0, "effects": [], "exceptions": []}
+        with mock.patch("cao.intake_queue.tick",
+                        return_value=report_view) as queue:
+            report = daemon.tick()
+        queue.assert_called_once()
+        self.assertNotIn("operator_authority", queue.call_args.kwargs)
+        authority = [e for e in report["effects"]
+                     if e.get("action") == "intake_authority"]
+        self.assertEqual(authority[0]["status"], "UNAVAILABLE")
+        pipeline = [e for e in report["effects"]
+                    if e.get("action") == "intake_pipeline"]
+        self.assertEqual(pipeline[0]["status"], "HOLD")
+
+    def test_enabled_pipeline_with_authority_passes_the_adapter(self) -> None:
+        adapter = object()
+        daemon = self.build(
+            FakeDriver(), config=self._config(intake_pipeline=True),
+            authority_reader=self._authority("SUPPORTED", adapter))
+        daemon.start()
+        report_view = {"schema": "x", "status": "IDLE", "items": [],
+                       "advanced": 0, "effects": [], "exceptions": []}
+        with mock.patch("cao.intake_queue.tick",
+                        return_value=report_view) as queue:
+            daemon.tick()
+        queue.assert_called_once()
+        self.assertIs(queue.call_args.kwargs.get("operator_authority"), adapter)
+
+    def test_pipeline_flag_must_be_boolean(self) -> None:
+        with self.assertRaises(product_config.ProductConfigError):
+            product_config.daemon_defaults(self._config(intake_pipeline="yes"))
+
+    def test_b7_queue_only_configuration_remains_undisturbed(self) -> None:
+        # A B7-only daemon (queue enabled, pipeline flag absent) still runs
+        # exactly one queue pass and still supplies no operator authority.
+        daemon = self.build(FakeDriver(), config=self._config(intake_queue=True))
+        daemon.start()
+        report_view = {"schema": "x", "status": "IDLE", "items": [],
+                       "advanced": 0, "effects": [], "exceptions": []}
+        with mock.patch("cao.intake_queue.tick",
+                        return_value=report_view) as queue, \
+                mock.patch("cao.intake_pipeline.tick") as pipeline:
+            report = daemon.tick()
+        queue.assert_called_once()
+        self.assertNotIn("operator_authority", queue.call_args.kwargs)
+        pipeline.assert_not_called()
+
+    def test_enabled_pipeline_a_refused_authority_supplies_no_adapter(self) -> None:
+        daemon = self.build(
+            FakeDriver(), config=self._config(intake_pipeline=True),
+            authority_reader=self._authority("REFUSED"))
+        daemon.start()
+        report_view = {"schema": "x", "status": "IDLE", "items": [],
+                       "advanced": 0, "effects": [], "exceptions": []}
+        with mock.patch("cao.intake_queue.tick",
+                        return_value=report_view) as queue:
+            report = daemon.tick()
+        queue.assert_called_once()
+        self.assertIsNone(queue.call_args.kwargs.get("operator_authority"))
+        pipeline = [e for e in report["effects"]
+                    if e.get("action") == "intake_pipeline"]
+        self.assertEqual(pipeline[0]["status"], "HOLD")
 
 
 if __name__ == "__main__":
