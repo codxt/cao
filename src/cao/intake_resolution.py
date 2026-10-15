@@ -55,7 +55,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from . import intake, intake_compile, intake_triage, product_config, registry, team
+from . import (intake, intake_compile, intake_handoff, intake_triage,
+               product_config, registry, team)
 from .evidence import canonical_json, fingerprint, utc_now
 
 __all__ = [
@@ -581,6 +582,7 @@ def _status_document(
     acceptance: Mapping[str, Any],
     *,
     clock: Any,
+    handoff: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if packet is None:
         status, mover, summary, uncertainties = (
@@ -639,6 +641,12 @@ def _status_document(
                           "no B4 proposal is bound to the advisory",
             },
             "team": dict(team_evidence),
+            "handoff": dict(handoff) if handoff is not None else {
+                "source": "handoff",
+                "verdict": "UNAVAILABLE",
+                "reason": "the handoff link could not be derived",
+                "team_id": None,
+            },
             "registry": dict(registry_evidence),
             "external": {
                 "verdict": "UNKNOWN",
@@ -719,9 +727,13 @@ def derive_status(
     objective = draft["plan"]["objective"] if draft is not None else record["title"]
     registry_evidence = _registry_activity(objective, env)
     acceptance = _acceptance(acceptance_source, sid, packet, draft, env)
+    # A read-only linked team/claim snapshot: an already-started independent
+    # READ audit is reported from authoritative CAO evidence, and its provenance
+    # is validated (team id/owner/source), never self-asserted.
+    handoff = intake_handoff.linked_state(sid, env)
     document = _status_document(
         record, packet, draft, team_evidence, registry_evidence, acceptance,
-        clock=clock,
+        clock=clock, handoff=handoff,
     )
     if document["status"] not in STATUSES:
         raise ResolutionStateError("refusing to emit an unknown status value")

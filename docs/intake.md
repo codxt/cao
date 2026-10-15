@@ -464,6 +464,103 @@ Load-bearing properties:
   rounded up to a send. There is no custom MCP server, HTTP service, email,
   Slack, Jira, ServiceNow API, secret or scheduler here.
 
+## Governed execution handoff (B6): plan only, gated
+
+`cao intake handoff` is the B6 path. It is the **bridge** the earlier phases
+lack: it derives, from the *original* admission and its B3 advisory, one
+independently reviewable **source-attested eligibility result**, and -- only
+when that result qualifies an explicit, operator-qualified, scoped **READ**
+execution -- one fail-closed, idempotent **handoff plan**.
+
+```sh
+cao intake handoff --id <submission-id> --dry-run     # derive a plan, no state
+cao intake handoff --id <submission-id> --repo /path/repo
+cao intake handoff --id <submission-id> --inspect     # read-only status
+cao intake handoff --id <submission-id> --authorize   # UNAVAILABLE in this build
+```
+
+### Mention is not request
+
+B3 flags a reserved word as a risk marker and hands almost every such request to
+`HUMAN_REVIEW`, and B4 accepts only `PROPOSE_WORK`. B6 closes that gap with a new,
+**independent** result. It classifies each reserved consequential-effect category
+(`merge`, `deploy`, `release`, `publish`, `credential`, `permission`,
+`destructive`) in the opaque request text as `REQUESTED`, `AMBIGUOUS`,
+`MENTIONED`, `NEGATED` or `ABSENT`, using deterministic, bounded rules:
+
+- an effect the request **explicitly asks for** is a `HOLD`;
+- an effect the rules **cannot prove non-actionable** is a `HOLD` with a precise
+  reason, never a silent pass;
+- a request that mixes a consequential effect with a read scope is **never**
+  silently downgraded to a READ plan (`mixed_effect_and_read_request`);
+- only a request that declares a read scope and holds no consequential effect is
+  `ELIGIBLE_READ`.
+
+The result is derived, never asserted, and **the immutable B3 packet is never
+mutated**: its fingerprint is bound, not rewritten. There is no LLM free-text
+authority anywhere.
+
+### What a handoff plan binds
+
+A plan binds the submission id, the B3 packet fingerprint and disposition, the
+source ref and HEAD (read-only Git evidence), the role/model/privacy
+qualification, the immutable team/task ids (derived deterministically from the
+submission id) and the plan's own content digest. The Registry owner is granted
+by the operator authority and recorded on the plan's grant.
+
+### PLAN_ONLY: the operator identity gate is missing
+
+B6 starts, ticks, schedules, claims and deploys nothing. A plan becomes
+executable **only** through an **in-process** authenticated operator-authority
+adapter supplied by the host. A CLI flag, a process-environment value or a JSON
+file is caller-controlled and is **never** proof, so this build ships no such
+adapter and every otherwise-dispatchable plan is `PLAN_ONLY`. It reports the
+exact missing capability and the smallest required integration:
+
+> supply an in-process adapter through the library `operator_authority` argument
+> that (1) authenticates the operator on a host-owned channel outside
+> argv/env/JSON, (2) returns a grant bound to this plan's exact digest with
+> `read_only = true`, and (3) names the operator, the scoped repository, the role,
+> the model and the provider privacy qualification.
+
+When every gate does prove -- authenticated operator, read-only grant bound to
+this exact plan, in-scope repository, allowlisted model, provider privacy
+qualified -- B6 hands **one** immutable `cao.team.v1` READ manifest to the
+**existing** CAO team owner API (`team.validate_spec`, `team.initialize`,
+`team.set_desired`). It never ticks: the existing R3/R4 daemon reconciles the
+team. A held, merely-planned or refused handoff creates no team, no agent and no
+Registry claim. `--authorize` is an honest structured `UNAVAILABLE`: the CLI
+never constructs an authority and never accepts one.
+
+### Already-started audits are linked, not duplicated
+
+If an independent READ audit is already running for a submission, the plan is
+`ALREADY_STARTED` and no second team is planned or launched. The link is
+validated from authoritative CAO evidence: the team id must resolve, the
+immutable manifest must be entirely READ, and the manifest itself must cite the
+submission. Its status is read from the team checkpoint and its claims from the
+ledger read-only, never from a caller-supplied `completed` field. Two competing
+audits are an explicit refusal, never a collapsed link.
+
+### Storage, idempotency and read-only status
+
+Plans live under `$XDG_STATE_HOME/cao/intake-handoffs/` (`0700`/`0600`, through
+the same validated, atomic, fsynced, descriptor-relative store as admission). The
+plan id is a one-way digest of the immutable binding, so an identical replay is
+idempotent (`DUPLICATE`), different evidence is a distinct plan, and a reused id
+for different content is a conflict. `--dry-run` creates no state. `cao intake
+handoff --inspect` and `cao intake status` derive a read-only handoff status from
+authoritative evidence and persist nothing; `cao intake status` also reports the
+validated linked team/claim snapshot.
+
+### Still gated
+
+Real operator authentication, email, Telegram, guest access and any
+merge/deploy/permission action remain **gated and `UNAVAILABLE`**. Source state,
+team completion and verified outcome stay distinct, and nothing here closes a
+request. B6 adds no queue, no scheduler, no second ledger, no network call and no
+credential.
+
 ## Limitations and unresolved items
 
 - **Marketplace policy is unresolved.** Whether and how a marketplace app may
@@ -511,11 +608,24 @@ ambiguous sends and failure of the built-in adapter; a caller-injected adapter
 that can never execute; replay/idempotence; prompt-injection inertness; read-only
 Registry and private `0700`/`0600` state; zero execution/claim/team effects; and
 the CLI.
+`tests/test_intake_handoff.py` is the B6
+runnable check: the mention-vs-request classification; the mixed and ambiguous
+hold; synthetic equivalents of four redacted requests; the authenticated-operator
+gate against an unauthenticated, stale, write-scoped or out-of-scope caller and a
+spoofed environment/CLI; the immutable B3 fingerprint; the source/HEAD binding
+and drift; validated linking of an already-started READ audit and the refusal of
+uncited, write or competing audits; duplicate admission and crash-restart durable
+idempotency; a WRITE request that is never dispatched; no new agent or Registry
+claim on a hold; the absence of any raw body, tenant text or credential in a
+plan; private `0700`/`0600` state; and the CLI.
 `tests/test_boundaries.py` additionally
 guards that intake never routes a durable record through the permissive state
-reader and that triage, B4 and B5 reach the Registry through read-only calls
+reader and that triage, B4, B5 and B6 reach the Registry through read-only calls
 only, open no egress surface and use no shell — and that B4 and B5 never reach a
 team execution entry point, a product task, a Registry write, canonical state or
-any private-store write, that B5 `reply` accepts no caller-supplied adapter and
-that the CLI never serves a guest projection from caller-controlled input.
-Every value is synthetic; nothing is shipped and no private payload is used.
+any private-store write, that B6 reaches the team owner API only inside its
+gated dispatch and never ticks or schedules, that B5 `reply` accepts no
+caller-supplied adapter, that B6's CLI never constructs or accepts an operator
+authority, and that the CLI never serves a guest projection from
+caller-controlled input. Every value is synthetic; nothing is shipped and no
+private payload is used.

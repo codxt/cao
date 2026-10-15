@@ -1,7 +1,7 @@
-# Intake roadmap (B3–B5): governed request intake
+# Intake roadmap (B3–B6): governed request intake
 
 > **Document status.** Accepted **owner plan** for the governed intake middle
-> (B3–B5). **B3 is implemented in source** (`src/cao/intake_triage.py`,
+> (B3–B6). **B3 is implemented in source** (`src/cao/intake_triage.py`,
 > `tests/test_intake_triage.py`), **merged to the default branch and
 > independently accepted**. **B4 is implemented in source**
 > (`src/cao/intake_compile.py`, `tests/test_intake_compile.py`) and is reported
@@ -9,8 +9,12 @@
 > **separate, later states** and are not claimed here. **B5 is implemented in
 > source** (`src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`)
 > and is likewise reported as `SOURCE_COMPLETE`; its independent acceptance is a
-> separate, later state and is not claimed here. B4 and B5 are **not** promoted
-> past the state the repository actually records.
+> separate, later state and is not claimed here. **B6 is implemented in source**
+> (`src/cao/intake_handoff.py`, `tests/test_intake_handoff.py`) and is likewise
+> reported as `SOURCE_COMPLETE`; it is `PLAN_ONLY` in this build because the
+> authenticated operator identity gate is absent, and its independent acceptance
+> is a separate, later state and is not claimed here. B4, B5 and B6 are **not**
+> promoted past the state the repository actually records.
 
 > **Owner.** The CAO repository owner. Shared-contract changes and anything
 > beyond the stated scope require an accountable integration decision, exactly as
@@ -38,7 +42,7 @@ Three layers must stay explicit and never be blurred:
 |---|---|---|
 | **Source evidence** | What an external source or in-tree artifact actually says/does | vendor page; committed B1/B2/B3 code in `src/cao/intake.py`, `src/cao/intake_bridge.py`, `src/cao/intake_triage.py`, `docs/intake.md` |
 | **Accepted plan** | What the owner has decided CAO *should* build | this document |
-| **Live implementation** | What actually runs and is verified | B3 deterministic triage; B4 draft compiler; B5 read-only status projection and mock gate |
+| **Live implementation** | What actually runs and is verified | B3 deterministic triage; B4 draft compiler; B5 read-only status projection and mock gate; B6 gated, `PLAN_ONLY` READ handoff |
 
 A statement in this document is a plan unless it cites source evidence or a live
 test. Reviewers must not read a planned capability as shipped.
@@ -48,7 +52,7 @@ and its final independent security acceptance is recorded separately. Nothing in
 this document promotes a commit to a merge, a merge to a deploy, or a deploy to
 live acceptance.
 
-## 1. The gap B3–B5 close
+## 1. The gap B3–B6 close
 
 `docs/intake.md` describes what ships today: one bounded, strictly-shaped JSON
 submission admitted **once** into the operator's private XDG state, deliberately
@@ -403,7 +407,72 @@ in `tests/test_boundaries.py`.
 review proving truthful status derivation, gated and idempotent sends, and
 projection-only guest access.
 
-## 7. Dependencies and gates
+## 7. Phase B6 — governed execution handoff
+
+**Status: implemented in source (`SOURCE_COMPLETE`); `PLAN_ONLY` in this build. Independent acceptance pending.**
+
+**Goal.** Close the missing Intake-to-execution bridge: turn an admitted,
+read-scoped request into **one** governed, reviewable READ handoff — and nothing
+more — from evidence that already exists.
+
+**Implemented surface.** `src/cao/intake_handoff.py` and `cao intake handoff
+--id <submission-id> [--repo PATH] [--source-ref REF] [--dry-run] [--inspect]
+[--authorize]`. B6 derives an independent **source-attested eligibility result**
+from the original admission and its B3 advisory and classifies each reserved
+consequential effect (`merge`, `deploy`, `release`, `publish`, `credential`,
+`permission`, `destructive`) in opaque request text as `REQUESTED`, `AMBIGUOUS`,
+`MENTIONED`, `NEGATED` or `ABSENT`. It handles the case B3 cannot: a *mention* of
+a reserved word is not a request, while an explicit effect, or an effect that
+cannot be proven non-actionable, is a `HOLD` with a precise reason. A request that
+mixes a consequential effect with a read scope (`mixed_effect_and_read_request`)
+is **never** downgraded to a READ plan. The immutable B3 packet is bound, never
+mutated, and no model decides anything.
+
+**The plan and its gates.** A plan binds the submission id, the B3 packet
+fingerprint and disposition, the source ref and HEAD, the role/model/privacy
+qualification, the immutable team/task ids and the plan digest, and it records
+the operator-granted Registry owner. It is executed **only** through an in-process
+authenticated operator-authority adapter; a CLI flag, environment value or JSON
+file is caller-controlled and is never proof. This build ships no such adapter,
+so every dispatchable plan is `PLAN_ONLY` and names the smallest required
+integration. When every gate proves, B6 hands one immutable `cao.team.v1` READ
+manifest to the existing CAO team owner API (`team.validate_spec`,
+`team.initialize`, `team.set_desired`); it never ticks, and the existing R3/R4
+daemon reconciles the team. A hold, a plan and a refusal create no team, no agent
+and no Registry claim.
+
+**Preserve, do not duplicate.** An already-started independent READ audit is
+linked and preserved, not duplicated. The link is validated from authoritative
+evidence (team id resolves, the immutable manifest is entirely READ and cites the
+submission), and its status is read from the checkpoint and its claims from the
+ledger read-only — never from a caller-supplied `completed` field. Two competing
+audits are refused, never collapsed.
+
+**Storage, idempotency, status.** Plans live under
+`$XDG_STATE_HOME/cao/intake-handoffs/` (`0700`/`0600`, through the existing
+validated private store); the plan id is a one-way digest of the immutable
+binding, so replay is idempotent and a reused id for different content is a
+conflict. `--dry-run` creates no state, and `--inspect` and `cao intake status`
+persist nothing.
+
+**Explicitly not in B6:** no scheduler, no queue, no second ledger, no tick, no
+claim, no merge/deploy/permission action, no network call, no credential and no
+LLM authority. Real operator authentication, email, Telegram and guest access
+remain gated and `UNAVAILABLE`.
+
+**Tests to write (synthetic only):** the classification and the mixed/ambiguous
+hold; four redacted-request equivalents; authenticated vs caller-spoofed
+operator; immutable B3 fingerprints; stale/drift; competing claims; duplicate and
+crash-restart idempotency; a WRITE request never dispatched; no new agent/claim
+on a hold; unknown sender/tenant privacy; truthful status. These are the runnable
+check in `tests/test_intake_handoff.py`, with the read-only and zero-effect
+boundaries in `tests/test_boundaries.py`.
+
+**Acceptance gate.** B6 is accepted only after B5 acceptance, on independent
+review proving the eligibility is source-attested, the operator gate is the only
+path to a dispatch, and no held, planned or refused handoff has any effect.
+
+## 8. Dependencies and gates
 
 ```text
 B2 final security approval
@@ -413,6 +482,8 @@ B2 final security approval
   → B4 independent acceptance    [separate recorded gate]
   → B5 implementation            [done: SOURCE_COMPLETE]
   → B5 independent acceptance    [pending]
+  → B6 implementation            [done: SOURCE_COMPLETE; PLAN_ONLY]
+  → B6 independent acceptance    [pending]
 ```
 
 - No phase begins before the **previous gate is accepted**. B3's independent
@@ -430,7 +501,7 @@ B2 final security approval
   test suites. Git, CI and release state are verified **separately** — a commit
   is not a merge, a merge is not a deploy, and a deploy is not live acceptance.
 
-## 8. Completion-state vocabulary
+## 9. Completion-state vocabulary
 
 Five distinct states, never collapsed:
 
@@ -445,7 +516,7 @@ Five distinct states, never collapsed:
 Reports must name the exact state reached and must not promote a lower state to
 a higher one.
 
-## 9. Pilot and acceptance criteria; smallest first steps
+## 10. Pilot and acceptance criteria; smallest first steps
 
 **Pilot posture.** Every phase is piloted **synthetic-only**: invented
 submissions, invented repos, invented identities. No real client or private
@@ -470,13 +541,17 @@ payload is used in a pilot or a test.
 7. **B5 dry-run adapter** — one mock channel send, gated and receipted, before
    any real adapter. **Done (`SOURCE_COMPLETE`);** real adapters remain
    unavailable, and an unqualified send is `UNAVAILABLE`.
+8. **B6 governed handoff** — an independent source-attested eligibility result
+   and one gated, idempotent READ handoff plan. **Done (`SOURCE_COMPLETE`);
+   `PLAN_ONLY`,** because the authenticated operator identity gate is absent; no
+   held, planned or refused handoff has any effect.
 
 **Acceptance criteria per phase:** full normal and `-S` test suites pass; the
 phase's tests pass; the foundation CLI smoke passes; `git diff --check` is
 clean; an independent reviewer confirms the phase's evidence and the absence of
 disallowed effects.
 
-## 10. Doctrine admission gate
+## 11. Doctrine admission gate
 
 Before any future cross-project work-admission doctrine change is made, the
 implementation must first rehearse a **synthetic standing-Plan** end to end:
@@ -484,15 +559,15 @@ proposal → matched accepted Plan/work package → compiled manifest → derive
 status. Only after that rehearsal passes may a doctrine change be proposed.
 This roadmap makes **no** doctrine change itself.
 
-## 11. Explicit non-goals
+## 12. Explicit non-goals
 
-B3–B5 do **not** introduce: a universal task database; a new authority concept;
+B3–B6 do **not** introduce: a universal task database; a new authority concept;
 a dispatcher, scheduler or queue; a second Registry or a second ledger; a custom
 marketplace MCP server; a presumed external status API; automatic execution on
 intake; automatic or unapproved outbound messaging; or any fabricated
 completion, sent or closed state.
 
-## 12. Open questions and research debt
+## 13. Open questions and research debt
 
 - **Request/event intake remains research debt.** The shape of a generic
   request/event intake beyond the current operator submission is unsettled.
@@ -509,7 +584,7 @@ completion, sent or closed state.
 - **B3 provider path is unbuilt.** The AI triage step stays behind the provider
   privacy gate and is not implemented in this build.
 
-## 13. Provenance
+## 14. Provenance
 
 | Item | Source | Standing |
 |---|---|---|
@@ -518,11 +593,12 @@ completion, sent or closed state.
 | B3 advisory triage | `src/cao/intake_triage.py`, `tests/test_intake_triage.py`, `docs/intake.md` | implemented, merged and independently accepted |
 | B4 routing compiler | `src/cao/intake_compile.py`, `tests/test_intake_compile.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
 | B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending |
+| B6 governed execution handoff | `src/cao/intake_handoff.py`, `tests/test_intake_handoff.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; `PLAN_ONLY` (no authenticated operator gate); acceptance pending |
 | Team Execution manifest `cao.team.v1` | `docs/team-execution.md` | shipped |
 | Performer/authority/evidence semantics | owner's cross-project work-execution contract (owner-referenced v0.4) | owner planning reference; re-verify against canonical home |
 | B5 request-to-resolution projection and mock gate | `src/cao/intake_resolution.py`, `tests/test_intake_resolution.py`, `docs/intake.md` | implemented, `SOURCE_COMPLETE`; acceptance pending; the owner plan below is its authority, not operating fact |
 
-## 14. Navigation
+## 15. Navigation
 
 - Current shipped intake contract: [`docs/intake.md`](intake.md)
 - Team execution contract: [`docs/team-execution.md`](team-execution.md)

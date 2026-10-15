@@ -24,6 +24,9 @@ from pathlib import Path
 from unittest import mock
 
 from cao import (
+    intake,
+    intake_handoff,
+    intake_triage,
     product_config,
     product_daemon,
     product_driver,
@@ -1702,6 +1705,80 @@ class TeamRecoveryDaemonTests(DaemonCase):
             self.start_daemon(driver, config).tick()
         net.assert_not_called()
         dial.assert_not_called()
+
+
+class HandoffReconciliationTests(DaemonCase):
+    """A B6 handoff READ team is reconciled only by the existing daemon."""
+
+    def _dispatch(self) -> tuple[str, str]:
+        document = {
+            "schema": intake.REQUEST_SCHEMA,
+            "item_id": "daemon-handoff",
+            "body": ("Read-only audit of the scoped source. Revalidate the "
+                     "default branch and report evidence."),
+            "title": "synthetic",
+            "source": "operator",
+        }
+        sid = intake.submit(document, env=self.env)["submission"]["submission_id"]
+        intake_triage.triage(sid, env=self.env)
+        preflight = intake_handoff.handoff_plan(
+            sid, env=self.env, repo=str(self.repo), dry_run=True
+        )
+        plan = preflight["plan"]
+        grant = {
+            "plan_digest": intake_handoff._binding_digest(plan),
+            "read_only": True,
+            "owner": "operator-one",
+            "scope": {"repo": str(self.repo), "paths": ["a.txt"]},
+            "role": "reader",
+            "model": "opencode-go/deepseek-v4.1-flash#high",
+            "privacy_qualified": True,
+            "granted_at": "2026-10-15T00:00:00Z",
+        }
+        authority = mock.Mock(return_value={
+            "authenticated": True, "operator": "operator-one", "grant": grant,
+        })
+        dispatched = intake_handoff.handoff_plan(
+            sid, env=self.env, repo=str(self.repo),
+            operator_authority=authority,
+        )
+        self.assertEqual(dispatched["status"], "ADMITTED")
+        return sid, dispatched["plan"]["binding"]["team_id"]
+
+    def test_handoff_team_is_reconciled_by_the_existing_daemon(self) -> None:
+        _sid, team_id = self._dispatch()
+        driver = FakeDriver()
+        daemon = self.build(driver)
+        daemon.start()
+        with (
+            mock.patch("cao.product_task.run_task",
+                       side_effect=AssertionError("handoff work must not be "
+                                                  "regenerated as a product task")) as legacy,
+            mock.patch("cao.team.tick_all",
+                       return_value=[{"team_id": team_id,
+                                      "status": "PENDING"}]) as team_tick,
+        ):
+            report = daemon.tick()
+        legacy.assert_not_called()
+        team_tick.assert_called_once()
+        self.assertTrue(report["ticked"])
+        self.assertTrue(any(item.get("action") == "team_reconcile"
+                            for item in report["effects"]))
+
+    def test_a_held_handoff_creates_no_team_or_claim(self) -> None:
+        document = {
+            "schema": intake.REQUEST_SCHEMA,
+            "item_id": "daemon-hold",
+            "body": "Read-only audit then one squash merge of the branch.",
+            "title": "synthetic",
+            "source": "operator",
+        }
+        sid = intake.submit(document, env=self.env)["submission"]["submission_id"]
+        intake_triage.triage(sid, env=self.env)
+        result = intake_handoff.handoff_plan(sid, env=self.env, repo=str(self.repo))
+        self.assertEqual(result["status"], "HOLD")
+        self.assertFalse(result["plan"]["dispatch"])
+        self.assertEqual(team.list_teams(env=self.env), [])
 
 
 if __name__ == "__main__":

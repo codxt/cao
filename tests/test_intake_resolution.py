@@ -768,6 +768,79 @@ class ReadOnlyAndPrivacyTests(_Fixture):
             self.status(sid)
 
 
+class LinkedHandoffStateTests(_Fixture):
+    """The status carries a validated, read-only linked team/claim snapshot."""
+
+    def _audit_team(self, team_id: str, sid: str, *, cite: bool = True,
+                    mode: str = "read") -> None:
+        repo = str(self.root / ("repo-" + team_id))
+        os.makedirs(repo, exist_ok=True)
+        prompt = "Read-only inspection of the scoped checkout."
+        if cite:
+            prompt = (f"READ-only audit for CAO Intake submission {sid}. "
+                      + prompt)
+        task = {"id": "audit-read", "role": "reader", "repo": repo,
+                "prompt": prompt, "mode": mode}
+        writers = 0
+        if mode == "write":
+            task["write_scope"] = ["src/app.py"]
+            writers = 1
+        team.initialize(
+            {
+                "schema": "cao.team.v1",
+                "team_id": team_id,
+                "initiative": "init-" + team_id,
+                "roles": {"reader": {"instruction": "Read-only governed audit."}},
+                "tasks": [task],
+                "max_writers": writers,
+            },
+            env=self.env,
+        )
+
+    def test_status_without_a_link_is_unavailable(self) -> None:
+        sid = self.submit("l-one", "implement the widget under src")
+        self.triage(sid)
+        document = self.status(sid)
+        handoff = document["evidence"]["handoff"]
+        self.assertEqual(handoff["verdict"], "UNAVAILABLE")
+        self.assertIsNone(handoff["team_id"])
+
+    def test_status_links_only_a_validated_read_audit(self) -> None:
+        sid = self.submit("l-two", "implement the widget under src")
+        self.triage(sid)
+        self._audit_team("audit-read", sid)
+        document = self.status(sid)
+        handoff = document["evidence"]["handoff"]
+        self.assertEqual(handoff["verdict"], "SUPPORTED")
+        self.assertEqual(handoff["team_id"], "audit-read")
+        self.assertEqual(handoff["status"], "PAUSED")
+
+    def test_uncited_or_write_team_is_never_adopted(self) -> None:
+        sid = self.submit("l-three", "implement the widget under src")
+        self.triage(sid)
+        self._audit_team("audit-uncited", sid, cite=False)
+        self.assertIsNone(self.status(sid)["evidence"]["handoff"]["team_id"])
+        self._audit_team("audit-write", sid, mode="write")
+        self.assertIsNone(self.status(sid)["evidence"]["handoff"]["team_id"])
+
+    def test_link_is_bound_into_the_fingerprint(self) -> None:
+        sid = self.submit("l-four", "implement the widget under src")
+        self.triage(sid)
+        before = self.status(sid)["fingerprint"]
+        self._audit_team("audit-fp", sid)
+        after = self.status(sid)
+        self.assertNotEqual(before, after["fingerprint"])
+        self.assertEqual(after["evidence"]["handoff"]["team_id"], "audit-fp")
+
+    def test_link_writes_no_index_or_second_state(self) -> None:
+        sid = self.submit("l-five", "implement the widget under src")
+        self.triage(sid)
+        self._audit_team("audit-quiet", sid)
+        before = _tree_files(self.state_root)
+        self.status(sid)
+        self.assertEqual(_tree_files(self.state_root), before)
+
+
 class CliTests(_Fixture):
     def test_status_command_reports_a_status(self) -> None:
         sid = self.submit("c-one", "implement the widget under src")
