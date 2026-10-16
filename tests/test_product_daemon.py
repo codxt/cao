@@ -1058,6 +1058,128 @@ class ReconciliationTests(DaemonCase):
             (supervision[old_id], supervision[new_id])
         ))
 
+    # -- synthetic review READ retry probe ---------------------------------
+    def _stage_synthetic_review_retry(self) -> tuple[str, str, str]:
+        """Stage a round-0 READ review retry with a later round left future.
+
+        Returns the original attempt id, the bounded retry id and the
+        unlaunched id of the next review round (max_corrections >= 1).
+        """
+        spec = {
+            "schema": "cao.team.v1", "team_id": "review-retry-audit",
+            "max_parallel": 1, "max_writers": 1,
+            "roles": {
+                "writer": {"instruction": "Scoped implementation."},
+                "reviewer": {"instruction": "Independent READ-only review."},
+            },
+            "tasks": [{
+                "id": "audit-report", "role": "writer", "repo": str(self.repo),
+                "mode": "write", "write_scope": ["a.txt"],
+                "prompt": "Make one bounded change", "reviewer": "reviewer",
+                "max_corrections": 1,
+            }],
+        }
+        team.initialize(spec, env=self.env)
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            text=True).strip()
+        checkpoint = team._required("review-retry-audit", self.env)
+        retry = team._execution_id(
+            "review-retry-audit", "audit-report", "review", 0, 1)
+        checkpoint["slots"]["audit-report"].update(
+            phase="review", round=0, status="complete",
+            execution_id=retry, retry_no=1, head=head,
+            prompt="bounded review retry")
+        checkpoint["desired"] = "paused"
+        team._save(checkpoint, self.env)
+        team._required("review-retry-audit", self.env)  # validate exact slot
+        return (
+            team._execution_id("review-retry-audit", "audit-report", "review", 0),
+            retry,
+            team._execution_id("review-retry-audit", "audit-report", "review", 1),
+        )
+
+    def test_review_read_retry_classifies_exact_identities(self) -> None:
+        # Exact deterministic identities for the original review attempt and
+        # its one admitted READ retry, on a fully synthetic team.
+        original, retry, future = self._stage_synthetic_review_retry()
+        self.assertEqual(
+            original,
+            "ct-review-retry-audit-audit-report-review-0-3b815876927340fe29ce")
+        self.assertEqual(
+            retry,
+            "ct-review-retry-audit-audit-report-review-0-e33ca1182194ee725cbe")
+        owners = product_daemon._team_execution_owners(self.env)
+        # Previous attempt of the current stage is historical, the retry is
+        # current, and a later review round stays unlaunched (fail-closed)
+        # even though it shares the review phase with the retried slot.
+        self.assertEqual(owners[original], ("review-retry-audit", "historical"))
+        self.assertEqual(owners[retry], ("review-retry-audit", "current"))
+        self.assertEqual(owners[future], ("review-retry-audit", "unlaunched"))
+        # The not-yet-launched correction of this round stays unlaunched too.
+        self.assertEqual(
+            owners[team._execution_id(
+                "review-retry-audit", "audit-report", "correction", 1)],
+            ("review-retry-audit", "unlaunched"))
+        # Earlier work identities remain historical, including the READ work
+        # identity and its admitted retry.
+        for attempt in (0, 1):
+            self.assertEqual(
+                owners[team._execution_id(
+                    "review-retry-audit", "audit-report", "work", 0, attempt)],
+                ("review-retry-audit", "historical"))
+
+    def test_review_read_retry_holds_the_future_round_fail_closed(self) -> None:
+        original, retry, future = self._stage_synthetic_review_retry()
+        # All three durable records claim a completed stage; only the first
+        # two were ever launched by this checkpoint.
+        for index, ident in enumerate((original, retry, future)):
+            product_state.write_task({
+                "schema": product_state.TASK_SCHEMA, "task_id": ident,
+                "run_id": "cao-team-review-retry-audit", "status": "complete",
+                "updated_at": f"2026-01-01T00:00:0{index}Z",
+            }, self.env)
+        daemon = self.build(FakeDriver())
+        daemon.start()
+        with mock.patch("cao.product_task.run_task",
+                        side_effect=AssertionError("team task was re-driven")):
+            tick = daemon.tick()
+        supervision = product_state.read_daemon(self.env)["supervision"]
+        # Historical attempt and current retry resolve to their own lanes.
+        self.assertEqual(supervision[original]["action"], "team_historical")
+        self.assertTrue(supervision[original]["terminal"])
+        self.assertEqual(supervision[retry]["action"], "team_owned")
+        self.assertTrue(supervision[retry]["terminal"])
+        # The future review round is never adopted as a historical completion.
+        future_entry = supervision[future]
+        self.assertEqual(future_entry["status"], "HELD_UNKNOWN")
+        self.assertEqual(future_entry["reason"], "team stage was not launched")
+        self.assertTrue(any(
+            effect.get("task_id") == future
+            and effect.get("action") == "team_ownership_hold"
+            for effect in tick["effects"]))
+        self.assertFalse(any(
+            effect.get("task_id") in (original, retry)
+            for effect in tick["effects"]))
+
+    def test_review_read_retry_orphan_identities_are_refused(self) -> None:
+        # Orphan refusal: with no readable team checkpoint, neither the
+        # original attempt nor its retry may be owned by generic recovery.
+        original = team._execution_id(
+            "review-retry-audit", "audit-report", "review", 0)
+        retry = team._execution_id(
+            "review-retry-audit", "audit-report", "review", 0, 1)
+        owners = product_daemon._team_execution_owners(self.env)
+        self.assertNotIn(original, owners)
+        self.assertNotIn(retry, owners)
+        for ident in (original, retry):
+            for run_id in ("cao-team-review-retry-audit",
+                           product_config.DEFAULT_RUN_ID):
+                self.assertEqual(
+                    product_daemon._task_owner_lane(
+                        {"task_id": ident, "run_id": run_id}, owners),
+                    "unknown")
+
     def test_prior_review_and_correction_stages_preserve_team_ownership(self) -> None:
         # A reviewer/correction team retains durable per-phase task records
         # after the current checkpoint has moved on. Old complete stages are
