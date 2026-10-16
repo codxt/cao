@@ -1075,6 +1075,228 @@ class TeamTests(unittest.TestCase):
                 driver=driver, env=self.env, wait_ms=1000, registry_db="ignored")
         self.assertEqual(result["status"], "unknown")
 
+    def test_read_completion_protocol_closes_pane_and_releases(self):
+        """A real team READ closes its own pane before releasing its claim."""
+        repo = git_repo(self.root, name="read-protocol-ok")
+        db = str(self.root / "read-protocol-ok.sqlite3")
+        driver = FakeDriver()
+        ident = "ct-squad-reader-work-0"
+        challenge = team._result_challenge(ident)
+        driver.read_text = "final answer\nCAO_TEAM_RESULT: " + challenge
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="work", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["pane_closed"], "w1:p1")
+        self.assertTrue(result["claim"]["released"])
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "complete")
+        self.assertEqual(record["pane_closed"], record["checkpoint"]["pane_id"])
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        # A second evaluation is idempotent: no re-prompt, no replacement claim.
+        again = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="work", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db)
+        self.assertEqual(again["status"], "complete")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_read_without_receipt_never_releases_or_closes(self):
+        """A DONE worker with no exact nonce holds the claim and its pane."""
+        repo = git_repo(self.root, name="read-protocol-bad")
+        db = str(self.root / "read-protocol-bad.sqlite3")
+        driver = FakeDriver()
+        ident = "ct-squad-reader-bad-work-0"
+        driver.read_text = "Model credits exhausted. No generation occurred."
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source and emit a computed receipt",
+            phase="work", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"], "TEAM_RESULT_UNVERIFIED")
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertIsNone(record.get("pane_closed"))
+        conn = registry.connect_readonly(db)
+        try:
+            row = conn.execute(
+                "SELECT mode, released_at FROM claims").fetchone()
+            self.assertEqual(row["mode"], "READ")
+            self.assertIsNone(row["released_at"])
+        finally:
+            conn.close()
+
+    def test_review_without_verdict_never_releases_or_closes(self):
+        """A receipt alone never authorizes a review handback: the verdict is
+        re-checked on the durable evidence before pane close and claim release.
+        """
+        repo = git_repo(self.root, name="review-protocol-bad")
+        db = str(self.root / "review-protocol-bad.sqlite3")
+        driver = FakeDriver()
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        # The exact completion receipt is present but the review verdict is not.
+        driver.read_text = "findings without a verdict\nCAO_TEAM_RESULT: " + challenge
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "write", "write_scope": ["a.txt"]},
+            prompt="review\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="review", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db, review_head=A)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error"]["code"], "REVIEW_VERDICT_UNVERIFIED")
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "unknown")
+        self.assertIsNone(record.get("pane_closed"))
+        self.assertFalse((record.get("claim") or {}).get("released"))
+        conn = registry.connect_readonly(db)
+        try:
+            row = conn.execute("SELECT released_at FROM claims").fetchone()
+            self.assertIsNone(row["released_at"])
+        finally:
+            conn.close()
+
+    def test_review_with_valid_verdict_releases_and_closes(self):
+        repo = git_repo(self.root, name="review-protocol-ok")
+        db = str(self.root / "review-protocol-ok.sqlite3")
+        driver = FakeDriver()
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        driver.read_text = (
+            "CAO_REVIEW_VERDICT: APPROVED\n"
+            "CAO_REVIEWED_HEAD: " + A + "\n"
+            "CAO_TEAM_RESULT: " + challenge)
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "write", "write_scope": ["a.txt"]},
+            prompt="review\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="review", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db, review_head=A)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["pane_closed"], "w1:p1")
+        self.assertTrue(result["claim"]["released"])
+
+    def test_focused_idle_read_with_receipt_completes_and_is_idempotent(self):
+        # A focused tab reports IDLE for the same settled completion an unseen
+        # background worker reports as DONE. The team admits it only because
+        # the durable terminal capture carries this execution's exact receipt.
+        repo = git_repo(self.root, name="idle-read-ok")
+        db = str(self.root / "idle-read-ok.sqlite3")
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        ident = "ct-squad-reader-idle-work-0"
+        challenge = team._result_challenge(ident)
+        driver.read_text = "final answer\nCAO_TEAM_RESULT: " + challenge
+        args = dict(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="work", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db)
+        result = team._execute(**args)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["pane_closed"], "w1:p1")
+        self.assertTrue(result["claim"]["released"])
+        again = team._execute(**args)
+        self.assertEqual(again["status"], "complete")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_focused_idle_review_with_matching_sha_completes(self):
+        repo = git_repo(self.root, name="idle-review-ok")
+        db = str(self.root / "idle-review-ok.sqlite3")
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        driver.read_text = (
+            "CAO_REVIEW_VERDICT: APPROVED\n"
+            "CAO_REVIEWED_HEAD: " + A + "\n"
+            "CAO_TEAM_RESULT: " + challenge)
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "write", "write_scope": ["a.txt"]},
+            prompt="review\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="review", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db, review_head=A)
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["claim"]["released"])
+
+    def test_focused_idle_review_with_wrong_sha_never_completes(self):
+        repo = git_repo(self.root, name="idle-review-drift")
+        db = str(self.root / "idle-review-drift.sqlite3")
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        driver.read_text = (
+            "CAO_REVIEW_VERDICT: APPROVED\n"
+            "CAO_REVIEWED_HEAD: " + B + "\n"  # reviewed a different revision
+            "CAO_TEAM_RESULT: " + challenge)
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "write", "write_scope": ["a.txt"]},
+            prompt="review\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="review", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db, review_head=A)
+        # A team idle without a valid verdict for THIS head is an early idle:
+        # the claim is held and the task stays RUNNING, never complete.
+        self.assertEqual(result["status"], "running")
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertFalse((record.get("claim") or {}).get("released"))
+
+    def test_immediate_idle_without_receipt_stays_running_in_team(self):
+        repo = git_repo(self.root, name="idle-team-early")
+        db = str(self.root / "idle-team-early.sqlite3")
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        ident = "ct-squad-reader-early-work-0"
+        challenge = team._result_challenge(ident)
+        # Only the prompt's own nonce is echoed back, never the receipt line.
+        driver.read_text = "working on it\nCAO_TEAM_NONCE_V2: " + challenge
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="work", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db)
+        self.assertEqual(result["status"], "running")
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task(ident, self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertFalse((record.get("claim") or {}).get("released"))
+
+    def test_idle_transport_unavailable_never_advances_the_team(self):
+        from cao import product_driver
+
+        class Unreadable(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverError("wait transport unavailable")
+
+        repo = git_repo(self.root, name="idle-team-transport")
+        db = str(self.root / "idle-team-transport.sqlite3")
+        driver = Unreadable()
+        ident = "ct-squad-reader-transport-work-0"
+        challenge = team._result_challenge(ident)
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "read", "write_scope": []},
+            prompt="Analyze source\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="work", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db)
+        self.assertEqual(result["status"], "running")
+        self.assertNotIn("pane_close", driver.names())
+
     def test_manual_resume_unknown_reuses_exact_execution_identity(self):
         self.init(self.spec([task("a", self.paths[0])]))
         calls = []
@@ -2785,7 +3007,7 @@ class TeamTests(unittest.TestCase):
 
     def test_recovery_no_matched_pane_holds(self):
         driver, db, ident, _ = self._recovery_setup()
-        driver.agent_present = False
+        driver.drop_agents()
         self._recovery_tick(driver, db)
         decision = self._decision()
         self.assertEqual(decision["classification"], team_recovery.READ_TRANSPORT)

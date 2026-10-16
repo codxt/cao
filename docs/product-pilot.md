@@ -294,8 +294,10 @@ Let the agent finish by resuming the same task with a bounded wait:
 ```
 
 Because this is a resume, it reuses the workspace/agent/prompt and only waits.
-On an `idle`/`done` agent the task completes and releases its claim with the
-observed repository HEAD:
+On a `done` agent the task completes and releases its claim with the observed
+repository HEAD. An ordinary product task has no task-bound receipt to verify,
+so a bare `idle` -- including the idle a focused tab reports -- is never treated
+as completion for it:
 
 ```json
 {
@@ -439,11 +441,13 @@ the CAO-created pane:
 Expected: `"outcome": "abandon"` and `"pane_closed": "<pane-id>"` equal to the
 pane from step 6; `daemon stop` reports `"status": "STOPPED"`.
 
-A task that already reached `complete` in step 8 keeps its pane for inspection,
-so `cao stop` is an idempotent no-op there. In that case close the CAO-created
-surface directly with the runtime's own close primitive, addressed by the
-captured ids and only after confirming the workspace carries the CAO-owned
-label `cao-review-<task_id>`:
+A task that reached `complete` under this build already closed its own pane
+before releasing its claim (READ and WRITE alike), so `cao stop` is an
+idempotent no-op there and no pane is left behind. Only a record written by an
+older build can still hold a terminal pane. For such a historical record, close
+the CAO-created surface directly with the runtime's own close primitive,
+addressed by the captured ids and only after confirming the workspace carries
+the CAO-owned label `cao-review-<task_id>`:
 
 ```sh
 "$RUNTIME" pane close "$PANE"
@@ -467,6 +471,43 @@ rm -rf "$PILOT"
 
 Do not touch any workspace, pane, session or process this pilot did not create,
 and do not stop the runtime's own server.
+
+## 12. Historical pane hygiene (opt-in, default off)
+
+A fresh CAO only **observes and plans**: it never closes a historical pane
+until an operator explicitly opts in. The existing daemon performs one bounded
+hygiene pass per tick and reports it on the existing status surface under
+`hygiene` (counts only, never raw process output):
+
+```sh
+./cao daemon status | python3 -c "import json,sys;print(json.load(sys.stdin)['hygiene'])"
+```
+
+Expected with no configuration: `"mode": "plan"`, and `eligible` naming any
+CAO-owned accepted terminal orphan panes. Nothing is closed. The classification
+counts are `eligible`, `closed`, `protected_active`, `protected_unknown`,
+`unowned`, `missing_pane`, `close_failed` and `process_leak`.
+
+To allow closing only its own proved orphans, the operator adds a typed
+`daemon` section to the product config (`$XDG_CONFIG_HOME/cao/config.json`):
+
+```json
+{
+  "daemon": {"hygiene_enabled": true, "hygiene_dry_run": false}
+}
+```
+
+`hygiene_enabled` defaults to `false` and `hygiene_dry_run` defaults to `true`,
+so both must be set deliberately. A pane is eligible only when it is proved to
+belong to this CAO install (matching `cao-review-<task_id>` label), to be free
+of any active or foreign worker, to have no live Registry claim and no dirty
+checkout, and to belong to an accepted terminal task. Everything else holds,
+including unknown team results, reused panes, foreign workers, missing
+identities, live claims and dirty worktrees. The pass is never a second daemon,
+ledger or scheduler, never scans or signals an arbitrary process and never
+force-unlocks the Registry. `process_leak` is only ever reported with real
+evidence; CAO records no pane-child process identity, so it is never
+fabricated.
 
 ## Evidence
 

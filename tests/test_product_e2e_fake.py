@@ -176,11 +176,12 @@ def _main(argv):
         action = argv[1] if len(argv) > 1 else ""
         if action == "start":
             name = argv[2]
+            kind = _flag(argv, "--kind")
             pane_id = _flag(argv, "--pane")
             pane = state["panes"].get(pane_id)
             if pane is None:
                 return _fail("pane_not_found")
-            pane["agent"] = name
+            pane["agent"] = kind
             pane["agent_status"] = "working"
             state["agents"][name] = pane_id
             _save(state)
@@ -203,9 +204,14 @@ def _main(argv):
             return 0
         if action == "get":
             name = argv[2]
-            if name in state["agents"]:
+            pane_id = state["agents"].get(name)
+            if pane_id is not None:
+                pane = state["panes"].get(pane_id, {})
                 return _out("agent_info",
-                            agent={"name": name, "agent_status": "working"})
+                            agent={"name": name, "agent": pane.get("agent"),
+                                   "pane_id": pane_id,
+                                   "workspace_id": pane.get("workspace_id"),
+                                   "agent_status": pane.get("agent_status")})
             return _fail("agent_not_found")
         if action == "wait":
             return _out("agent_wait", agent={"agent_status": "working"})

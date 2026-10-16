@@ -73,6 +73,8 @@ __all__ = [
     "DEFAULT_RETRY_BOUND",
     "MAX_RETRY_BOUND",
     "DEFAULT_STOP_TIMEOUT",
+    "DEFAULT_HYGIENE_ENABLED",
+    "DEFAULT_HYGIENE_DRY_RUN",
     "DaemonDefaults",
     "daemon_defaults",
 ]
@@ -884,6 +886,11 @@ DEFAULT_WAKE_BUDGET = 60
 DEFAULT_RETRY_BOUND = 3
 MAX_RETRY_BOUND = 100
 DEFAULT_STOP_TIMEOUT = 10.0
+#: Historical pane hygiene is default OFF: with no typed operator opt-in the
+#: daemon only observes and plans, and never closes a pane. Even when enabled,
+#: the default is a dry run, so an operator must explicitly clear that too.
+DEFAULT_HYGIENE_ENABLED = False
+DEFAULT_HYGIENE_DRY_RUN = True
 
 
 @dataclass(frozen=True)
@@ -908,6 +915,12 @@ class DaemonDefaults:
     #: verified standing authority when the host has provisioned one. It defaults
     #: to ``False`` so a fresh or unconfigured product discovers nothing.
     intake_pipeline: bool = False
+    #: Opt-in, default-disabled historical pane hygiene. When enabled the
+    #: daemon plans (and, with ``hygiene_dry_run`` cleared, applies) closure of
+    #: only its own accepted terminal orphan panes. It is never a scheduler, a
+    #: second ledger or a broad cleanup.
+    hygiene_enabled: bool = False
+    hygiene_dry_run: bool = True
 
 
 def daemon_defaults(
@@ -976,12 +989,20 @@ def daemon_defaults(
     intake_pipeline = raw.get("intake_pipeline", False)
     if type(intake_pipeline) is not bool:
         raise ProductConfigError("daemon.intake_pipeline must be true or false")
+    hygiene_enabled = raw.get("hygiene_enabled", DEFAULT_HYGIENE_ENABLED)
+    if type(hygiene_enabled) is not bool:
+        raise ProductConfigError("daemon.hygiene_enabled must be true or false")
+    hygiene_dry_run = raw.get("hygiene_dry_run", DEFAULT_HYGIENE_DRY_RUN)
+    if type(hygiene_dry_run) is not bool:
+        raise ProductConfigError("daemon.hygiene_dry_run must be true or false")
     return DaemonDefaults(
         engineering_queue_dir=queue_dir,
         engineering_watch_file=engineering_watch,
         feedback_watch_file=watch,
         intake_queue=intake_queue,
         intake_pipeline=intake_pipeline,
+        hygiene_enabled=hygiene_enabled,
+        hygiene_dry_run=hygiene_dry_run,
         tick_interval=interval,
         min_tick_interval=min_interval,
         max_tick_interval=max_interval,

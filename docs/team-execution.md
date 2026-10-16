@@ -166,17 +166,26 @@ resumption does not blindly resubmit an already issued prompt.
 
 ## Verified terminal results
 
-A prompt being accepted and the model being IDLE does not mean the work
-is complete. Team Execution's product adapter keeps the original task and
-claim RUNNING until the runtime reports post-prompt DONE and the specialist's
-actual output contains a task-specific receipt. The prompt contains a
-16-character nonce on a separate line but not the completed receipt; the
-specialist copies the nonce (no calculation) after CAO_TEAM_RESULT: on a
-standalone line only after successful work. Legacy checkpointed prompts that
-explicitly required reversal continue to be checked against their original
-contract. An unreadable or missing receipt holds UNKNOWN
-instead of unblocking dependents. The single-task core also no longer
-accepts a pre-response IDLE state as completion.
+A prompt being accepted does not mean the work is complete, and neither does a
+bare IDLE. The managed runtime distinguishes an IDLE pane -- ready for input
+after the focused tab has been seen -- from a DONE pane, which is the same
+underlying settled completion observed while the work finished in an unseen
+background tab; focusing a finished tab turns DONE into IDLE. Team Execution's
+product adapter therefore waits on both and keeps the original task and claim
+RUNNING until the specialist's actual output contains this execution's exact,
+task-bound receipt in a durable **post-prompt settled** capture. A team IDLE is
+only a candidate: it is admitted solely when that receipt -- and, for a review,
+the exact single verdict and reviewed HEAD -- verifies. An idle without a
+verified result, including the transient idle a runtime may report immediately
+after prompt acknowledgement before any work, remains RUNNING with its claim
+held: never falsely complete and never UNKNOWN. A DONE without a receipt is
+terminal but unverified and holds UNKNOWN rather than unblocking dependents. An
+ordinary product task carries no receipt to verify and is never completed by a
+bare idle. The prompt contains a 16-character nonce on a separate line but not
+the completed receipt; the specialist copies the nonce (no calculation) after
+CAO_TEAM_RESULT: on a standalone line only after successful work. Legacy
+checkpointed prompts that explicitly required reversal continue to be checked
+against their original contract.
 
 The receipt proves that a post-prompt response was observed; it is not a
 security signature, approval, guarantee of correctness, or proof that tests
@@ -184,6 +193,41 @@ passed. Repository, Registry, scope, commit, review, human approval, and
 release gates remain independently required. A provider credit denial,
 transport failure or model output without the receipt must be investigated
 rather than retried under a new task identity.
+
+### One READ completion protocol
+
+All CAO READ executions complete through one ordered protocol. This applies to
+an ordinary product READ and to a team work or review READ alike:
+
+1. CAO observes a **post-prompt settled** state -- `done`, or an `idle` that
+   carries this execution's verified result (never a pre-response IDLE).
+2. CAO saves the bounded terminal observation durably.
+3. CAO verifies the exact task receipt (`CAO_TEAM_RESULT:`) and, for a review,
+   the exact single verdict and reviewed HEAD, against that durable terminal
+   evidence. A team READ passes this verification as a completion gate, so an
+   unverified output, nonce or review verdict is decided **before** any closing.
+4. CAO persists the verified terminal settlement durably, bound to this task's
+   exact claim, repository, run and owned pane. This happens after verification
+   and **before the first pane-close attempt**, so a crash during closure can
+   neither lose the settled receipt nor strand the still-open claim: a later run
+   reconciles only its own recorded settlement, re-proves the result and the
+   original claim, and releases exactly once.
+5. CAO closes only its own exact pane -- its own workspace and pane identity
+   must match the durable checkpoint, and a foreign occupant is refused -- and
+   then verifies the pane is actually gone.
+6. Only when 2-5 hold does CAO release the Registry claim and mark the task
+   complete.
+
+A failure at any step holds the claim and the pane; an unverified DONE (or a
+closed recovery that cannot be re-verified) holds UNKNOWN, while an unverified
+IDLE is only an early idle and stays RUNNING. Nothing is released
+on a done receipt alone. CAO never scans or signals an arbitrary process, never
+force-unlocks the Registry and never closes a pane it cannot prove is its own.
+Pane absence is the only closure CAO claims: an OS process exit it cannot prove
+through a stable recorded identity is reported as unverified, not asserted.
+Historical records written before this protocol may still hold a terminal pane;
+the opt-in, default-off daemon hygiene pass below can plan (and, when enabled,
+apply) closing those.
 
 Team task agent names use a readable prefix and digest of their full ID.
 This prevents longer team/task names from colliding after terminal name-length

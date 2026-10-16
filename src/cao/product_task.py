@@ -29,6 +29,10 @@ Fail-closed rules this module enforces:
   timestamp and prompt provenance, so a longer earlier read that missed the
   receipt cannot displace a shorter later read that carries it -- the durable
   record keeps both, and the completion receipt is evaluated against each;
+* a verified terminal settlement is made durable *before* the first pane-close
+  attempt, so a crash during closure never loses the completion receipt or
+  strands the still-open claim; a later run reconciles only its own recorded
+  settlement, and only once its exact owned pane is verifiably gone;
 * ``complete`` handback releases the claim with the observed repository HEAD;
   stop/abandon releases with outcome ``abandon`` and closes only CAO's own
   pane in the CAO-owned workspace.
@@ -686,25 +690,28 @@ def _observe(
     defaults: product_config.TaskDefaults,
     *,
     terminal: bool = False,
-) -> None:
+) -> dict[str, Any] | None:
     checkpoint = record.get("checkpoint") or {}
     agent_name = checkpoint.get("agent_name")
     if not agent_name:
-        return
+        return None
     try:
         text = driver.agent_read(
             agent_name, lines=defaults.read_lines, source="recent"
         )
     except product_driver.DriverError as exc:
         record["observation"] = {"status": "UNKNOWN", "reason": getattr(exc, "code", None)}
-        return
+        return None
     stamp = evidence.utc_now(clock)
     bounded, bounds = _bounded(text, defaults.max_output_chars)
     # Every bounded read of this task's own pane is retained with the prompt
     # provenance and terminal state that were current when it was captured, so
     # a shorter later read carrying the receipt is never discarded in favour of
-    # a longer earlier read that missed it.
-    _remember_observation(record, {
+    # a longer earlier read that missed it. The recorded entry is returned so a
+    # caller that provisionally marked a candidate capture terminal and then
+    # refused it can withdraw that provenance instead of leaving a claim it
+    # cannot support.
+    entry = {
         "output": bounded,
         "bounds": dict(bounds),
         "observed_at": stamp,
@@ -712,7 +719,8 @@ def _observe(
         "prompt_ack": checkpoint.get("prompt_ack"),
         "stage": checkpoint.get("stage"),
         "terminal": bool(terminal),
-    })
+    }
+    _remember_observation(record, entry)
     stored = record.get("output")
     if isinstance(stored, str) and stored and len(bounded) < len(stored):
         # Each read is a bounded window of a scrolling pane. A later read that
@@ -727,11 +735,12 @@ def _observe(
             observed_at=stamp,
         )
         record["observation"] = {"status": "OBSERVED", "captured_at": stamp}
-        return
+        return entry
     record["output"] = bounded
     record["output_truncated"] = bounds["kept"] == "tail"
     record["output_bounds"] = dict(bounds, observed_at=stamp)
     record["observation"] = {"status": "OBSERVED", "captured_at": stamp}
+    return entry
 
 
 # --------------------------------------------------------------------------
@@ -783,6 +792,7 @@ def run_task(
     observation: registry.RuntimeObservation | None = None,
     clock: Callable[[], Any] | None = None,
     wait_ms: int | None = None,
+    verify: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Run (or idempotently resume) one product task and return its record view."""
 
@@ -971,7 +981,7 @@ def run_task(
 
         record["status"] = "running"
         _save(record, env, clock)
-        return _finish(conn, driver, record, env, clock, defaults, wait_ms)
+        return _finish(conn, driver, record, env, clock, defaults, wait_ms, verify)
     finally:
         conn.close()
 
@@ -1055,8 +1065,123 @@ def _write_completion_error(
     return None
 
 
+def _owned_pane_gone(driver, record: Mapping[str, Any]) -> bool:
+    """Whether the task's exact owned pane is verifiably absent right now.
+
+    Only the checkpoint's own workspace/pane identity is probed, and only a
+    runtime ``not found`` answer counts. An unreadable runtime, a missing pane
+    identity or any other error is not absence, so a caller must never treat it
+    as proven closure.
+    """
+
+    checkpoint = record.get("checkpoint") or {}
+    pane_id = checkpoint.get("pane_id")
+    if not isinstance(pane_id, str) or not pane_id or driver is None:
+        return False
+    try:
+        driver.pane_get(pane_id)
+    except product_driver.DriverNotFound:
+        return True
+    except product_driver.DriverError:
+        return False
+    return False
+
+
+def _own_settled_disposition(record: Mapping[str, Any]) -> bool:
+    """Whether the record carries this task's own durable verified settlement.
+
+    The disposition is written only after a terminal observation passed the
+    completion gate (or an ordinary settled DONE), and records which claim,
+    repository, run, work key and owned pane it settled. A later run may
+    reconcile an interrupted settlement only when every one of those still
+    matches this record and a durable terminal observation is still present, so
+    a foreign, stale or tampered disposition is refused rather than released.
+    """
+
+    settled = record.get("terminal_result")
+    if not isinstance(settled, Mapping):
+        return False
+    claim = record.get("claim") or {}
+    checkpoint = record.get("checkpoint") or {}
+    proof = any(
+        isinstance(entry, Mapping) and entry.get("terminal") is True
+        for entry in record.get("output_observations") or []
+    )
+    return (
+        proof
+        and settled.get("claim_id") is not None
+        and settled.get("claim_id") == claim.get("claim_id")
+        and settled.get("mode") == record.get("mode")
+        and settled.get("repo") == record.get("repo")
+        and settled.get("run_id") == record.get("run_id")
+        and settled.get("work_key") == record.get("work_key")
+        and settled.get("pane_id") == checkpoint.get("pane_id")
+        and settled.get("agent_name") == checkpoint.get("agent_name")
+    )
+
+
+def _named_agent_ownership_error(
+    driver,
+    checkpoint: Mapping[str, Any],
+    pane: Mapping[str, Any],
+    pane_id: str,
+    workspace_id: str,
+) -> str | None:
+    """Prove the pane's occupant is exactly this task's own named agent.
+
+    The runtime reports the worker KIND on a pane (a type such as a CLI name),
+    never this task's unique agent name, so the pane's ``agent`` field is never
+    compared against the unique name. When the pane carries an occupant, that
+    occupant is proved to be this task's own worker only by an exact
+    ``agent.get`` on the checkpoint's unique name reporting the same pane and
+    workspace; the kind fields are compared only to each other. An *empty* pane
+    this task already owned is safe to close -- there is no process to mistake
+    -- but a pane occupied by a worker this task cannot resolve as its own
+    never is.
+    """
+
+    agent_name = checkpoint.get("agent_name")
+    pane_kind = pane.get("agent")
+    occupied = isinstance(pane_kind, str) and bool(pane_kind)
+    if not isinstance(agent_name, str) or not agent_name:
+        if occupied:
+            return "an unidentified worker occupies this task's pane"
+        return None
+    try:
+        agent = driver.agent_get(agent_name)
+    except product_driver.DriverNotFound:
+        # This task's named agent has exited. Its now-empty pane is safe to
+        # close; a pane still showing an occupant it cannot own is not.
+        if occupied:
+            return "a worker occupies a pane this task's named agent does not own"
+        return None
+    except product_driver.DriverError as exc:
+        return "the task's named agent could not be read: " + str(exc)
+    if not isinstance(agent, Mapping):
+        return "the task's named agent identity is unreadable"
+    reported_name = agent.get("name")
+    if not isinstance(reported_name, str) or reported_name != agent_name:
+        return "the named agent identity does not match this task"
+    if (agent.get("pane_id") != pane_id
+            or agent.get("workspace_id") != workspace_id):
+        return "the named agent occupies a different pane or workspace"
+    agent_kind = agent.get("agent")
+    if (occupied and isinstance(agent_kind, str) and agent_kind
+            and pane_kind != agent_kind):
+        return "the pane's worker kind does not match the named agent"
+    return None
+
+
 def _close_owned_pane(driver, record):
-    """Confirm exact task-owned pane closure before releasing WRITE ownership."""
+    """Confirm exact task-owned pane closure before releasing ownership.
+
+    Only the checkpoint's own pane is addressed. Its identity and workspace
+    must match the durable checkpoint, and its occupying process must be this
+    task's own named agent -- proved through ``agent.get`` on the unique name,
+    matching the reported kind only to the reported kind -- so a foreign,
+    reused or unverified worker is never closed. A successful close request is
+    only an acknowledgement: the pane must then be verifiably absent.
+    """
     checkpoint = record.get("checkpoint") or {}
     pane_id = checkpoint.get("pane_id")
     workspace_id = checkpoint.get("workspace_id")
@@ -1077,6 +1202,10 @@ def _close_owned_pane(driver, record):
     if (not isinstance(pane, Mapping) or pane.get("pane_id") != pane_id
             or pane.get("workspace_id") != workspace_id):
         return None, "pane identity or workspace identity mismatch"
+    ownership_error = _named_agent_ownership_error(
+        driver, checkpoint, pane, pane_id, workspace_id)
+    if ownership_error is not None:
+        return None, ownership_error
     try:
         driver.pane_close(pane_id)
     except product_driver.DriverError as exc:
@@ -1100,6 +1229,7 @@ def _finish(
     clock: Callable[[], Any] | None,
     defaults: product_config.TaskDefaults,
     wait_ms: int | None,
+    verify: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     _observe(driver, record, env, clock, defaults)
     _save(record, env, clock)
@@ -1112,10 +1242,20 @@ def _finish(
     wait_not_found = False
     if effective_wait > 0:
         checkpoint = record.get("checkpoint") or {}
+        # A focused tab reports `idle` (ready-for-input) for the same underlying
+        # settled completion that an unseen background worker reports as
+        # `done`; focusing a finished pane therefore turns DONE into IDLE. A
+        # team execution (one that supplies a completion gate) may settle at
+        # either, so it waits on both. An ordinary task keeps waiting only on
+        # `done`/`blocked`: a bare idle never proves its work.
+        wait_until = (
+            ("idle", "done", "blocked") if verify is not None
+            else ("done", "blocked")
+        )
         try:
             result = driver.agent_wait(
                 checkpoint["agent_name"],
-                until=("done", "blocked"),
+                until=wait_until,
                 timeout_ms=effective_wait,
             )
             state = product_driver.wait_state(result)
@@ -1135,19 +1275,44 @@ def _finish(
             state = None
 
     checkpoint = record.get("checkpoint") or {}
-    closed_checkpoint = (
-        record["mode"] == registry.WRITE
-        and isinstance(record.get("pane_closed"), str)
+    recorded_close = (
+        isinstance(record.get("pane_closed"), str)
         and bool(record.get("pane_closed"))
         and record.get("pane_closed") == checkpoint.get("pane_id")
-    ) or (record["mode"] == registry.WRITE and wait_not_found)
+    )
+    # The exact owned pane is probed once: a durable settlement is reconciled
+    # only when the pane it settled is verifiably absent right now.
+    pane_gone = _owned_pane_gone(driver, record)
+    # A settlement that was made durable (see ``terminal_result``) but whose
+    # pane closure was never recorded is an interrupted close: the receipt is
+    # already on disk, the claim is still open and the owned pane is gone. It is
+    # trusted only for this task's own disposition and only when the pane is
+    # verifiably absent, and it still runs the full verified-result, claim and
+    # Git predicate below -- never a bare not-found.
+    settled_recovery = _own_settled_disposition(record) and pane_gone
+    # Post-close recovery: the pane was closed on an earlier run but the claim
+    # was not released. It is trusted only when the exact owned pane is now
+    # verifiably absent. A bare wait not-found is ambiguous for a READ and
+    # holds it, while a WRITE keeps its existing recovery followed by the full
+    # Git/claim completion predicate below.
+    closed_checkpoint = (
+        (recorded_close and pane_gone)
+        or (record["mode"] == registry.WRITE and wait_not_found)
+        or settled_recovery
+    )
     # If the pane closed and the Registry refused release, agent_wait can no
     # longer find that agent. Retain its original claim and recover by proving
     # the same closed pane plus committed Git result, without restarting it.
     # Prompt acknowledgement does not mean prompt completion. Some runtimes
-    # report IDLE immediately after accepting a prompt, before the model
-    # starts working. Only post-prompt DONE proves a terminal observation.
-    if state == "done" or closed_checkpoint:
+    # report IDLE immediately after accepting a prompt, before the model starts
+    # working, so a bare idle is never terminal. A post-prompt DONE is
+    # authoritative; a team IDLE is only a *candidate* that must carry this
+    # execution's own verified, task-bound terminal result before it may settle.
+    settled = state == "done"
+    idle_candidate = (
+        state == "idle" and verify is not None and not closed_checkpoint
+    )
+    if settled or idle_candidate or closed_checkpoint:
         head, branch = _repo_head_and_branch(record["repo"])
         if head:
             if record["mode"] == registry.WRITE:
@@ -1160,19 +1325,74 @@ def _finish(
                     }
                     _save(record, env, clock)
                     return task_payload(record)
-            _observe(driver, record, env, clock, defaults, terminal=True)
-            if record["mode"] == registry.WRITE:
-                closed, error = _close_owned_pane(driver, record)
-                if error is not None:
-                    record["status"] = "blocked"
+            observed_entry = _observe(
+                driver, record, env, clock, defaults, terminal=True)
+            # A caller-supplied completion gate (the team's exact output,
+            # nonce and review-verdict check) runs on the just-saved durable
+            # settled evidence, BEFORE the pane is closed and the claim is
+            # released. A refused DONE (or closed recovery) holds the claim and
+            # the pane UNKNOWN; a refused IDLE is only an early idle and stays
+            # RUNNING (handled below).
+            if verify is not None:
+                refusal = verify(record)
+                if refusal is not None:
+                    if idle_candidate:
+                        # An idle that does not carry this execution's verified
+                        # result is an early/transient idle, not completion.
+                        # Withdraw the provisional terminal provenance and keep
+                        # the claim: the task stays RUNNING -- never falsely
+                        # complete and never UNKNOWN on an early idle.
+                        if isinstance(observed_entry, dict):
+                            observed_entry["terminal"] = False
+                        record["status"] = "running"
+                        record.pop("error", None)
+                        _save(record, env, clock)
+                        return task_payload(record)
+                    record["status"] = "unknown"
                     record["error"] = {
-                        "code": "TASK_PANE_CLOSE_FAILED",
-                        "message": "WRITE agent was not proven stopped; claim retained",
-                        "detail": error,
+                        "code": str(refusal.get("code") or "TASK_RESULT_UNVERIFIED"),
+                        "message": str(refusal.get("message") or
+                                       "the terminal result could not be verified"),
                     }
                     _save(record, env, clock)
                     return task_payload(record)
-                record["pane_closed"] = closed
+            # The verified terminal settlement is made durable BEFORE the first
+            # pane-close attempt. A crash between this save and the recorded
+            # close would otherwise lose the settled receipt while leaving the
+            # claim open and stranding ownership. The disposition is bound to
+            # this task's exact claim, repository, run and owned pane, so a
+            # later run only ever reconciles its own interrupted settlement.
+            record["terminal_result"] = {
+                "verified_at": evidence.utc_now(clock),
+                "claim_id": (record.get("claim") or {}).get("claim_id"),
+                "mode": record["mode"],
+                "repo": record["repo"],
+                "run_id": record["run_id"],
+                "work_key": record["work_key"],
+                "pane_id": checkpoint.get("pane_id"),
+                "agent_name": checkpoint.get("agent_name"),
+            }
+            _save(record, env, clock)
+            # Closing the exact CAO-owned pane and verifying its disappearance
+            # is a precondition for handing back either mode. A still-running
+            # worker -- of either mode -- must retain its Registry ownership.
+            closed, error = _close_owned_pane(driver, record)
+            if error is not None:
+                record["status"] = "blocked"
+                record["error"] = {
+                    "code": "TASK_PANE_CLOSE_FAILED",
+                    "message": "agent was not proven stopped; claim retained",
+                    "detail": error,
+                }
+                _save(record, env, clock)
+                return task_payload(record)
+            record["pane_closed"] = closed
+            # Persist the verified close immediately, BEFORE the Registry
+            # release, so a crash between the two never loses the exact
+            # owned-pane identity a later run uses to recover the open claim
+            # without re-executing the worker.
+            _save(record, env, clock)
+            if record["mode"] == registry.WRITE:
                 # Closing a worker is a boundary. Check source state again
                 # because the previous Git probe ran while it was alive.
                 failure = _write_completion_error(conn, record, head, branch)
@@ -1392,6 +1612,12 @@ def stop_task(
         }
         _save(record, env, clock)
         return task_payload(record)
+
+    # Persist the verified close immediately, BEFORE the Registry release, so a
+    # crash between the two never loses the exact owned-pane identity a later
+    # stop run uses to finish the release without touching the pane again.
+    record["pane_closed"] = closed
+    _save(record, env, clock)
 
     if not prior_released:
         conn = registry.connect(db=registry_db or product_config.registry_db_path(env))

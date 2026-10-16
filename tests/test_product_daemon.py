@@ -137,6 +137,7 @@ class FakeDriver:
 
     def pane_close(self, pane_id):
         self._note("pane_close", pane_id)
+        self._panes.pop(pane_id, None)
         return "{}"
 
     def agent_start(self, name, kind, pane_id, *, argv=(), timeout_ms=None):
@@ -144,7 +145,7 @@ class FakeDriver:
         self._agents[name] = pane_id
         pane = self._panes.get(pane_id)
         if pane is not None:
-            pane["agent"] = name
+            pane["agent"] = kind  # the worker KIND, never the unique name
             pane["agent_status"] = "working"
         return {"agent_pane_id": pane_id, "agent_workspace_id": None}
 
@@ -158,9 +159,17 @@ class FakeDriver:
 
     def agent_get(self, target):
         self._note("agent_get", target)
-        if target in self._agents:
-            return {"name": target, "agent_status": "working"}
-        raise product_driver.DriverNotFound("not present")
+        pane_id = self._agents.get(target)
+        if pane_id is None:
+            raise product_driver.DriverNotFound("not present")
+        pane = self._panes.get(pane_id) or {}
+        return {
+            "name": target,
+            "agent": pane.get("agent"),
+            "pane_id": pane_id,
+            "workspace_id": pane.get("workspace_id"),
+            "agent_status": pane.get("agent_status"),
+        }
 
     def agent_wait(self, target, *, until=(), timeout_ms=None):
         self._note("agent_wait", target)
@@ -1459,6 +1468,307 @@ class ReconciliationTests(DaemonCase):
         self.assertNotIn("agent_start", driver.names())
         supervision = product_state.read_daemon(self.env)["supervision"]
         self.assertEqual(supervision[task_id]["status"], "UNKNOWN")
+
+
+class HygieneTests(DaemonCase):
+    """Conservative, bounded, default-off historical pane hygiene."""
+
+    def _ledger(self):
+        # Hygiene fails closed on an absent Registry ledger, so an "eligible"
+        # result requires a present, readable (here empty) ledger.
+        registry.connect(self.db).close()
+
+    def orphan_read(self, driver, task_id="orphan-read", *, kind="opencode",
+                    agent_status="done", label=None, agent_name=None,
+                    register_agent=True, mode="READ", scope=(), ledger=True):
+        """A terminal task record plus the exact production-shaped runtime pane.
+
+        A real pane reports the worker KIND in ``agent`` (not the unique name),
+        and ``agent.get`` on the task's own unique name resolves that pane and
+        workspace. ``register_agent=False`` models a pane whose occupant this
+        task cannot prove is its own (a foreign or already-vanished worker);
+        ``ledger=False`` models a Registry ledger that is absent.
+        """
+        if ledger:
+            self._ledger()
+        created = driver.workspace_create("cao-review-" + task_id, cwd=str(self.repo))
+        pane_id = created["pane_id"]
+        if label is not None:
+            driver._workspaces[created["workspace_id"]]["label"] = label
+        if agent_name is None:
+            agent_name = "cao-" + task_id
+        if register_agent:
+            driver._agents[agent_name] = pane_id
+        driver._panes[pane_id]["agent"] = kind
+        driver._panes[pane_id]["agent_status"] = agent_status
+        stamp = "2026-01-01T00:00:00Z"
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA,
+            "task_id": task_id,
+            "run_id": product_config.DEFAULT_RUN_ID,
+            "work_key": task_id,
+            "repo": str(self.repo),
+            "prompt": "Read the repository",
+            "mode": mode, "scope": list(scope),
+            "agent_kind": "opencode", "agent_args": [],
+            "workspace_label": "cao-review-" + task_id,
+            "status": "complete",
+            "checkpoint": {
+                "workspace_id": created["workspace_id"],
+                "tab_id": created["tab_id"], "pane_id": pane_id,
+                "agent_name": agent_name, "agent_started": True,
+                "start_attempted": True, "prompt_issued": True,
+                "prompt_ack": "accepted", "stage": "prompted",
+            },
+            "created_at": stamp, "updated_at": stamp,
+            "claim": {"claim_id": 1, "status": "RELEASED", "released": True,
+                      "outcome": "complete"},
+            "output": None, "output_truncated": False, "output_bounds": None,
+            "output_observations": [], "observation": None, "error": None,
+            "refusal": None, "pane_closed": None,
+        }, self.env)
+        return pane_id
+
+    def hygiene_config(self, *, enabled, dry_run):
+        return product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "model": "m"},
+            "daemon": {"hygiene_enabled": enabled, "hygiene_dry_run": dry_run},
+        })
+
+    def test_default_off_only_plans_and_never_closes(self):
+        driver = FakeDriver()
+        pane_id = self.orphan_read(driver)
+        daemon = self.build(driver)
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["mode"], "plan")
+        self.assertGreaterEqual(hygiene["counts"]["eligible"], 1)
+        self.assertEqual(hygiene["counts"]["closed"], 0)
+        self.assertIn(pane_id, driver._panes)
+        # Visible on the existing status surface, without raw process output.
+        surfaced = product_daemon.status(env=self.env)["hygiene"]
+        self.assertEqual(surfaced["mode"], "plan")
+        self.assertEqual(surfaced["counts"], hygiene["counts"])
+        # Process exit is never asserted without a stable recorded identity.
+        self.assertEqual(surfaced["counts"]["process_leak"], 0)
+        self.assertNotIn("process", surfaced)
+
+    def test_enabled_dry_run_still_never_closes(self):
+        driver = FakeDriver()
+        pane_id = self.orphan_read(driver)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=True))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["mode"], "plan")
+        self.assertEqual(hygiene["counts"]["closed"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_enabled_apply_closes_only_the_owned_orphan_and_is_idempotent(self):
+        driver = FakeDriver()
+        pane_id = self.orphan_read(driver)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["mode"], "applied")
+        self.assertEqual(hygiene["counts"]["closed"], 1)
+        self.assertNotIn(pane_id, driver._panes)
+        record = product_state.read_task("orphan-read", self.env)
+        self.assertEqual(record["pane_closed"], pane_id)
+        # Idempotent: a second pass finds no orphan and closes nothing further.
+        daemon.tick()
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        second = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(second["counts"]["eligible"], 0)
+        self.assertEqual(second["counts"]["closed"], 0)
+
+    def test_active_worker_is_protected_even_with_apply(self):
+        driver = FakeDriver()
+        self.orphan_read(driver, agent_status="working")
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["protected_active"], 1)
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
+
+    def test_foreign_worker_is_never_closed(self):
+        # The pane is occupied and done, but ``agent.get`` cannot resolve the
+        # task's own unique name to this pane, so it is never closed.
+        driver = FakeDriver()
+        self.orphan_read(driver, agent_name="caoown", register_agent=False)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["protected_active"], 1)
+
+    def test_live_claim_holds_even_a_terminal_record(self):
+        driver = FakeDriver()
+        created = self.run_read(driver, wait_ms=0)
+        driver.drop_agents()
+        record = product_state.read_task(created["task_id"], self.env)
+        record["status"] = "complete"
+        product_state.write_task(record, self.env)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["protected_active"], 1)
+
+    def test_unreadable_runtime_never_closes(self):
+        driver = FakeDriver()
+        self.orphan_read(driver)
+        driver.readable = False
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["runtime"], "UNAVAILABLE")
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
+
+    def test_foreign_workspace_label_is_unowned(self):
+        driver = FakeDriver()
+        self.orphan_read(driver, label="someone-elses-workspace")
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["unowned"], 1)
+
+    def test_unaccepted_team_result_holds(self):
+        # A terminal task record owned by a team that has NOT accepted the
+        # result is never cleaned up: an unknown team result holds.
+        driver = FakeDriver()
+        task_id = team._execution_id("squad", "a", "work", 0)
+        self.orphan_read(driver, task_id=task_id)
+        spec = {
+            "schema": team.SPEC_SCHEMA, "team_id": "squad",
+            "roles": {"analyst": {"instruction": "Read only."}},
+            "tasks": [{"id": "a", "role": "analyst", "repo": str(self.repo),
+                       "mode": "read", "prompt": "Analyze source"}],
+        }
+        team.initialize(spec, env=self.env)
+        record = team._required("squad", self.env)
+        record["slots"]["a"].update(status="unknown", execution_id=task_id,
+                                    prompt="Analyze source")
+        team._save(record, self.env)
+        task = product_state.read_task(task_id, self.env)
+        task["run_id"] = "cao-team-squad"
+        product_state.write_task(task, self.env)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["protected_unknown"], 1)
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
+
+    def test_done_receipt_alone_cannot_authorize_cleanup(self):
+        # A terminal record whose output happens to contain a receipt is still
+        # not authority: an active worker or a live claim protects the pane.
+        driver = FakeDriver()
+        self.orphan_read(driver, agent_status="working")
+        record = product_state.read_task("orphan-read", self.env)
+        record["output"] = "done\nCAO_TEAM_RESULT: " + ("a" * 16)
+        record["claim"] = {"claim_id": 7, "status": "CLAIMED", "released": False}
+        product_state.write_task(record, self.env)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
+
+    def test_absent_registry_ledger_fails_closed(self):
+        # A missing Registry ledger is not "zero claims": it is unavailable, so
+        # every terminal pane holds rather than being treated as unclaimed.
+        driver = FakeDriver()
+        self.orphan_read(driver, ledger=False)
+        self.assertFalse(os.path.exists(self.db))
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["registry"], "UNAVAILABLE")
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
+
+    def test_active_conflicting_claim_on_the_same_checkout_holds(self):
+        # A live claim on the SAME checkout -- even under a different work_key
+        # and run -- protects the terminal pane there.
+        driver = FakeDriver()
+        self.orphan_read(driver)
+        product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Edit the code",
+            task_id="other-writer", mode="write", write_scope=("a.txt",),
+            observation=RuntimeObservation.empty(), config=self.config,
+            env=self.env, registry_db=self.db, wait_ms=0)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["protected_active"], 1)
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
+
+    def test_historical_team_result_is_not_deemed_accepted(self):
+        # A previous team attempt's task record says complete, but the team has
+        # advanced to a later stage. The task's own terminal status is not
+        # durable team acceptance, so the pane is held.
+        driver = FakeDriver()
+        historical = team._execution_id("squad", "a", "work", 0)
+        current = team._execution_id("squad", "a", "review", 0)
+        self.orphan_read(driver, task_id=historical, mode="WRITE",
+                         scope=["a.txt"])
+        spec = {
+            "schema": team.SPEC_SCHEMA, "team_id": "squad",
+            "roles": {"dev": {"instruction": "Implement precise edits."},
+                      "reviewer": {"instruction": "Review the commits."}},
+            "tasks": [{"id": "a", "role": "dev", "reviewer": "reviewer",
+                       "repo": str(self.repo), "mode": "write",
+                       "write_scope": ["a.txt"], "prompt": "Implement it.",
+                       "max_corrections": 1}],
+        }
+        team.initialize(spec, env=self.env)
+        record = team._required("squad", self.env)
+        record["slots"]["a"].update(
+            status="complete", phase="review", round=0, execution_id=current,
+            prompt="Review it.")
+        team._save(record, self.env)
+        task = product_state.read_task(historical, self.env)
+        task["run_id"] = "cao-team-squad"
+        product_state.write_task(task, self.env)
+        daemon = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        daemon.start()
+        daemon.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertGreaterEqual(hygiene["counts"]["protected_unknown"], 1)
+        self.assertEqual(hygiene["counts"]["eligible"], 0)
 
 
 class WakeTests(DaemonCase):
