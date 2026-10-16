@@ -1640,7 +1640,8 @@ def _apply_recovery(team_id: str, record: dict[str, Any], *,
 
 def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
              phase: str, config: product_config.ProductConfig, driver: Any,
-             env: Mapping[str, str] | None, wait_ms: int, registry_db: str) -> dict[str, Any]:
+             env: Mapping[str, str] | None, wait_ms: int, registry_db: str,
+             review_head: str | None = None) -> dict[str, Any]:
     from . import product_daemon
     mode = "read" if phase == "review" else task["mode"]
     scope = task["write_scope"] if mode == "write" else []
@@ -1648,12 +1649,41 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
     if mode == "write" and product_state.read_task(execution_id, env) is None:
         observation = product_daemon.to_runtime_observation(
             product_daemon.collect_occupancy(driver))
+
+    def verify(record: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Refuse a READ handback unless its durable terminal result is exact.
+
+        This runs on the just-saved durable terminal evidence, BEFORE the pane
+        is closed and the claim released, so a bad nonce or an unverified review
+        verdict holds the claim and the pane instead of completing the base task
+        and leaking them. It is the same evaluation the caller re-checks below.
+        """
+        receipt = _receipt_for(execution_id, prompt)
+        window = _verified_result_window(record, receipt)
+        if window is None:
+            return {
+                "code": "TEAM_DURABLE_RESULT_UNVERIFIED",
+                "message": "the durable terminal result does not carry this "
+                           "task's exact completion receipt",
+            }
+        if phase == "review" and (
+                review_head is None
+                or _review_verdict(window["output"], review_head) is None):
+            return {
+                "code": "REVIEW_VERDICT_UNVERIFIED",
+                "message": "the review verdict is absent, ambiguous or for "
+                           "another revision",
+            }
+        return None
+
+    gate = verify
     # Start/reconcile the existing idempotent task without asking the generic
     # runner to infer "done" before substantive model output exists.
     payload = product_task.run_task(
         driver=driver, repo=task["repo"], prompt=prompt, task_id=execution_id,
         mode=mode, write_scope=scope, config=config, env=env,
-        registry_db=registry_db, observation=observation, wait_ms=0)
+        registry_db=registry_db, observation=observation, wait_ms=0,
+        verify=gate)
     if payload.get("status") not in ("running", "claimed", "complete"):
         return payload
 
@@ -1667,7 +1697,7 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
                         error={"code": "TEAM_PROMPT_NOT_VERIFIED"})
         try:
             waited = driver.agent_wait(
-                agent, until=("done", "blocked"), timeout_ms=wait_ms
+                agent, until=("idle", "done", "blocked"), timeout_ms=wait_ms
             )
         except product_driver.DriverError:
             return payload  # Unknown runtime state: never grant completion.
@@ -1675,7 +1705,7 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
         if observed == "blocked":
             return dict(payload, status="blocked",
                         error={"code": "TEAM_AGENT_BLOCKED"})
-        if observed != "done":
+        if observed not in ("done", "idle"):
             return payload
         try:
             output = driver.agent_read(
@@ -1688,16 +1718,28 @@ def _execute(*, execution_id: str, task: Mapping[str, Any], prompt: str,
         # The expected assembled result line never appears verbatim in the
         # prompt, so its echo cannot by itself impersonate model success.
         if not _receipt_present(output, receipt):
+            if observed == "idle":
+                # A focused tab reports idle for the same settled completion a
+                # `done` unseen in the background would report, but the runtime
+                # also reports idle transiently right after accepting a prompt.
+                # An idle whose output carries no exact receipt for THIS
+                # execution is therefore not terminal: keep the claim and the
+                # task RUNNING and re-observe on the next tick. A `done`
+                # without a receipt is terminal but unverified, so it stays
+                # UNKNOWN rather than silently advancing the team.
+                return payload
             return dict(payload, status="unknown",
                         error={"code": "TEAM_RESULT_UNVERIFIED"})
 
         # The actual task runner still owns exact claim release, commit/scope
         # verification and stop/recovery. A receipt is advisory execution evidence,
-        # not approval to publish or deploy.
+        # not approval to publish or deploy. The verify gate above re-checks the
+        # saved durable result, nonce and review verdict before release.
         payload = product_task.run_task(
             driver=driver, repo=task["repo"], prompt=prompt, task_id=execution_id,
             mode=mode, write_scope=scope, config=config, env=env,
-            registry_db=registry_db, observation=None, wait_ms=wait_ms)
+            registry_db=registry_db, observation=None, wait_ms=wait_ms,
+            verify=gate)
     if payload.get("status") == "complete":
         receipt = _receipt_for(execution_id, prompt)
         window = _verified_result_window(payload, receipt)
@@ -1953,7 +1995,10 @@ def tick(team_id: str, *, config: product_config.ProductConfig,
                     result = runner(execution_id=slot["execution_id"], task=task,
                                     prompt=slot["prompt"], phase=slot["phase"],
                                     config=role, driver=driver, env=env,
-                                    wait_ms=1000, registry_db=db)
+                                    wait_ms=1000, registry_db=db,
+                                    review_head=(slot.get("head")
+                                                 if slot["phase"] == "review"
+                                                 else None))
                 except Exception as exc:
                     # A single team's unexpected error must never starve its
                     # other already-running workers. BaseException remains fatal.

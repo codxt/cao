@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 import re
 import signal
+import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -70,11 +71,31 @@ __all__ = [
     "Occupancy",
     "collect_occupancy",
     "to_runtime_observation",
+    "hygiene_report",
+    "HYGIENE_SCHEMA",
+    "HYGIENE_CLASSIFICATIONS",
     "status",
     "Daemon",
 ]
 
 DAEMON_STATUS_SCHEMA = "cao.product.daemon.status.v0"
+
+#: The bounded classification vocabulary of one hygiene reconnaissance pass.
+#: Only an ``eligible`` pane of an accepted, CAO-owned, terminal task may ever
+#: be closed; every other class holds. Nothing here scans arbitrary processes,
+#: force-unlocks the Work Registry or acts as a second scheduler or ledger.
+HYGIENE_SCHEMA = "cao.product.hygiene.v0"
+HYGIENE_CLASSIFICATIONS = (
+    "eligible",
+    "closed",
+    "protected_active",
+    "protected_unknown",
+    "unowned",
+    "missing_pane",
+    "close_failed",
+    "process_leak",
+)
+_MAX_HYGIENE_ITEMS = 64
 
 _TERMINAL_STATUSES = ("complete", "stopped")
 _RECOVERABLE_STATUSES = ("pending", "claimed", "running")
@@ -189,6 +210,243 @@ def _task_owner_lane(
     return "ordinary"
 
 
+# ---------------------------------------------------------------------------
+# Historical pane hygiene (read-only aggregation, opt-in, bounded)
+# ---------------------------------------------------------------------------
+
+
+def _open_claim_rows(db: str) -> list[dict[str, Any]] | None:
+    """Every open Registry claim, or ``None`` when the ledger is unreadable.
+
+    A missing, unopenable or otherwise unreadable ledger proves nothing: it
+    fails closed and is reported unavailable rather than being rounded down to
+    "no claims at all", which would let a live claim be cleaned up.
+    """
+
+    if not isinstance(db, str) or not db:
+        return None
+    try:
+        conn = registry.connect_readonly(db)
+        try:
+            rows = conn.execute(
+                "SELECT run_id, work_key, worktree FROM claims "
+                "WHERE released_at IS NULL").fetchall()
+        finally:
+            conn.close()
+    except (OSError, ValueError, sqlite3.Error, registry.RegistryError):
+        return None
+    return [
+        {"run_id": row["run_id"], "work_key": row["work_key"],
+         "worktree": row["worktree"]}
+        for row in rows
+    ]
+
+
+def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
+                   registry_db: str | None = None, apply: bool = False,
+                   teams: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Plan (and optionally apply) closure of CAO-owned terminal orphan panes.
+
+    This is a bounded, read-only aggregation over records the daemon already
+    owns: durable product task records, the read-only Work Registry and the
+    runtime's own pane list. It adds no second daemon, ledger or scheduler, and
+    it never scans or signals an arbitrary process. A pane is eligible ONLY
+    when it is proved to belong to this CAO install (matching workspace label),
+    to be free of any active or foreign worker, to have no live conflicting
+    claim and no dirty checkout, and to belong to an accepted terminal task.
+    Every other class holds. With ``apply=False`` (the default) the pass is a
+    plan: it counts eligible orphans and closes nothing.
+    """
+
+    db = registry_db or product_config.registry_db_path(env)
+    counts = {name: 0 for name in HYGIENE_CLASSIFICATIONS}
+    items: list[dict[str, Any]] = []
+    owners = _team_execution_owners(env) if teams is None else teams
+    tasks = product_state.list_tasks(env)
+
+    def classify(task: Mapping[str, Any], classification: str, reason: str) -> None:
+        counts[classification] += 1
+        if len(items) < _MAX_HYGIENE_ITEMS:
+            items.append({
+                "task_id": task.get("task_id"),
+                "classification": classification,
+                "reason": reason,
+            })
+
+    def team_slot_accepted(owner: Any, execution_id: str) -> bool:
+        """Whether the current team slot for this exact execution is accepted.
+
+        Only a slot whose durable status is ``complete`` is accepted; a
+        running, pending, blocked or unknown slot holds, so an unverified team
+        result is never treated as an accepted terminal orphan.
+        """
+
+        if not isinstance(owner, tuple) or len(owner) != 2:
+            return False
+        try:
+            from . import team as _team
+            record = _team._required(owner[0], env)
+        except Exception:  # noqa: BLE001 - an unreadable team accepts nothing
+            return False
+        for slot in (record.get("slots") or {}).values():
+            if isinstance(slot, Mapping) and slot.get("execution_id") == execution_id:
+                return slot.get("status") == "complete"
+        return False
+
+    # Runtime capability. Without a readable runtime no pane can be probed and
+    # every candidate holds; a partially read list is never a healthy reading.
+    labels: dict[str, str] = {}
+    runtime_ok = driver is not None
+    if runtime_ok:
+        try:
+            for workspace in driver.workspace_list():
+                workspace_id = workspace.get("workspace_id")
+                label = workspace.get("label")
+                if isinstance(workspace_id, str) and workspace_id:
+                    labels[workspace_id] = label if isinstance(label, str) else ""
+        except Exception:  # noqa: BLE001 - an unreadable runtime proves nothing
+            runtime_ok = False
+    claims = _open_claim_rows(db)
+    ledger_ok = claims is not None
+
+    # Panes/workspaces referenced by any NON-terminal CAO task: a reused pane
+    # or workspace is an active conflict, never a hygiene candidate.
+    busy_panes: set[str] = set()
+    busy_workspaces: set[str] = set()
+    for task in tasks:
+        if str(task.get("status") or "") in _TERMINAL_STATUSES:
+            continue
+        checkpoint = task.get("checkpoint") or {}
+        pane_id = checkpoint.get("pane_id")
+        workspace_id = checkpoint.get("workspace_id")
+        if isinstance(pane_id, str) and pane_id:
+            busy_panes.add(pane_id)
+        if isinstance(workspace_id, str) and workspace_id:
+            busy_workspaces.add(workspace_id)
+
+    # One checkout-cleanliness probe per distinct repository, read-only.
+    dirty_cache: dict[str, Mapping[str, Any] | None] = {}
+
+    def cleanliness(repo: Any) -> Mapping[str, Any]:
+        if not isinstance(repo, str) or not repo:
+            return {"ok": False}
+        if repo not in dirty_cache:
+            from . import git
+            dirty_cache[repo] = git.probe_status(repo)
+        return dirty_cache[repo] or {"ok": False}
+
+    for task in tasks:
+        task_id = task.get("task_id")
+        status = str(task.get("status") or "")
+        if status not in _TERMINAL_STATUSES:
+            continue  # active work is never a hygiene candidate
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        lane = _task_owner_lane(task, owners)
+        checkpoint = task.get("checkpoint") or {}
+        pane_id = checkpoint.get("pane_id")
+        workspace_id = checkpoint.get("workspace_id")
+
+        if lane in ("unknown", "team_unlaunched"):
+            classify(task, "protected_unknown", "team ownership is unverified")
+            continue
+        # A current OR historical team execution is accepted only on its own
+        # durable acceptance. A task record that merely says complete/stopped is
+        # never authority to clean up a team's pane.
+        if lane.startswith("team_") and not team_slot_accepted(
+                owners.get(task_id), task_id):
+            classify(task, "protected_unknown",
+                     "the owning team has not durably accepted this result")
+            continue
+        if (not isinstance(pane_id, str) or not pane_id
+                or not isinstance(workspace_id, str) or not workspace_id):
+            classify(task, "missing_pane",
+                     "terminal task has no verified pane identity")
+            continue
+        if not runtime_ok:
+            classify(task, "protected_unknown",
+                     "the runtime is not available to observe")
+            continue
+        if not ledger_ok:
+            classify(task, "protected_unknown",
+                     "the Work Registry is unreadable")
+            continue
+        repo = task.get("repo")
+        if any(
+                row["work_key"] == task_id
+                or (isinstance(repo, str) and repo
+                    and row["worktree"] == repo)
+                for row in claims):
+            classify(task, "protected_active",
+                     "a live Registry claim still owns this task or checkout")
+            continue
+        tree = cleanliness(task.get("repo"))
+        if not tree.get("ok"):
+            classify(task, "protected_unknown",
+                     "the task checkout state is unreadable")
+            continue
+        if tree.get("items"):
+            classify(task, "protected_unknown", "the task checkout is dirty")
+            continue
+        if pane_id in busy_panes or workspace_id in busy_workspaces:
+            classify(task, "protected_active",
+                     "the pane or workspace is reused by another task")
+            continue
+        try:
+            pane = driver.pane_get(pane_id)
+        except product_driver.DriverNotFound:
+            continue  # the pane is already gone: there is no orphan to close
+        except product_driver.DriverError:
+            classify(task, "protected_unknown", "the pane could not be read")
+            continue
+        if (not isinstance(pane, Mapping) or pane.get("pane_id") != pane_id
+                or pane.get("workspace_id") != workspace_id
+                or labels.get(workspace_id) != task.get("workspace_label")):
+            classify(task, "unowned",
+                     "the pane is not this CAO task's own workspace")
+            continue
+        # Bind the pane's occupant to this task's own named agent through the
+        # exact production identity fields (a pane carries the worker KIND, not
+        # this task's unique name) and, when a worker is present, require it to
+        # be provably stopped. A foreign, reused or unverifiable worker never is.
+        ownership_error = product_task._named_agent_ownership_error(
+            driver, checkpoint, pane, pane_id, workspace_id)
+        if ownership_error is not None:
+            classify(task, "protected_active", ownership_error)
+            continue
+        if isinstance(pane.get("agent"), str) and pane.get("agent"):
+            state = str(pane.get("agent_status") or "").strip().lower()
+            if state not in registry.DEAD_STATES:
+                classify(task, "protected_active",
+                         "the task's own worker is still active")
+                continue
+        # Everything is proved: an owned, inactive, unreused, clean, accepted
+        # terminal orphan pane.
+        classify(task, "eligible",
+                 "an owned accepted terminal orphan pane")
+        if not apply:
+            continue
+        closed, error = product_task._close_owned_pane(driver, task)
+        if error is not None or not closed:
+            classify(task, "close_failed", "the owned pane was not proven closed")
+            continue
+        try:
+            product_state.update_task(task_id, {"pane_closed": closed}, env)
+        except Exception:  # noqa: BLE001 - an unrecorded close is not a close
+            classify(task, "close_failed", "the verified close could not be recorded")
+            continue
+        classify(task, "closed", "closed an owned terminal orphan pane")
+
+    return {
+        "schema": HYGIENE_SCHEMA,
+        "mode": "applied" if apply else "plan",
+        "runtime": "AVAILABLE" if runtime_ok else "UNAVAILABLE",
+        "registry": "AVAILABLE" if ledger_ok else "UNAVAILABLE",
+        "counts": counts,
+        "items": items,
+    }
+
+
 class DaemonError(Exception):
     """Base class for daemon failures."""
 
@@ -282,6 +540,7 @@ def collect_occupancy(driver: Any) -> Occupancy:
             agents.append(
                 {
                     "agent_id": name,
+                    "pane_id": pane_id,
                     "worktree": worktree,
                     "state": str(state),
                     "session_id": _opaque_session(detail),
@@ -532,6 +791,7 @@ def _payload(
         "tasks": tasks,
         "held": held,
         "already_running": already_running,
+        "hygiene": record.get("hygiene"),
         "service": {
             "desired": (service or {}).get("desired"),
             "observed": (service or {}).get("observed"),
@@ -1080,6 +1340,23 @@ class Daemon:
                     "reason": getattr(exc, "code", type(exc).__name__),
                 })
         now = evidence.utc_now(self._clock)
+        # Conservative bounded hygiene reconciliation on this same tick. It is
+        # default OFF and, even when enabled, defaults to a plan-only dry run:
+        # it never scans arbitrary processes, never force-unlocks the Registry
+        # and never closes a pane that is not proved to be its own accepted
+        # terminal orphan. No second daemon, ledger or scheduler is added.
+        if self._config is not None:
+            hygiene = self._hygiene(owners)
+            record["hygiene"] = hygiene
+            counts = hygiene.get("counts") or {}
+            if hygiene.get("mode") == "applied" or any(
+                    count for name, count in counts.items()
+                    if name not in ("eligible",)):
+                effects.append({
+                    "action": "hygiene",
+                    "status": hygiene.get("mode"),
+                    "counts": counts,
+                })
         # One bounded exception report over the records this tick already read.
         # A healthy tick emits nothing here: only a real exception is surfaced,
         # so this is not a routine per-tick message. The daemon applies none of
@@ -1133,11 +1410,43 @@ class Daemon:
             return Occupancy(False, (), "no runtime driver is configured")
         return collect_occupancy(self._driver)
 
+    def _hygiene(self, teams: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """One bounded hygiene pass, default plan-only.
+
+        Closure is applied only when the operator has both enabled hygiene and
+        cleared its dry run. Any unexpected error is reported as a held pass,
+        never as a successful cleanup.
+        """
+
+        apply = (self._defaults.hygiene_enabled
+                 and not self._defaults.hygiene_dry_run)
+        try:
+            return hygiene_report(
+                env=self._env, driver=self._driver,
+                registry_db=self._registry_db, apply=apply, teams=teams)
+        except Exception as exc:  # noqa: BLE001 - a failed pass cleans nothing
+            return {
+                "schema": HYGIENE_SCHEMA, "mode": "hold",
+                "runtime": "UNAVAILABLE", "registry": "UNAVAILABLE",
+                "counts": {}, "items": [],
+                "reason": getattr(exc, "code", type(exc).__name__),
+            }
+
     def _observed_state(self, task: Mapping[str, Any], occupancy: Occupancy) -> str | None:
         if not occupancy.available:
             return None
         checkpoint = task.get("checkpoint") or {}
+        pane_id = checkpoint.get("pane_id")
         name = checkpoint.get("agent_name")
+        # The runtime reports the worker KIND on a pane, never this task's
+        # unique agent name, so bind this task's own worker by its pane
+        # identity first. A name match is only a fallback for a runtime that
+        # reports the unique name.
+        if isinstance(pane_id, str) and pane_id:
+            for agent in occupancy.agents:
+                if agent.get("pane_id") == pane_id:
+                    state = str(agent.get("state") or "").strip().lower()
+                    return "gone" if state in registry.DEAD_STATES else "active"
         if not isinstance(name, str) or not name:
             return "gone"
         for agent in occupancy.agents:
@@ -1420,6 +1729,7 @@ def status(
             "tasks": {},
             "held": [],
             "already_running": None,
+            "hygiene": None,
             "service": {"desired": None, "observed": None},
         }
     current = record or product_state.default_daemon_record()

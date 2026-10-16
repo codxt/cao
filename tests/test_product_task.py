@@ -31,7 +31,15 @@ GIT_ENV = {
 
 
 class FakeDriver:
-    """Record calls and answer with deterministic runtime-shaped values."""
+    """Record calls and answer with deterministic, production-shaped values.
+
+    The shape mirrors the managed runtime the product drives: a pane reports
+    the worker KIND (a type such as a CLI name) in ``agent`` plus its own
+    ``agent_status``, while ``agent.get`` on this task's unique agent name
+    reports that agent's own pane and workspace. Putting the unique name in the
+    pane's ``agent`` field instead would hide the exact identity confusion the
+    product must never make.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
@@ -41,12 +49,18 @@ class FakeDriver:
         self.read_text = "agent output"
         self.agent_present = False
         self.closed_panes: set[str] = set()
+        self.panes: dict[str, dict] = {}
+        self.agents: dict[str, dict] = {}
 
     def _note(self, name, *args, **kwargs):
         self.calls.append((name, args, kwargs))
 
     def names(self) -> list[str]:
         return [call[0] for call in self.calls]
+
+    @staticmethod
+    def _workspace_of(pane_id):
+        return pane_id.split(":", 1)[0] if isinstance(pane_id, str) and ":" in pane_id else None
 
     def workspace_list(self):
         self._note("workspace_list")
@@ -57,17 +71,29 @@ class FakeDriver:
         self.workspaces.append(
             {"workspace_id": "w1", "label": label, "active_tab_id": "w1:t1"}
         )
+        self.panes.setdefault("w1:p1", {
+            "pane_id": "w1:p1", "workspace_id": "w1",
+            "agent": None, "agent_status": "unknown",
+        })
         return {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1"}
 
     def pane_list(self, workspace_id):
         self._note("pane_list", workspace_id)
-        return [{"pane_id": "w1:p1", "workspace_id": workspace_id}]
+        pane = self.panes.get("w1:p1", {})
+        return [{
+            "pane_id": "w1:p1", "workspace_id": workspace_id,
+            "agent": pane.get("agent"), "agent_status": pane.get("agent_status"),
+        }]
 
     def pane_get(self, pane_id):
         self._note("pane_get", pane_id)
         if pane_id in self.closed_panes:
             raise product_driver.DriverNotFound("closed pane")
-        return {"pane_id": pane_id, "workspace_id": "w1"}
+        pane = self.panes.get(pane_id)
+        if pane is None:
+            return {"pane_id": pane_id, "workspace_id": self._workspace_of(pane_id),
+                    "agent": None, "agent_status": "unknown"}
+        return dict(pane)
 
     def pane_close(self, pane_id):
         self._note("pane_close", pane_id)
@@ -76,7 +102,18 @@ class FakeDriver:
 
     def agent_start(self, name, kind, pane_id, *, argv=(), timeout_ms=None):
         self._note("agent_start", name, kind, pane_id, tuple(argv), timeout_ms)
-        return {"agent_pane_id": pane_id, "agent_workspace_id": "w1"}
+        workspace_id = self._workspace_of(pane_id)
+        pane = self.panes.setdefault(
+            pane_id, {"pane_id": pane_id, "workspace_id": workspace_id})
+        if workspace_id is not None:
+            pane["workspace_id"] = workspace_id
+        pane["agent"] = kind  # the worker KIND, never the unique name
+        pane["agent_status"] = "working"
+        self.agents[name] = {
+            "name": name, "agent": kind, "pane_id": pane_id,
+            "workspace_id": pane.get("workspace_id"),
+        }
+        return {"agent_pane_id": pane_id, "agent_workspace_id": pane.get("workspace_id")}
 
     def agent_prompt(self, target, text, *, timeout_ms=None, wait=False):
         self._note("agent_prompt", target, text)
@@ -90,13 +127,25 @@ class FakeDriver:
 
     def agent_get(self, target):
         self._note("agent_get", target)
+        agent = self.agents.get(target)
+        if agent is not None:
+            return dict(agent)
         if self.agent_present:
-            return {"name": target, "agent_status": "idle"}
+            return {"name": target, "agent": "opencode",
+                    "pane_id": "w1:p1", "workspace_id": "w1"}
         raise product_driver.DriverNotFound("not present")
 
     def agent_wait(self, target, *, until=(), timeout_ms=None):
         self._note("agent_wait", target)
         return {"agent": {"agent_status": self.wait_state}}
+
+    def drop_agents(self) -> None:
+        """Model the runtime losing every started agent (an exited worker)."""
+        self.agents.clear()
+        self.agent_present = False
+        for pane in self.panes.values():
+            pane["agent"] = None
+            pane["agent_status"] = "unknown"
 
 
 def git_repo(root: Path, name: str = "repo", files=("a.txt",)) -> Path:
@@ -813,6 +862,188 @@ class CompletionAndStopTests(TaskCase):
         self.assertEqual(row["outcome"], "abandon")
         self.assertIsNotNone(row["released_at"])
 
+    def test_read_finish_closes_own_pane_before_release(self) -> None:
+        # An ordinary READ completion must close its own pane before releasing
+        # the claim, exactly like a WRITE, so a finished reader is never left
+        # with a leaked pane.
+        repo = git_repo(self.root, name="read-close")
+        driver = FakeDriver()
+        driver.wait_state = "done"
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=1000,
+        )
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["pane_closed"], "w1:p1")
+        self.assertTrue(payload["claim"]["released"])
+        self.assertEqual(payload["claim"]["outcome"], "complete")
+        self.assertEqual(driver.names().count("pane_close"), 1)
+
+    def test_pane_kind_is_never_compared_to_the_unique_agent_name(self) -> None:
+        # A real pane reports the worker KIND in ``agent`` (e.g. the CLI name)
+        # while ``agent.get`` resolves this task's unique agent name. The close
+        # must bind through the named agent, never mistake the kind for a name.
+        repo = git_repo(self.root, name="kind-vs-name")
+        driver = FakeDriver()
+        driver.wait_state = "done"
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=1000,
+        )
+        self.assertEqual(payload["status"], "complete")
+        name, kind = next(
+            call[1] for call in driver.calls if call[0] == "agent_start")[:2]
+        self.assertNotEqual(name, kind)          # unique name vs worker kind
+        self.assertEqual(driver.panes["w1:p1"]["agent"], kind)
+        self.assertEqual(payload["pane_closed"], "w1:p1")
+        self.assertTrue(payload["claim"]["released"])
+
+    def test_matching_kind_with_a_foreign_named_agent_holds(self) -> None:
+        # The pane's kind matches the named agent's kind, but ``agent.get``
+        # resolves this task's own name to a different pane: the close must hold
+        # the claim rather than touch a reused pane.
+        class ReusedPane(FakeDriver):
+            def agent_get(self, target):
+                agent = super().agent_get(target)
+                return dict(agent, pane_id="w9:p9")
+
+        repo = git_repo(self.root, name="reused-pane")
+        driver = ReusedPane()
+        driver.wait_state = "done"
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=1000,
+        )
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(payload["claim"].get("released"))
+
+    def test_read_finish_holds_claim_when_pane_close_fails(self) -> None:
+        class FailingClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                raise product_driver.DriverError("close unavailable")
+
+        repo = git_repo(self.root, name="read-close-fail")
+        driver = FailingClose()
+        driver.wait_state = "done"
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=1000,
+        )
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertFalse(payload["claim"].get("released"))
+        conn = registry.connect(db=self.db)
+        try:
+            row = conn.execute(
+                "SELECT released_at FROM claims WHERE work_key=?",
+                (payload["task_id"],)).fetchone()
+            self.assertIsNone(row["released_at"])
+        finally:
+            conn.close()
+
+    def test_completion_gate_refusal_never_releases_or_closes(self) -> None:
+        # The optional completion gate runs on the durable terminal evidence
+        # BEFORE pane closure and claim release, so a refused result holds both.
+        repo = git_repo(self.root, name="gate-refusal")
+        driver = FakeDriver()
+        driver.wait_state = "done"
+        calls: list = []
+
+        def refuse(record):
+            calls.append(bool(record.get("output_observations")))
+            return {"code": "TEAM_DURABLE_RESULT_UNVERIFIED",
+                    "message": "no exact receipt"}
+
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db,
+            wait_ms=1000, verify=refuse,
+        )
+        self.assertEqual(payload["status"], "unknown")
+        self.assertEqual(payload["error"]["code"], "TEAM_DURABLE_RESULT_UNVERIFIED")
+        self.assertFalse(payload["claim"].get("released"))
+        self.assertIsNone(payload.get("pane_closed"))
+        self.assertNotIn("pane_close", driver.names())
+        # The gate saw the durable terminal observation it was asked to judge.
+        self.assertTrue(calls and calls[0])
+
+    def test_completion_gate_acceptance_still_releases_and_closes(self) -> None:
+        repo = git_repo(self.root, name="gate-accept")
+        driver = FakeDriver()
+        driver.wait_state = "done"
+        seen: list[bool] = []
+
+        def accept(record):
+            seen.append(bool(record.get("output") is not None))
+            return None
+
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db,
+            wait_ms=1000, verify=accept,
+        )
+        self.assertEqual(payload["status"], "complete")
+        self.assertTrue(seen)
+        self.assertEqual(payload["pane_closed"], "w1:p1")
+        self.assertTrue(payload["claim"]["released"])
+
+    def test_read_retries_release_after_verified_closed_pane(self) -> None:
+        # A non-atomic crash between pane closure and claim release: the pane is
+        # already gone but the claim is open. The re-run only completes because
+        # the recorded close matches the exact owned pane, which is verifiably
+        # absent; it never re-prompts or starts a replacement.
+        class ClosedWait(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                if "w1:p1" in self.closed_panes:
+                    raise product_driver.DriverNotFound("closed worker")
+                return super().agent_wait(
+                    target, until=until, timeout_ms=timeout_ms)
+
+        repo = git_repo(self.root, name="read-retry-release")
+        driver = ClosedWait()
+        driver.wait_state = "done"
+        args = dict(driver=driver, repo=str(repo), prompt="Read the repository",
+                    config=self.config, env=self.env, registry_db=self.db)
+        with patch.object(registry, "release", return_value={
+                "ok": False, "errors": ["temporary ledger refusal"]}):
+            first = product_task.run_task(**args, wait_ms=1000)
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(first["error"]["code"], "TASK_CLAIM_RELEASE_REJECTED")
+        self.assertEqual(first["pane_closed"], "w1:p1")
+        second = product_task.run_task(**args, wait_ms=1000)
+        self.assertEqual(second["status"], "complete")
+        self.assertTrue(second["claim"]["released"])
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_read_post_close_recovery_needs_the_matching_checkpoint(self) -> None:
+        # A recorded close for a DIFFERENT pane is not post-close evidence for
+        # this task, so with the worker gone the READ holds rather than
+        # releasing on a bare guess.
+        class GoneWorker(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverNotFound("worker gone")
+
+        repo = git_repo(self.root, name="read-close-mismatch")
+        driver = GoneWorker()
+        started = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            config=self.config, env=self.env, registry_db=self.db, wait_ms=0)
+        self.assertEqual(started["status"], "running")
+        record = product_state.read_task(started["task_id"], self.env)
+        record["pane_closed"] = "w9:p9"
+        product_state.write_task(record, self.env)
+        resumed = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Read the repository",
+            task_id=started["task_id"], config=self.config, env=self.env,
+            registry_db=self.db, wait_ms=1000)
+        self.assertEqual(resumed["status"], "running")
+        self.assertFalse(resumed["claim"].get("released"))
+        self.assertNotIn("pane_close", driver.names())
+
     def _release_out_of_band(self, payload):
         conn = registry.connect(db=self.db)
         try:
@@ -1031,6 +1262,468 @@ class CompletionAndStopTests(TaskCase):
     def test_stop_without_a_task_is_unavailable(self) -> None:
         with self.assertRaises(product_task.TaskUnavailable):
             product_task.stop_task(env=self.env, registry_db=self.db)
+
+
+class FocusedIdleAdmissionTests(TaskCase):
+    """A focused tab reports IDLE for the same settled state an unseen
+    background worker reports as DONE. A team execution (one that supplies a
+    completion gate) may therefore settle at EITHER, but a bare idle is never
+    completion: an idle is admitted only when this execution's own verified,
+    task-bound terminal result passes the gate. An idle that does not is an
+    early/transient idle and stays RUNNING with its claim held.
+    """
+
+    RECEIPT = "CAO_TEAM_RESULT: " + ("a" * 16)
+
+    def gated(self, driver, *, repo_name, prompt="Run the task", wait_ms=1000,
+              verify=None):
+        repo = git_repo(self.root, name=repo_name)
+        return product_task.run_task(
+            driver=driver, repo=str(repo), prompt=prompt, config=self.config,
+            env=self.env, registry_db=self.db, wait_ms=wait_ms, verify=verify,
+        )
+
+    def test_focused_idle_with_a_verified_result_completes_and_releases(self) -> None:
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        driver.read_text = "final answer\n" + self.RECEIPT
+        seen: list[bool] = []
+
+        def accept(record):
+            observations = record.get("output_observations") or []
+            seen.append(bool(observations) and observations[-1]["terminal"] is True)
+            return None
+
+        payload = self.gated(driver, repo_name="idle-accept", verify=accept)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["pane_closed"], "w1:p1")
+        self.assertTrue(payload["claim"]["released"])
+        # The gate judged a durable capture that was marked terminal.
+        self.assertEqual(seen, [True])
+
+    def test_immediate_idle_without_a_verified_result_stays_running(self) -> None:
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        driver.read_text = "no completion line here"  # no receipt at all
+
+        def refuse(record):
+            return {"code": "TEAM_DURABLE_RESULT_UNVERIFIED",
+                    "message": "no exact receipt"}
+
+        payload = self.gated(driver, repo_name="idle-early", verify=refuse)
+        # Never falsely complete, and never UNKNOWN on an early idle.
+        self.assertEqual(payload["status"], "running")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(payload["claim"].get("released"))
+        # The provisional terminal provenance is withdrawn: an early idle is
+        # not a durable terminal capture.
+        record = product_state.read_task(payload["task_id"], self.env)
+        self.assertFalse(record["output_observations"][-1]["terminal"])
+
+    def test_ordinary_task_without_a_gate_is_never_completed_by_bare_idle(self) -> None:
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        driver.read_text = "final answer\n" + self.RECEIPT
+        payload = self.gated(driver, repo_name="idle-ungated", verify=None)
+        self.assertEqual(payload["status"], "running")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(payload["claim"].get("released"))
+
+    def test_done_with_a_refused_result_still_holds_unknown(self) -> None:
+        # A DONE report is authoritative terminal: an unverified result is
+        # terminal-but-unverified, so it holds UNKNOWN rather than RUNNING.
+        driver = FakeDriver()
+        driver.wait_state = "done"
+        driver.read_text = "no receipt"
+        payload = self.gated(
+            driver, repo_name="done-refused",
+            verify=lambda record: {"code": "TEAM_DURABLE_RESULT_UNVERIFIED"})
+        self.assertEqual(payload["status"], "unknown")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(payload["claim"].get("released"))
+
+    def test_idle_transport_unavailable_never_completes(self) -> None:
+        class Unreadable(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverError("wait transport unavailable")
+
+        driver = Unreadable()
+        payload = self.gated(
+            driver, repo_name="idle-transport", verify=lambda record: None)
+        self.assertEqual(payload["status"], "running")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(payload["claim"].get("released"))
+
+    def test_idle_completion_is_idempotent_after_process_exit(self) -> None:
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        driver.read_text = "answer\n" + self.RECEIPT
+        repo = git_repo(self.root, name="idle-idempotent")
+        args = dict(driver=driver, repo=str(repo), prompt="Run the task",
+                    config=self.config, env=self.env, registry_db=self.db)
+        first = product_task.run_task(**args, wait_ms=1000,
+                                      verify=lambda record: None)
+        self.assertEqual(first["status"], "complete")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        # The runtime loses the worker (process exit). Re-evaluation stays
+        # complete, verifies the owned pane is absent, and never re-prompts.
+        driver.drop_agents()
+        second = product_task.run_task(**args, wait_ms=1000,
+                                       verify=lambda record: None)
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+    def test_idle_post_close_recovery_completes_without_replay(self) -> None:
+        class ClosedWait(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                if "w1:p1" in self.closed_panes:
+                    raise product_driver.DriverNotFound("closed worker")
+                return super().agent_wait(
+                    target, until=until, timeout_ms=timeout_ms)
+
+        driver = ClosedWait()
+        driver.wait_state = "idle"
+        driver.read_text = "answer\n" + self.RECEIPT
+        repo = git_repo(self.root, name="idle-post-close")
+        args = dict(driver=driver, repo=str(repo), prompt="Run the task",
+                    config=self.config, env=self.env, registry_db=self.db)
+        with patch.object(registry, "release", return_value={
+                "ok": False, "errors": ["temporary ledger refusal"]}):
+            first = product_task.run_task(**args, wait_ms=1000,
+                                          verify=lambda record: None)
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(first["pane_closed"], "w1:p1")
+        second = product_task.run_task(**args, wait_ms=1000,
+                                       verify=lambda record: None)
+        self.assertEqual(second["status"], "complete")
+        self.assertTrue(second["claim"]["released"])
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(driver.names().count("pane_close"), 1)
+
+
+class DurableTerminalReceiptTests(TaskCase):
+    """A verified settlement is durable BEFORE the first pane-close attempt.
+
+    A crash between that save and the recorded close must neither lose the
+    settled receipt nor strand the open claim: a later run re-proves this
+    task's own claim, repository, owned pane and durable terminal result, then
+    completes the close and releases exactly once -- never re-prompting.
+    """
+
+    RECEIPT = "CAO_TEAM_RESULT: " + ("c" * 16)
+
+    def gate(self):
+        receipt = self.RECEIPT
+
+        def verify(record):
+            for entry in record.get("output_observations") or []:
+                if (isinstance(entry, dict) and entry.get("terminal") is True
+                        and receipt in str(entry.get("output") or "")):
+                    return None
+            return {"code": "TEAM_DURABLE_RESULT_UNVERIFIED",
+                    "message": "the durable result is not this task's receipt"}
+
+        return verify
+
+    def start(self, driver, task_id, *, name, verify):
+        repo = git_repo(self.root, name=name)
+        return dict(driver=driver, repo=str(repo), prompt="Run the task",
+                    task_id=task_id, config=self.config, env=self.env,
+                    registry_db=self.db, wait_ms=1000, verify=verify)
+
+    def claims(self, task_id):
+        conn = registry.connect(db=self.db)
+        try:
+            return conn.execute(
+                "SELECT claim_id, released_at, outcome FROM claims WHERE work_key=?",
+                (task_id,)).fetchall()
+        finally:
+            conn.close()
+
+    def test_crash_within_pane_close_keeps_receipt_and_recovers_once(self):
+        class CrashOnClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                self.closed_panes.add(pane_id)   # the close effect happened
+                raise RuntimeError("simulated crash inside pane.close")
+
+        driver = CrashOnClose()
+        driver.wait_state = "done"
+        driver.read_text = "settled answer\n" + self.RECEIPT
+        args = self.start(driver, "durable-close", name="durable-close",
+                          verify=self.gate())
+        with self.assertRaises(RuntimeError):
+            product_task.run_task(**args)
+
+        # The verified receipt is durable even though the close was never
+        # recorded and the claim is still open.
+        record = product_state.read_task("durable-close", self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertIsNone(record.get("pane_closed"))
+        self.assertEqual(record["terminal_result"]["repo"], args["repo"])
+        self.assertEqual(record["terminal_result"]["pane_id"], "w1:p1")
+        self.assertEqual(record["terminal_result"]["claim_id"],
+                         record["claim"]["claim_id"])
+        self.assertTrue(any(entry.get("terminal") is True
+                            for entry in record["output_observations"]))
+        held = self.claims("durable-close")
+        self.assertEqual(len(held), 1)
+        self.assertIsNone(held[0]["released_at"])
+
+        # The runtime lost the closed worker. Recovery re-proves the durable
+        # receipt and the original claim, closes idempotently (already gone)
+        # and releases exactly once, without re-prompting.
+        class RestartGone(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverNotFound("closed worker")
+
+        restart = RestartGone()
+        restart.closed_panes.add("w1:p1")
+        args["driver"] = restart
+        second = product_task.run_task(**args)
+        self.assertEqual(second["status"], "complete")
+        self.assertTrue(second["claim"]["released"])
+        self.assertEqual(second["claim"]["claim_id"],
+                         record["terminal_result"]["claim_id"])
+        self.assertEqual(restart.names().count("agent_prompt"), 0)
+        self.assertNotIn("pane_close", restart.names())
+        released = self.claims("durable-close")
+        self.assertEqual(len(released), 1)
+        self.assertIsNotNone(released[0]["released_at"])
+        self.assertEqual(released[0]["outcome"], "complete")
+        # The original terminal evidence survives the reconciliation.
+        final = product_state.read_task("durable-close", self.env)
+        self.assertTrue(any(
+            entry.get("terminal") is True
+            and self.RECEIPT in str(entry.get("output") or "")
+            for entry in final["output_observations"]))
+
+    def test_crash_before_pane_close_retains_receipt_and_completes(self):
+        class CrashBeforeClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                raise RuntimeError("simulated crash before pane.close")
+
+        driver = CrashBeforeClose()
+        driver.wait_state = "done"
+        driver.read_text = "settled answer\n" + self.RECEIPT
+        args = self.start(driver, "durable-before", name="durable-before",
+                          verify=self.gate())
+        with self.assertRaises(RuntimeError):
+            product_task.run_task(**args)
+
+        record = product_state.read_task("durable-before", self.env)
+        self.assertEqual(record["status"], "running")
+        self.assertIsNone(record.get("pane_closed"))
+        self.assertEqual(record["terminal_result"]["claim_id"],
+                         record["claim"]["claim_id"])
+        self.assertTrue(any(entry.get("terminal") is True
+                            for entry in record["output_observations"]))
+        self.assertIsNone(self.claims("durable-before")[0]["released_at"])
+
+        # A later run of the same task proves the same claim/repository and
+        # completes exactly once without a second prompt or start.
+        restart = FakeDriver()
+        restart.wait_state = "done"
+        restart.read_text = "settled answer\n" + self.RECEIPT
+        args["driver"] = restart
+        second = product_task.run_task(**args)
+        self.assertEqual(second["status"], "complete")
+        self.assertTrue(second["claim"]["released"])
+        self.assertEqual(restart.names().count("agent_prompt"), 0)
+        self.assertEqual(restart.names().count("agent_start"), 0)
+        rows = self.claims("durable-before")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["released_at"])
+
+    def test_refused_gate_never_writes_a_durable_disposition(self):
+        driver = FakeDriver()
+        driver.wait_state = "done"
+        driver.read_text = "no receipt here"
+        args = self.start(driver, "no-durable-done", name="no-durable-done",
+                          verify=self.gate())
+        payload = product_task.run_task(**args)
+        self.assertEqual(payload["status"], "unknown")
+        self.assertFalse(payload["claim"].get("released"))
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task("no-durable-done", self.env)
+        self.assertIsNone(record.get("terminal_result"))
+
+    def test_early_idle_never_writes_a_durable_disposition(self):
+        driver = FakeDriver()
+        driver.wait_state = "idle"
+        driver.read_text = "no receipt here"
+        args = self.start(driver, "no-durable-idle", name="no-durable-idle",
+                          verify=self.gate())
+        payload = product_task.run_task(**args)
+        self.assertEqual(payload["status"], "running")
+        self.assertFalse(payload["claim"].get("released"))
+        self.assertNotIn("pane_close", driver.names())
+        record = product_state.read_task("no-durable-idle", self.env)
+        self.assertIsNone(record.get("terminal_result"))
+        self.assertFalse(record["output_observations"][-1]["terminal"])
+
+    def test_durable_disposition_never_releases_while_its_pane_is_present(self):
+        class CrashOnClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                raise RuntimeError("crash before the close effect")
+
+        driver = CrashOnClose()
+        driver.wait_state = "done"
+        driver.read_text = "settled\n" + self.RECEIPT
+        args = self.start(driver, "durable-pane-open", name="durable-pane-open",
+                          verify=self.gate())
+        with self.assertRaises(RuntimeError):
+            product_task.run_task(**args)
+
+        # The pane still exists and the worker cannot be read: a bare wait
+        # not-found must never release the claim from the durable disposition.
+        class UnreadableWait(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverNotFound("worker gone")
+
+        restart = UnreadableWait()          # pane "w1:p1" is still present
+        args["driver"] = restart
+        payload = product_task.run_task(**args)
+        self.assertEqual(payload["status"], "running")
+        self.assertFalse(payload["claim"].get("released"))
+        self.assertNotIn("pane_close", restart.names())
+        self.assertIsNone(self.claims("durable-pane-open")[0]["released_at"])
+
+    def test_foreign_durable_disposition_is_refused(self):
+        class CrashOnClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                self.closed_panes.add(pane_id)   # the close effect happened
+                raise RuntimeError("simulated crash inside pane.close")
+
+        driver = CrashOnClose()
+        driver.wait_state = "done"
+        driver.read_text = "settled\n" + self.RECEIPT
+        args = self.start(driver, "durable-foreign", name="durable-foreign",
+                          verify=self.gate())
+        with self.assertRaises(RuntimeError):
+            product_task.run_task(**args)
+
+        # A disposition bound to another claim is not this task's own and must
+        # never be adopted as a settlement.
+        record = product_state.read_task("durable-foreign", self.env)
+        record["terminal_result"]["claim_id"] = "claimed-by-someone-else"
+        product_state.write_task(record, self.env)
+
+        class RestartGone(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverNotFound("closed worker")
+
+        restart = RestartGone()
+        restart.closed_panes.add("w1:p1")
+        args["driver"] = restart
+        payload = product_task.run_task(**args)
+        self.assertEqual(payload["status"], "running")
+        self.assertFalse(payload["claim"].get("released"))
+        self.assertNotIn("pane_close", restart.names())
+        self.assertIsNone(self.claims("durable-foreign")[0]["released_at"])
+
+    def test_recovery_refuses_when_the_durable_receipt_is_tampered(self):
+        class CrashOnClose(FakeDriver):
+            def pane_close(self, pane_id):
+                self._note("pane_close", pane_id)
+                self.closed_panes.add(pane_id)   # the close effect happened
+                raise RuntimeError("simulated crash inside pane.close")
+
+        driver = CrashOnClose()
+        driver.wait_state = "done"
+        driver.read_text = "settled\n" + self.RECEIPT
+        args = self.start(driver, "durable-tampered", name="durable-tampered",
+                          verify=self.gate())
+        with self.assertRaises(RuntimeError):
+            product_task.run_task(**args)
+
+        # The retained window no longer carries this task's exact receipt, so
+        # the recovery gate refuses and the claim stays open.
+        record = product_state.read_task("durable-tampered", self.env)
+        record["output_observations"] = [
+            dict(entry, output="tampered with no receipt")
+            for entry in record["output_observations"]]
+        product_state.write_task(record, self.env)
+
+        class RestartGone(FakeDriver):
+            def agent_wait(self, target, *, until=(), timeout_ms=None):
+                raise product_driver.DriverNotFound("closed worker")
+
+        restart = RestartGone()
+        restart.closed_panes.add("w1:p1")
+        restart.read_text = "unrelated read"
+        args["driver"] = restart
+        payload = product_task.run_task(**args)
+        self.assertEqual(payload["status"], "unknown")
+        self.assertFalse(payload["claim"].get("released"))
+        self.assertNotIn("pane_close", restart.names())
+        self.assertIsNone(self.claims("durable-tampered")[0]["released_at"])
+
+
+class HerdrFieldCanaryTests(TaskCase):
+    """Read-only canaries over the exact Herdr field shapes CAO consumes.
+
+    Herdr reports a pane's worker KIND in ``agent`` while the UNIQUE agent name
+    resolves only through ``agent get``; a live agent also carries a settled
+    ``status`` and a ``completion_seq``. The positive canary asserts CAO reads
+    those fields as documented and admits a verified focused-idle result; the
+    negative canary asserts a pane whose occupant CAO cannot resolve as its own
+    has NO closure effect (no pane close, no claim release).
+    """
+
+    class LiveHerdr(FakeDriver):
+        def pane_get(self, pane_id):
+            pane = super().pane_get(pane_id)
+            pane.setdefault("agent_status", "idle")
+            return pane
+
+        def agent_get(self, target):
+            base = super().agent_get(target)
+            return dict(base, status="idle", completion_seq=7)
+
+    RECEIPT = "CAO_TEAM_RESULT: " + ("b" * 16)
+
+    def canary_repo(self, name):
+        return git_repo(self.root, name=name)
+
+    def test_positive_canary_reads_unique_name_not_pane_kind(self) -> None:
+        driver = self.LiveHerdr()
+        driver.wait_state = "idle"
+        driver.read_text = "reviewed\n" + self.RECEIPT
+        repo = self.canary_repo("canary-positive")
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Run the task",
+            config=self.config, env=self.env, registry_db=self.db,
+            wait_ms=1000, verify=lambda record: None)
+        self.assertEqual(payload["status"], "complete")
+        record = product_state.read_task(payload["task_id"], self.env)
+        unique = record["checkpoint"]["agent_name"]
+        # The pane reports the KIND; CAO must resolve this task's UNIQUE name.
+        self.assertNotEqual(unique, "opencode")
+        gets = [call for call in driver.calls if call[0] == "agent_get"]
+        self.assertTrue(gets)
+        self.assertTrue(all(call[1][0] == unique for call in gets))
+
+    def test_negative_canary_foreign_occupant_has_no_closure_effect(self) -> None:
+        class Foreign(self.LiveHerdr):
+            def agent_get(self, target):
+                raise product_driver.DriverNotFound("foreign occupant")
+
+        driver = Foreign()
+        driver.wait_state = "idle"
+        driver.read_text = "answer\n" + self.RECEIPT
+        repo = self.canary_repo("canary-negative")
+        payload = product_task.run_task(
+            driver=driver, repo=str(repo), prompt="Run the task",
+            config=self.config, env=self.env, registry_db=self.db,
+            wait_ms=1000, verify=lambda record: None)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["error"]["code"], "TASK_PANE_CLOSE_FAILED")
+        self.assertNotIn("pane_close", driver.names())
+        self.assertFalse(payload["claim"].get("released"))
 
 
 class BoundedOutputTests(TaskCase):
