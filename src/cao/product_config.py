@@ -104,18 +104,20 @@ MAX_TEAM_STALL_TIMEOUT_MS = 604_800_000
 #: naming any other policy is refused rather than silently ignored.
 REGISTRY_ATTACH_GOVERNED = "governed"
 
-#: Optional, operator-local model policy. Its vocabulary is the owner's
-#: authorized CAO/OpenCode dispatch routes (``provider/model``, optionally with
-#: a ``#effort`` variant). An absent field preserves the existing OSS behavior;
-#: a configured one is a deny gate applied to every NEW dispatch intent.
+#: Optional, operator-local model policy. Its vocabulary is the operator's own
+#: dispatch routes (``provider/model``, optionally with a ``#effort`` variant).
+#: An absent field preserves the existing OSS behavior; a configured one is a
+#: deny gate applied to every NEW dispatch intent. This field is the ONLY
+#: configurable route allowlist: the product prescribes no global, product-wide
+#: set of allowed routes and endorses no provider or model.
 TEAM_MODEL_ALLOWLIST_FIELD = "team_model_allowlist"
 _MAX_TEAM_MODELS = 16
-#: Documented owner routes, retained as explicit supported-route examples.
-SUPPORTED_TEAM_ROUTES = (
-    "opencode/step-5-preview-free",
-    "opencode-go/glm-5.3-flash",
-    "opencode-go/deepseek-v4.1-flash",
-)
+#: Deprecated, non-binding compatibility alias. The product is route-agnostic:
+#: it ships no global set of allowed dispatch routes, so this tuple is empty and
+#: grants nothing. The name is retained (rather than removed) so an existing
+#: importer keeps resolving; no code consults it. The only configurable route
+#: allowlist is the operator-local :data:`TEAM_MODEL_ALLOWLIST_FIELD`.
+SUPPORTED_TEAM_ROUTES: tuple[str, ...] = ()
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,150}\Z")
 #: A dispatch route may carry one bounded ``#effort`` variant (``#high``,
 #: ``#xhigh``, ...). The variant changes effort, never the base route, so the

@@ -1471,8 +1471,8 @@ class TeamModelPolicyTests(TaskCase):
                 with self.assertRaises(product_config.ProductConfigError):
                     self.policy_config(bad)
 
-    def test_owner_routes_admit_effort_variants_in_resolved_argv(self):
-        # All three owner-allowed routes are configurable, and an #effort
+    def test_configured_routes_admit_effort_variants_in_resolved_argv(self):
+        # Every configured allowlist route is honored, and an #effort
         # variant carried in the ACTUAL resolved provider argv is the same
         # base route: the gate reads the verified argv selection, normalizes
         # it, and dispatches the real variant.
@@ -1504,15 +1504,16 @@ class TeamModelPolicyTests(TaskCase):
                              if call[0] == "agent_start"][0]
                     self.assertIn(route + variant, start[1][3])
 
-    def test_unlisted_low_tier_route_is_refused_with_zero_claims(self):
-        # Any unlisted route — including the other models on the same
+    def test_unlisted_route_is_refused_with_zero_claims(self):
+        # Any unlisted route — including another model on the same
         # opencode-go provider — is denied before the first effect.
         config = self.policy_config([
             "opencode/step-5-preview-free",
             "opencode-go/glm-5.3-flash",
             "opencode-go/deepseek-v4.1-flash",
         ])
-        for route in ("opencode-go/luna", "opencode-go/space-bunny"):
+        for route in ("opencode-go/example-unlisted-a",
+                      "opencode-go/example-unlisted-b"):
             with self.subTest(route=route):
                 denied = product_config.validate_config({
                     "schema": product_config.SCHEMA,
@@ -1671,15 +1672,15 @@ class TeamRouteIdentityTests(TaskCase):
     claim rows and no workspace, pane or agent effect.
     """
 
-    OWNER_ROUTES = ("opencode/step-5-preview-free",
-                    "opencode-go/glm-5.3-flash",
-                    "opencode-go/deepseek-v4.1-flash")
+    CONFIGURED_ROUTES = ("opencode/step-5-preview-free",
+                         "opencode-go/glm-5.3-flash",
+                         "opencode-go/deepseek-v4.1-flash")
 
     def identity_config(self, provider, task=None):
         return product_config.validate_config({
             "schema": product_config.SCHEMA, "provider": provider,
             "task": task or {},
-            "team_model_allowlist": list(self.OWNER_ROUTES),
+            "team_model_allowlist": list(self.CONFIGURED_ROUTES),
         })
 
     def refused_dispatch(self, config):
@@ -1752,10 +1753,10 @@ class TeamRouteIdentityTests(TaskCase):
         self.assert_zero_effects(driver, payload)
 
     def test_actual_opencode_routes_still_dispatch_with_effort_variants(self):
-        # The approved routes dispatched by the real OpenCode identity (kind
+        # The configured routes dispatched by the real OpenCode identity (kind
         # and CLI both opencode) keep working, including each #effort variant
         # carried by the resolved provider argv.
-        for index, route in enumerate(self.OWNER_ROUTES):
+        for index, route in enumerate(self.CONFIGURED_ROUTES):
             for variant in ("", "#high", "#xhigh"):
                 with self.subTest(route=route, variant=variant):
                     config = self.identity_config(
