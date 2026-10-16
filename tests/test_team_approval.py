@@ -880,13 +880,12 @@ class ChatTeamTests(unittest.TestCase):
                 with self.assertRaises(product_config.ProductConfigError):
                     product_config.validate_config(raw)
 
-    def test_owner_routes_admit_effort_variants_at_init(self):
-        # All three owner-allowed routes are configurable; a role declaring an
-        # #effort variant resolves to the same base route and is admitted,
-        # while a lower-tier route on the same provider stays forbidden.
+    def test_configured_routes_admit_effort_variants_at_init(self):
+        # Every route the operator lists is configurable; a role declaring an
+        # #effort variant resolves to the same base route and is admitted too.
         routes = ("opencode/step-5-preview-free",
-                  "opencode-go/glm-5.3-flash",
-                  "opencode-go/deepseek-v4.1-flash")
+                  "opencode-go/example-model-a",
+                  "opencode-go/example-model-b")
         self.raw["team_model_allowlist"] = list(routes)
         for route in routes:
             for variant in ("", "#high", "#xhigh"):
@@ -908,7 +907,7 @@ class ChatTeamTests(unittest.TestCase):
                     self.assertIs(route_view["model_allowed"], True)
 
     def test_plan_refuses_a_claude_cli_spoofing_an_opencode_route(self):
-        # A $60 owner approval is paid for OpenCode routing. A profile whose
+        # A configured allowlist entry binds OpenCode routing. A profile whose
         # argv model LOOKS allowed but whose resolved identity is
         # agent_kind/provider.cli = claude used to pass the allowlist and
         # dispatch on the foreign runtime; the read-only plan now answers the
@@ -981,15 +980,17 @@ class ChatTeamTests(unittest.TestCase):
         self.assertEqual(len(effects), 1)
         self.assertEqual(result["tasks"]["read"]["status"], "running")
 
-    def test_low_tier_routes_are_denied_at_init_before_any_effect(self):
-        # $15 Go Luna / Space Bunny and any other unlisted route are refused
-        # outright at init; the admission evidence and team state stay empty.
-        for route in ("opencode-go/luna", "opencode-go/space-bunny"):
+    def test_unlisted_routes_are_denied_at_init_before_any_effect(self):
+        # Any route absent from the configured allowlist — including another
+        # model on the same provider — is refused outright at init; the
+        # admission evidence and team state stay empty.
+        for route in ("opencode-go/example-unlisted-a",
+                      "opencode-go/example-unlisted-b"):
             with self.subTest(route=route):
                 self.raw["team_model_allowlist"] = [
                     "opencode/step-5-preview-free",
-                    "opencode-go/glm-5.3-flash",
-                    "opencode-go/deepseek-v4.1-flash",
+                    "opencode-go/example-model-a",
+                    "opencode-go/example-model-b",
                 ]
                 self.spec["roles"]["reviewer"]["model"] = route
                 self.configure()

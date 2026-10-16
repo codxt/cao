@@ -2,11 +2,11 @@
 
 CAO's automatic recovery classifies each orchestration tick from durable
 evidence and never invents a receipt, bypasses a platform refusal or repeats an
-issued prompt. This document records the owner rule for the reviewer and the
-recovery contract, and the queued implementation batches that follow it. It
+issued prompt. This document records the reviewer and recovery contract and the
+queued implementation batches that follow it. It
 states a policy and a target design, not a description of deployed behavior.
 
-## Non-interrupting reviewer (owner rule)
+## Non-interrupting reviewer
 
 The default READ advisor must be a qualified **non-interactive** process in a
 **pinned, verified-clean checkout**. Prefer a headless Codex `exec review` run
@@ -20,9 +20,9 @@ with:
 
 That headless Codex preference is a target transport, not a route grant: it
 stays a future optional adapter until a separate owner, provider and cost
-authority exists for it (R2), and until then the advisor dispatches on an
-authorized route from the allowlist below. It never widens the route set, and
-it never carries a broader sandbox or permission grant.
+authority decides otherwise (R2), and until then the advisor dispatches only on
+a route the installation's own policy permits. It never widens the permitted
+route set, and it never carries a broader sandbox or permission grant.
 
 Deterministic tests run through the approved CAO fixture runner in synthetic
 temporary fixtures, never through a model's unrestricted shell. Keep per-task
@@ -43,29 +43,24 @@ broader authority. If provider authentication, the exact route, policy or a
 trusted source fails, record `UNAVAILABLE` and escalate; never impersonate
 approval.
 
-### Authorized dispatch allowlist (owner rule)
+### Optional dispatch allowlist (operator-local policy)
 
-The owner's authoritative CAO/OpenCode dispatch routes are exactly these
-three, and nothing else:
+CAO is route-agnostic. It ships no global, product-wide set of allowed routes,
+endorses no provider or model, and never selects a route on an installation's
+behalf. A route is permitted only by the installation's own policy, and CAO
+holds no list of operator selections, subscription entitlements, provider
+approvals or private pricing.
 
-- `opencode/step-5-preview-free` — free;
-- `opencode-go/glm-5.3-flash` — $60 quota;
-- `opencode-go/deepseek-v4.1-flash` — $80 quota.
-
-An independent READ advisor must run on one of those three authorized routes,
-selected within its own quota, and the exact route is recorded next to the
-reviewed HEAD. A Go `$15` GPT-6 Luna route, a Space Bunny route, any other
-model, and any automatic substitution when a route is unavailable or out of
-quota are all outside this rule: CAO reports the route `UNAVAILABLE` with its
-cause and escalates for an owner decision rather than dispatching another
-provider or model.
-
-Per installation, the operator may make this rule machine-enforced with the
+An installation may make its own route policy machine-enforced with the
 optional CAO product-config field `team_model_allowlist`:
 
 ```json
-{"team_model_allowlist": ["opencode/step-5-preview-free", "opencode-go/glm-5.3-flash", "opencode-go/deepseek-v4.1-flash"]}
+{"team_model_allowlist": ["example-provider/example-model-a", "example-provider/example-model-b"]}
 ```
+
+The identifiers above are neutral, schematic placeholders and are not valid
+production selections; an operator replaces them with its own exact
+`provider/model` routes.
 
 It is a bounded list (at most 16) of unique normalized `provider/model`
 identifiers without an `#effort` variant. Only the ABSENCE of the field is the
@@ -75,23 +70,24 @@ wrong-typed, malformed, duplicate or over-long value is refused fail-closed by
 configured it is a deny gate resolved only from each
 task's own provider and verified agent argv — never from an untrusted prompt.
 A route whose model is missing, ambiguous, flag-trapped or not listed is
-refused with no silent fallback. A route id carrying an `#effort` (or
-`#effort`-like) suffix is accepted as the same base route. The gate applies to
-the read-only plan (as a reported `model_allowed` verdict), to team
-initialization and start, and to every NEW dispatch intent before any Registry
-claim — for both team tasks and direct `cao run` product tasks. An
-already-started execution keeps its exact identity, prompt and claim and is
-still reconciled and released; changing the allowlist therefore stops new work
-instead of freezing work already in flight.
+refused with no silent fallback; a route that is unavailable or out of quota is
+reported `UNAVAILABLE` for an operator decision rather than replaced by another
+provider or model. A route id carrying an `#effort` (or `#effort`-like) suffix
+is accepted as the same base route. The gate applies to the read-only plan (as
+a reported `model_allowed` verdict), to team initialization and start, and to
+every NEW dispatch intent before any Registry claim — for both team tasks and
+direct `cao run` product tasks. An already-started execution keeps its exact
+identity, prompt and claim and is still reconciled and released; changing the
+allowlist therefore stops new work instead of freezing work already in flight.
 
 #### Read-only Codex routes
 
 A listed `codex/` model id binds a Codex agent-profile route identity, not just
 a model string. A profile's native `--model` token resolves to the canonical
 allowlist identity `<provider>/<model>` — for example a native
-`--model gpt-6.1-sol` under `agent_kind`/`provider.cli` `codex` is the
-allowlist entry `codex/gpt-6.1-sol` — and exactly one unambiguous `--model` is
-required. A repeated, `--model=`-formed, flag-trapped, divergent or unlisted
+`--model example-model` under `agent_kind`/`provider.cli` `codex` is the
+allowlist entry `codex/example-model` — and exactly one unambiguous `--model`
+is required. A repeated, `--model=`-formed, flag-trapped, divergent or unlisted
 selection is reported unresolved and refused. The resolved agent kind and the
 provider CLI must both be `codex`, so a foreign CLI can never dispatch on an
 allowed-looking model id (`TEAM_ROUTE_IDENTITY_MISMATCH`).
@@ -108,45 +104,51 @@ routes and their role-profile invariants are otherwise unchanged.
 
 #### Read-only Step-5 Preview Free route
 
-The canonical owner policy additionally restricts the Step-5 Preview Free base
-model id to privacy-qualified READ. Under a configured allowlist, a dispatch
-whose resolved base model is `opencode/step-5-preview-free` — reached through
-its canonical identity, the bare `--model` token, a non-canonical spelling, a
-foreign provider prefix or a bounded `#effort` variant — is refused for a WRITE
-task (`TEAM_ROUTE_READ_ONLY`) before any Registry claim or agent effect, so no
-alias spelling or provider prefix restores write access. The route is
-READ-admitted as before, and every other OpenCode route keeps both modes.
+A defensive, model-specific READ-only gate covers the exact Step-5 Preview Free
+base model id. Under a configured allowlist, a dispatch whose resolved base
+model is `opencode/step-5-preview-free` — reached through its canonical
+identity, the bare `--model` token, a non-canonical spelling, a foreign
+provider prefix or a bounded `#effort` variant — is refused for a WRITE task
+(`TEAM_ROUTE_READ_ONLY`) before any Registry claim or agent effect, so no alias
+spelling or provider prefix restores write access. The route is READ-admitted as
+any other permitted route and every other route keeps both modes. This is a
+legacy defensive gate for that one base id, not a product-wide route policy: a
+distinct id such as `opencode-go/step-5-preview` is a different identity, is
+never treated as an alias of it, and its availability is unknown and
+installation-specific.
 
 #### Non-zero-data-retention providers
 
 An allowlisted model id whose provider is known not to offer
 zero-data-retention (it may retain or train on submitted input) is refused at
 every NEW dispatch (`TEAM_ROUTE_PRIVACY_UNVERIFIED`), whether the task is READ
-or WRITE and regardless of the allowlist. `opencode-go/gemini-4-argon-contributor`
-is such a route for this build. CAO performs no automated provider-privacy
-classification, and this product adapter cannot technically prove that a
-checkout or prompt is clean public OSS or sanitized. The admission gate the
-route would require is therefore **unfulfilled**: an explicit operator-local
-public-repository restriction (never a prompt, and never hardcoded hosts or
-paths), a verified clean checkout, a READ-only mode and a declared owner
-qualification. Until such a proof is technically available the route stays
-unavailable, and the operator must never route private, client, tenant or
-secret material to it.
+or WRITE and regardless of which routes the allowlist permits.
+`opencode-go/gemini-4-argon-contributor` is the identity this build classifies
+as non-zero-data-retention; that classification is a conservative build-time
+constant and says nothing about any other route. CAO performs no automated
+provider-privacy classification, and this product adapter cannot technically
+prove that a checkout or prompt is clean public OSS or sanitized. The admission
+gate the route would require is therefore **unfulfilled**: an explicit
+operator-local public-repository restriction (never a prompt, and never
+hardcoded hosts or paths), a verified clean checkout, a READ-only mode and a
+declared operator qualification. Until such a proof is technically available
+the route stays unavailable, and the operator must never route private, client,
+tenant or secret material to it.
 
 ### Qualification states
 
-- **TEMPORARY.** Until the headless Codex transport is verified, the designated
-  temporary READ advisor is an independent reviewer dispatched on one of the
-  authorized routes above — Step 5 Preview Free, GLM 5.3 Flash or DeepSeek
-  v4.1 Flash. The existing interactive Herdr/Codex review remains a legacy
+- **TEMPORARY.** Until the headless Codex transport is verified, the READ
+  advisor is an independent reviewer dispatched only on a route the
+  installation's own policy permits, with the exact route recorded next to the
+  reviewed HEAD. The existing interactive Herdr/Codex review remains a legacy
   compatibility fallback, not a reliable unattended default.
-- **Optional pilot.** A ChatGPT OAuth / OpenCode credential route may be tried
-  only after the account holder authorizes it themselves **and** a separate
-  owner, provider and cost authority for that route is granted explicitly; it
-  is never switched on automatically by the dispatch allowlist above. The
-  provider must still be shown to qualify: the model, the subscription and the
-  private-data policy must all qualify, and a read-only permission-deny profile
-  must be tested first. CAO never logs in, copies or stores credentials
+- **Optional pilot.** A provider credential route an operator already holds may
+  be tried only after that account holder authorizes it themselves **and** a
+  separate owner, provider and cost authority for that route is granted
+  explicitly; it is never switched on automatically by a configured allowlist.
+  The provider must still be shown to qualify: the model, the entitlement and
+  the private-data policy must all qualify, and a read-only permission-deny
+  profile must be tested first. CAO never logs in, copies or stores credentials
   automatically.
 
 A receipt proves a post-prompt response was observed; it is never a security
@@ -198,17 +200,17 @@ previous one is accepted.
 
 ### R2 — headless Codex READ adapter (after R1 accepted/merged)
 
-Qualify a headless Codex Sol High READ adapter through the CAO/Herdr owner
+Qualify a headless Codex READ adapter through the CAO/Herdr owner
 contract: bounded subprocess and timeouts, a JSON result, a sanitized
 environment, explicit no-hooks, no repository writes, an exact source SHA and
 an authenticated model. Compare the OpenCode OpenAI OAuth optional fallback;
 never modify credentials automatically. Run a disposable mock-driver and a
 source-free smoke first, then an actual trial.
 
-This batch is a **future optional** adapter, not an entitlement of the
-authorized dispatch allowlist above: it may begin only after a separate owner,
-provider and cost authority for the Codex route is granted, and until then the
-three authorized routes remain the only routes this rule dispatches. It is
+This batch is a **future optional** adapter, not an entitlement of any
+configured allowlist: it may begin only after a separate owner, provider and
+cost authority for the Codex route is granted, and until then this rule
+dispatches only the routes the installation's own policy permits. It is
 qualified under a READ-only sandbox with no interactive approvals and no
 untrusted hooks — never `--dangerously-bypass-approvals-and-sandbox`,
 `--dangerously-bypass-hook-trust`, `danger-full-access` or an unbounded

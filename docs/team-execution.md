@@ -13,16 +13,18 @@ dependencies and a precisely scoped WRITE change set. A WRITE task may name a
 separate reviewer role with up to three correction rounds.
 
 Every model selection — a role's inline model, a reviewer or an
-`agent_profile` — must be one of the owner's authorized dispatch routes; see
-the allowlist in docs/automatic-recovery.md. An operator may enforce that
-per installation with the optional CAO product-config `team_model_allowlist`
-(bounded unique normalized `provider/model` ids, no `#effort`); its absence
-preserves existing behavior. CAO never substitutes a different
-model when a route is unavailable or out of quota, and it holds the task
-`UNAVAILABLE` for an owner decision instead. When `team_model_allowlist` is
-configured, every NEW dispatch is additionally refused with zero Registry
-claim rows and no workspace or agent effect before the first effect; an
-already-claimed worker keeps its exact identity and is never re-gated.
+`agent_profile` — is governed by the installation's own operator-local route
+policy. CAO is route-agnostic: it ships no global allowed route set, endorses
+no provider, and states no product-wide default naming an operator's selection.
+An operator may make its own policy machine-enforced per installation with the
+optional CAO product-config `team_model_allowlist` (bounded unique normalized
+`provider/model` ids, no `#effort`); its absence preserves existing behavior.
+CAO never substitutes a different model when a route is unavailable or out of
+quota, and it holds the task `UNAVAILABLE` for an operator decision instead.
+When `team_model_allowlist` is configured, every NEW dispatch is additionally
+refused with zero Registry claim rows and no workspace or agent effect before
+the first effect; an already-claimed worker keeps its exact identity and is
+never re-gated.
 
 A listed `opencode/` or `opencode-go/` model id binds the dispatch route
 identity, not just the model string. A model id alone never proves OpenCode
@@ -34,8 +36,8 @@ even when the provider model and the verified argv `--model` look allowed.
 
 A listed `codex/` model id binds a Codex agent-profile route the same way: a
 native `--model` token resolves to the canonical allowlist identity
-`<provider>/<model>` (for example a native `--model gpt-6.1-sol` under
-`agent_kind`/`provider.cli` `codex` is `codex/gpt-6.1-sol`), the resolved agent
+`<provider>/<model>` (for example a native `--model example-model` under
+`agent_kind`/`provider.cli` `codex` is `codex/example-model`), the resolved agent
 kind and provider CLI must both be `codex`, and exactly one unambiguous
 `--model` is required. A repeated, flag-trapped, divergent or unlisted
 selection is unresolved and refused. A Codex route is READ-only: any dispatch
@@ -45,13 +47,16 @@ kind / provider CLI — reached for a WRITE task is refused
 effort variants differ only by the bounded `-c model_reasoning_effort=…`
 switch, so they share the base identity.
 
-One canonical owner route is additionally restricted to privacy-qualified
-READ: the Step-5 Preview Free base model id
-(`opencode/step-5-preview-free`), reached through its canonical identity, the
-bare `--model` token, a non-canonical spelling, a foreign provider prefix or a
-bounded `#effort` variant, is refused for a WRITE task (`TEAM_ROUTE_READ_ONLY`)
-before any Registry claim or agent effect, so an alias never restores write
-access. Every other OpenCode route keeps both modes.
+A defensive, model-specific READ-only gate additionally covers the exact
+Step-5 Preview Free base model id (`opencode/step-5-preview-free`), reached
+through its canonical identity, the bare `--model` token, a non-canonical
+spelling, a foreign provider prefix or a bounded `#effort` variant: it is
+refused for a WRITE task (`TEAM_ROUTE_READ_ONLY`) before any Registry claim or
+agent effect, so an alias never restores write access. It is a legacy defensive
+gate for that one base id, not a product-wide route policy; a distinct id such
+as `opencode-go/step-5-preview` is a different identity, is never treated as an
+alias of it, and its availability is unknown per installation. Every other
+route keeps both modes.
 
 An allowlisted model id whose provider is known not to offer
 zero-data-retention is refused at every NEW dispatch
@@ -192,9 +197,10 @@ labeled untrusted. A scoped WRITE verifies its actual committed Git changes,
 exact Registry release and worker shutdown through the existing task runner.
 
 A reviewer is a separate READ agent against the latest accepted source HEAD.
-Its route is one of the owner's authorized dispatch routes recorded in
-docs/automatic-recovery.md, and no other model or automatic fallback model is
-dispatched in its place. It must report findings and exactly one of these
+Its route is governed by the installation's own operator-local policy (the
+optional `team_model_allowlist`), and no other model or automatic fallback
+model is dispatched in its place. It must report findings and exactly one of
+these
 lines:
 
     CAO_REVIEW_VERDICT: APPROVED
@@ -297,9 +303,9 @@ existing shared Registry; there is no second ledger.
 
 There is no automated provider privacy classification. Operators must verify
 the selected model's terms before using it on private or sensitive data.
-A free model is not a default destination for confidential material. An
-authorized route's quota is a cost boundary, not a permission: exhausting it
-holds the task `UNAVAILABLE` for an owner decision, and neither an unlisted
+A free model is not a default destination for confidential material. A
+permitted route's quota is a cost boundary, not a permission: exhausting it
+holds the task `UNAVAILABLE` for an operator decision, and neither an unlisted
 model nor a fallback provider is dispatched to work around it.
 Teams cannot publish, deploy, grant permissions, modify credentials, create
 production resources, or override repository governance by implication.
