@@ -13,9 +13,12 @@ dependencies and a precisely scoped WRITE change set. A WRITE task may name a
 separate reviewer role with up to three correction rounds.
 
 Every model selection — a role's inline model, a reviewer or an
-`agent_profile` — must be one of the owner's authorized dispatch routes; see
-the allowlist in docs/automatic-recovery.md. An operator may enforce that
-per installation with the optional CAO product-config `team_model_allowlist`
+`agent_profile` — must be one of the owner's currently authorized dispatch
+routes. The owner's canonical routing policy is the single semantic authority
+for that list, and docs/automatic-recovery.md describes how CAO applies it;
+deployment availability and provider pricing can change, so the list is never
+hardcoded here. An operator may enforce the routes per installation with the
+optional CAO product-config `team_model_allowlist`
 (bounded unique normalized `provider/model` ids, no `#effort`); its absence
 preserves existing behavior. CAO never substitutes a different
 model when a route is unavailable or out of quota, and it holds the task
@@ -45,13 +48,15 @@ kind / provider CLI — reached for a WRITE task is refused
 effort variants differ only by the bounded `-c model_reasoning_effort=…`
 switch, so they share the base identity.
 
-One canonical owner route is additionally restricted to privacy-qualified
-READ: the Step-5 Preview Free base model id
-(`opencode/step-5-preview-free`), reached through its canonical identity, the
-bare `--model` token, a non-canonical spelling, a foreign provider prefix or a
-bounded `#effort` variant, is refused for a WRITE task (`TEAM_ROUTE_READ_ONLY`)
-before any Registry claim or agent effect, so an alias never restores write
-access. Every other OpenCode route keeps both modes.
+The Step-5 Preview Free base model id is additionally restricted to
+privacy-qualified READ: reached through its canonical identity, the bare
+`--model` token, a non-canonical spelling, a foreign provider prefix or a
+bounded `#effort` variant, it is refused for a WRITE task
+(`TEAM_ROUTE_READ_ONLY`) before any Registry claim or agent effect, so an alias
+never restores write access. The canonical policy currently holds that base
+model unavailable and does not qualify the distinct `opencode-go/step-5-preview`
+route, so neither dispatches; the runtime gate remains as defense in depth.
+Every other OpenCode route keeps both modes.
 
 An allowlisted model id whose provider is known not to offer
 zero-data-retention is refused at every NEW dispatch
@@ -192,8 +197,9 @@ labeled untrusted. A scoped WRITE verifies its actual committed Git changes,
 exact Registry release and worker shutdown through the existing task runner.
 
 A reviewer is a separate READ agent against the latest accepted source HEAD.
-Its route is one of the owner's authorized dispatch routes recorded in
-docs/automatic-recovery.md, and no other model or automatic fallback model is
+Its route is one of the owner's currently authorized dispatch routes (the
+canonical owner routing policy is the authority; docs/automatic-recovery.md
+describes the enforcement), and no other model or automatic fallback model is
 dispatched in its place. It must report findings and exactly one of these
 lines:
 

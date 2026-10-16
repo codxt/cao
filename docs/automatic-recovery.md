@@ -18,11 +18,11 @@ with:
 - a structured, bounded final review carrying the exact reviewed HEAD and the
   task-bound nonce receipt.
 
-That headless Codex preference is a target transport, not a route grant: it
-stays a future optional adapter until a separate owner, provider and cost
-authority exists for it (R2), and until then the advisor dispatches on an
-authorized route from the allowlist below. It never widens the route set, and
-it never carries a broader sandbox or permission grant.
+That headless Codex preference is a transport, not an entitlement: the native
+pinned `codex/gpt-6.1-sol` READ route is now a qualified authorized route in
+the canonical owner policy below, and the advisor still dispatches only on a
+currently authorized route. It never widens the route set, and it never carries
+a broader sandbox or permission grant.
 
 Deterministic tests run through the approved CAO fixture runner in synthetic
 temporary fixtures, never through a model's unrestricted shell. Keep per-task
@@ -45,26 +45,43 @@ approval.
 
 ### Authorized dispatch allowlist (owner rule)
 
-The owner's authoritative CAO/OpenCode dispatch routes are exactly these
-three, and nothing else:
+The owner's canonical routing policy is the single semantic authority for which
+CAO/OpenCode routes may dispatch; its current section `Owner model routing
+budget (2026-10-16, current)` holds the mutable list, and this document never
+copies that list as the rule. The policy currently qualifies six example routes
+as runtime-qualified state:
 
-- `opencode/step-5-preview-free` — free;
-- `opencode-go/glm-5.3-flash` — $60 quota;
-- `opencode-go/deepseek-v4.1-flash` — $80 quota.
+- `opencode-go/deepseek-v4.1-flash` — routine WRITE;
+- `opencode-go/mimo-v2.6-flash` — efficient bounded WRITE;
+- `opencode-go/minimax-m3` — scoped complex WRITE;
+- `opencode-go/glm-5.3-flash` — routine independent READ;
+- `opencode-go/glm-5.3` — critical READ escalation;
+- `codex/gpt-6.1-sol` — native pinned CAO READ only (MEDIUM planning, HIGH
+  independent exact-HEAD review), never WRITE and never a direct coordinator.
 
-An independent READ advisor must run on one of those three authorized routes,
-selected within its own quota, and the exact route is recorded next to the
-reviewed HEAD. A Go `$15` GPT-6 Luna route, a Space Bunny route, any other
-model, and any automatic substitution when a route is unavailable or out of
-quota are all outside this rule: CAO reports the route `UNAVAILABLE` with its
-cause and escalates for an owner decision rather than dispatching another
-provider or model.
+These are an example of currently qualified state, not a fixed price or cap
+table. Deployment availability, provider pricing and allowances can change with
+the installed runtime and provider, and they are re-verified at dispatch rather
+than hardcoded here. An independent READ advisor must run on a route the policy
+currently authorizes, selected within its own allowance, and the exact route is
+recorded next to the reviewed HEAD. Any other model, and any automatic
+substitution when a route is unavailable or out of allowance, is outside this
+rule: CAO reports the route `UNAVAILABLE` with its cause and escalates for an
+owner decision rather than dispatching another provider or model.
+
+Published OpenCode Go Plus documentation describes a $40/month plan with
+model-specific, token-priced usage: each model's 5-hour limit is 20% of that
+model's own monthly dollar limit, its weekly limit is 50% and its monthly limit
+is 100%. Those limits are per model and are not asserted here to be shared or
+pooled unless independently verified. The old Step 5 Preview Free
+"limited-time unlimited" promotion is not a reliable local identity for any
+route and is not a price or cap this document relies on.
 
 Per installation, the operator may make this rule machine-enforced with the
 optional CAO product-config field `team_model_allowlist`:
 
 ```json
-{"team_model_allowlist": ["opencode/step-5-preview-free", "opencode-go/glm-5.3-flash", "opencode-go/deepseek-v4.1-flash"]}
+{"team_model_allowlist": ["opencode-go/deepseek-v4.1-flash", "opencode-go/mimo-v2.6-flash", "opencode-go/minimax-m3", "opencode-go/glm-5.3-flash", "opencode-go/glm-5.3", "codex/gpt-6.1-sol"]}
 ```
 
 It is a bounded list (at most 16) of unique normalized `provider/model`
@@ -106,40 +123,63 @@ and differ only by the bounded `-c model_reasoning_effort=medium` / `high`
 switch, so both resolve the same base identity. The pre-existing OpenCode
 routes and their role-profile invariants are otherwise unchanged.
 
-#### Read-only Step-5 Preview Free route
+#### Step-5 Preview and the READ-only base-model guard
 
-The canonical owner policy additionally restricts the Step-5 Preview Free base
-model id to privacy-qualified READ. Under a configured allowlist, a dispatch
-whose resolved base model is `opencode/step-5-preview-free` — reached through
-its canonical identity, the bare `--model` token, a non-canonical spelling, a
-foreign provider prefix or a bounded `#effort` variant — is refused for a WRITE
-task (`TEAM_ROUTE_READ_ONLY`) before any Registry claim or agent effect, so no
-alias spelling or provider prefix restores write access. The route is
-READ-admitted as before, and every other OpenCode route keeps both modes.
+The canonical owner policy does not currently qualify a Step-5 Preview route for
+dispatch. The old `opencode/step-5-preview-free` base model is **UNAVAILABLE**
+in the currently installed runtime profile and is not active, so it may not
+dispatch despite its earlier privacy-bound READ qualification. The advertised
+`opencode-go/step-5-preview` is a **distinct** route, not a qualified
+replacement: its paid activation, price and Go Plus 5-hour / weekly / monthly
+limits are unverified, it has no verified cap or price, and it is never
+silently substituted or dispatched.
+
+As defense in depth, CAO's runtime enforces the READ-only restriction on the
+Step-5 Preview Free base model id independently of the policy's current
+availability: under a configured allowlist, a dispatch whose resolved base model
+is `opencode/step-5-preview-free` — reached through its canonical identity, the
+bare `--model` token, a non-canonical spelling, a foreign provider prefix or a
+bounded `#effort` variant — is refused for a WRITE task (`TEAM_ROUTE_READ_ONLY`)
+before any Registry claim or agent effect, so no alias spelling or provider
+prefix restores write access. The gate still admits the base model for READ and
+refuses it for WRITE; the policy separately holds the route unavailable, so it
+does not dispatch at all, and every other OpenCode route keeps both modes.
 
 #### Non-zero-data-retention providers
 
 An allowlisted model id whose provider is known not to offer
 zero-data-retention (it may retain or train on submitted input) is refused at
 every NEW dispatch (`TEAM_ROUTE_PRIVACY_UNVERIFIED`), whether the task is READ
-or WRITE and regardless of the allowlist. `opencode-go/gemini-4-argon-contributor`
-is such a route for this build. CAO performs no automated provider-privacy
-classification, and this product adapter cannot technically prove that a
-checkout or prompt is clean public OSS or sanitized. The admission gate the
-route would require is therefore **unfulfilled**: an explicit operator-local
-public-repository restriction (never a prompt, and never hardcoded hosts or
-paths), a verified clean checkout, a READ-only mode and a declared owner
-qualification. Until such a proof is technically available the route stays
-unavailable, and the operator must never route private, client, tenant or
-secret material to it.
+or WRITE and regardless of the allowlist.
+`opencode-go/gemini-4-argon-contributor` is such a route: it is
+training-eligible and not covered by a zero-data-retention agreement, and the
+canonical owner policy denies it outright. CAO performs no automated
+provider-privacy classification, and this product adapter cannot technically
+prove that a checkout or prompt is clean public OSS or sanitized. The admission
+gate the route would require is therefore **unfulfilled**: an explicit
+operator-local public-repository restriction (never a prompt, and never
+hardcoded hosts or paths), a verified clean checkout, a READ-only mode and a
+declared owner qualification. That isolated, sanitized public open-source READ
+assessment remains only a candidate requiring explicit owner authorization;
+until such a proof is technically available the route stays denied, and the
+operator must never route private, client, tenant or secret material to it.
 
 ### Qualification states
 
-- **TEMPORARY.** Until the headless Codex transport is verified, the designated
-  temporary READ advisor is an independent reviewer dispatched on one of the
-  authorized routes above — Step 5 Preview Free, GLM 5.3 Flash or DeepSeek
-  v4.1 Flash. The existing interactive Herdr/Codex review remains a legacy
-  compatibility fallback, not a reliable unattended default.
+- **Codex READ — qualified (native pinned).** The native pinned
+  `codex/gpt-6.1-sol` READ route has passed public open-source canaries at both
+  MEDIUM and HIGH reasoning and is the qualified independent READ and advice
+  transport: MEDIUM for scoped technical planning, HIGH for consequential
+  independent exact-HEAD review. It is scoped review and advice only, carries a
+  bounded pinned selection, requires explicit folder trust, is never a WRITE
+  route and is never escalated into a writer, a manager or a direct coordinator.
+- **Held and denied routes.** `opencode/step-5-preview-free` is unavailable and
+  not active; the distinct `opencode-go/step-5-preview` is unqualified with no
+  verified cap or price; `opencode-go/kimi-k2.7-code` is held entirely — its
+  READ canary qualified but its WRITE canary was abandoned, and CAO has no
+  per-mode allowlist, so a passing READ does not qualify WRITE and the whole
+  route stays excluded; and `opencode-go/gemini-4-argon-contributor` is denied
+  as non-ZDR (see above).
 - **Optional pilot.** A ChatGPT OAuth / OpenCode credential route may be tried
   only after the account holder authorizes it themselves **and** a separate
   owner, provider and cost authority for that route is granted explicitly; it
@@ -205,10 +245,12 @@ an authenticated model. Compare the OpenCode OpenAI OAuth optional fallback;
 never modify credentials automatically. Run a disposable mock-driver and a
 source-free smoke first, then an actual trial.
 
-This batch is a **future optional** adapter, not an entitlement of the
-authorized dispatch allowlist above: it may begin only after a separate owner,
-provider and cost authority for the Codex route is granted, and until then the
-three authorized routes remain the only routes this rule dispatches. It is
+This batch describes an optional direct headless transport, not an entitlement
+of the authorized dispatch allowlist above: it may proceed only after a
+separate owner, provider and cost authority grants it. The native pinned
+`codex/gpt-6.1-sol` READ route already runs as the CAO portable agent profile
+the policy qualifies, and the routes currently authorized by the canonical
+owner policy remain the routes this rule dispatches. It is
 qualified under a READ-only sandbox with no interactive approvals and no
 untrusted hooks — never `--dangerously-bypass-approvals-and-sandbox`,
 `--dangerously-bypass-hook-trust`, `danger-full-access` or an unbounded
