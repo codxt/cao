@@ -472,11 +472,12 @@ rm -rf "$PILOT"
 Do not touch any workspace, pane, session or process this pilot did not create,
 and do not stop the runtime's own server.
 
-## 12. Historical pane hygiene (observe-only; activation not ready)
+## 12. Historical pane hygiene (default-off; gated historical cleanup)
 
-A fresh CAO only **observes and plans**: it never closes a historical pane. The
-existing daemon performs one bounded hygiene pass per tick and reports it on the
-existing status surface under `hygiene` (counts only, never raw process output):
+A fresh CAO only **observes and plans**: it never closes a historical pane
+unless an operator explicitly enables the effect. The existing daemon performs
+one bounded hygiene pass per tick and reports it on the existing status surface
+under `hygiene` (counts only, never raw process output):
 
 ```sh
 ./cao daemon status | python3 -c "import json,sys;print(json.load(sys.stdin)['hygiene'])"
@@ -486,42 +487,69 @@ Expected with no configuration: `"mode": "plan"`. The classification counts are
 `eligible`, `closed`, `protected_active`, `protected_unknown`, `unowned`,
 `missing_pane`, `close_failed` and `process_leak`.
 
-**Activation is not ready.** `hygiene_enabled` defaults to `false` and
-`hygiene_dry_run` defaults to `true`, and both must stay that way until a
-separately designed, task-owned recovery/liveness flow exists. The generic pass
-cannot qualify a real positive today:
+**Default off.** `hygiene_enabled` defaults to `false` and `hygiene_dry_run`
+defaults to `true`, and both must stay that way in source. Committing code never
+activates the effect; only an installation's own local config does. Two terminal
+pane states are distinguished:
 
-* the accepted native lifecycle closes the exact owned pane and records
-  `pane_closed` **before** it releases the claim (`cao run`, `cao stop`), so a
-  real released terminal task has **no live owned pane** at all;
-* a terminal pane observed **present** is therefore an unexpected reappearance
-  or identity conflict. It is reported `protected_unknown` and held, never
-  `eligible` and never closed, whether or not the record also carries a
-  released-claim and pane-close disposition;
-* a terminal record without a durable released claim **and** a matching verified
-  close is likewise `protected_unknown` and held. A terminal pane that is
-  simply absent is skipped and does not inflate the held counts.
+* **Unexpected reappearance.** The task durably released its claim **and**
+  recorded a verified close of this exact pane, yet the pane is observed
+  present. A recorded verified absence cannot be reconciled to a present pane
+  without a runtime continuity attestation that does not exist, so it is
+  `protected_unknown` and held -- the accepted PR #31 protection, preserved.
+* **Corroborated historical record.** A task written by the pre-close-first
+  build (before commit `6d2f271`) released its claim **without** closing the
+  pane, so its record carries a released disposition and **no** recorded close.
+  Such a pane is `eligible` only when every one of these holds: the exact
+  RELEASED Work Registry row (claim id, run, work key, CAO owner, mode, release
+  outcome and time, and any declared worktree) corroborates the record's
+  released disposition; the pane is this task's own exact `cao-review-<task_id>`
+  workspace and pane; its uniquely named worker is observed stopped; no live
+  claim owns the task or checkout; the checkout is clean and readable; and no
+  other task reuses the pane. A forged released boolean the ledger does not
+  match, a mismatched/unknown row, an unaccepted team phase, a reused pane, a
+  foreign or active worker, and an unreadable runtime or ledger all hold.
 
-The earlier generic "terminal orphan" positive was **synthetic and
-inconsistent**: it fabricated a released claim together with a live pane, a
-state the production lifecycle cannot produce. A passing test suite is **not**
-operating activation, and `eligible` cannot be qualified by inventing a
-post-release pane. The opt-in switch therefore changes nothing today; the
-`eligible` and `closed` classes remain in the vocabulary only for a future,
-separately designed task-owned recovery/liveness flow that must ship with real
-positive **and** negative native operating proof before it can be trusted.
+**Activation criteria.** The opt-in switch is not operating authority by itself.
+Enable it only on an installation whose own plan run shows a bounded, reviewed
+`eligible` cohort that is a genuine pre-close-first leftover, with the operator
+separately confirming each row's released Registry claim and its
+`cao-review-<task_id>` workspace. A passing test suite proves the gate, not the
+operating cohort. To activate, the operator clears the dry run **locally** in
+the installation's own config (`hygiene_enabled: true`, `hygiene_dry_run:
+false`); source defaults never change.
 
-Everything else holds, including unknown team results, reused panes, foreign
-workers, missing identities, live claims and dirty worktrees. The pass is never
-a second daemon, ledger or scheduler, never scans or signals an arbitrary
-process and never force-unlocks the Registry. `process_leak` is only ever
-reported with real evidence; CAO records no pane-child process identity, so it
-is never fabricated.
+**Operator canary.**
 
-For a historical record written by an older build that still holds a terminal
-pane, close the CAO-created surface manually (section 11) after confirming the
-CAO-owned `cao-review-<task_id>` workspace label; this hygiene pass will not do
-it for you.
+```sh
+# Plan only (no effect): review the eligible cohort line by line before activation.
+./cao daemon status | python3 -c "import json,sys;print(json.load(sys.stdin)['hygiene'])"
+```
+
+When enabled, an applied pass closes only the revalidated eligible cohort: for
+each candidate it re-reads the ledger and re-probes the pane immediately before
+the close, closes only this task's exact owned pane, confirms absence through
+the runtime (`pane_get`), and records the verified close as `pane_closed` on the
+shared task record.
+
+**Audit receipts.** The daemon record's `hygiene` block -- its counts plus a
+bounded item list of `task_id`/`classification`/`reason` -- is the receipt,
+surfaced by `cao daemon status`. A closed pane additionally carries
+`pane_closed` on its own task record. No raw process output or tenant data is
+ever included.
+
+**Rollback / fail-closed.** Clear the local opt-in (or set `hygiene_dry_run:
+true`) and the pass returns to plan-only on the next tick; nothing is closed. An
+unreadable runtime, an unreadable ledger, a dirty or unreadable checkout, a
+reused pane, an active or foreign worker, a live claim, an unknown team phase,
+or a `pane_get` that still finds the pane after an acknowledged close all fail
+closed to a held classification -- never a fabricated `closed`. `process_leak`
+is only ever reported with a real recorded process identity; CAO records no
+pane-child process identity, so it is never fabricated.
+
+If no eligible cohort survives review, leave the switches at their defaults and
+close the specific historical pane manually (section 11) after confirming the
+CAO-owned `cao-review-<task_id>` workspace label.
 
 
 ## Evidence

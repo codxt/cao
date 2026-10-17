@@ -226,11 +226,16 @@ force-unlocks the Registry and never closes a pane it cannot prove is its own.
 Pane absence is the only closure CAO claims: an OS process exit it cannot prove
 through a stable recorded identity is reported as unverified, not asserted.
 Historical records written before this protocol may still hold a terminal pane.
-The opt-in, default-off daemon hygiene pass below is observe-only today: the
-accepted lifecycle closes its pane before it releases its claim, so the pass
-cannot qualify a real positive and reports such a pane `protected_unknown` and
-holds. Close a historical pane manually with the runtime's own close primitive
-until a separately designed, task-owned recovery/liveness flow exists.
+The opt-in, default-off daemon hygiene pass below is gated and default
+plan-only: an unexpected reappearance of a pane after its recorded verified
+close is held `protected_unknown`, while a corroborated historical record (the
+pre-close-first build released its claim without closing, so no close is
+recorded) is `eligible` only when the exact RELEASED Work Registry row, the
+task's own exact workspace/pane and its stopped uniquely named worker all
+corroborate it. It closes that exact pane only when an operator enables both
+switches locally; source never changes the defaults. Close a specific
+historical pane manually with the runtime's own close primitive until an
+installation's own plan run proves a reviewed eligible cohort.
 
 Team task agent names use a readable prefix and digest of their full ID.
 This prevents longer team/task names from colliding after terminal name-length

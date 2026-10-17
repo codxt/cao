@@ -82,12 +82,16 @@ DAEMON_STATUS_SCHEMA = "cao.product.daemon.status.v0"
 
 #: The bounded classification vocabulary of one hygiene reconnaissance pass.
 #: Nothing here scans arbitrary processes, force-unlocks the Work Registry or
-#: acts as a second scheduler or ledger. Because the production lifecycle closes
-#: its own pane before releasing its claim, no generic terminal pane is a
-#: closeable orphan today: a terminal pane observed present is always
-#: ``protected_unknown`` and a pane that is absent is skipped. The ``eligible``
-#: and ``closed`` classes remain in the vocabulary for a future, separately
-#: designed task-owned recovery/liveness flow; this pass never qualifies them.
+#: acts as a second scheduler or ledger. The close-first native lifecycle closes
+#: its own pane and records ``pane_closed`` BEFORE it releases the claim, so an
+#: ordinary released terminal task has no live owned pane and a terminal pane
+#: observed present after a recorded verified close is always
+#: ``protected_unknown``. ``eligible``/``closed`` are reached ONLY by a
+#: corroborated historical leftover: a task whose exact RELEASED Registry claim
+#: row is present, whose record carries NO recorded close of that pane (the
+#: pre-close-first build released without closing), and whose own exact
+#: workspace/pane/named-worker identity is observed stopped. A pane that is
+#: absent is skipped and never inflates a held count.
 HYGIENE_SCHEMA = "cao.product.hygiene.v0"
 HYGIENE_CLASSIFICATIONS = (
     "eligible",
@@ -100,6 +104,10 @@ HYGIENE_CLASSIFICATIONS = (
     "process_leak",
 )
 _MAX_HYGIENE_ITEMS = 64
+#: A per-tick effect bound: at most this many historical leftovers are closed in
+#: one pass. The remainder stay reported ``eligible`` and are closed on a later
+#: tick, so a large cohort can never produce an unbounded close burst.
+_MAX_HYGIENE_CLOSES = 16
 
 _TERMINAL_STATUSES = ("complete", "stopped")
 _RECOVERABLE_STATUSES = ("pending", "claimed", "running")
@@ -219,12 +227,15 @@ def _task_owner_lane(
 # ---------------------------------------------------------------------------
 
 
-def _open_claim_rows(db: str) -> list[dict[str, Any]] | None:
-    """Every open Registry claim, or ``None`` when the ledger is unreadable.
+def _claim_rows(db: str) -> list[dict[str, Any]] | None:
+    """Every Registry claim row, or ``None`` when the ledger is unreadable.
 
     A missing, unopenable or otherwise unreadable ledger proves nothing: it
     fails closed and is reported unavailable rather than being rounded down to
-    "no claims at all", which would let a live claim be cleaned up.
+    "no claims at all", which would let a live claim be cleaned up. The full row
+    (id, run, work key, owner, mode, worktree, release outcome and time) is the
+    authority a historical candidate is matched against -- never the task
+    record's own released boolean.
     """
 
     if not isinstance(db, str) or not db:
@@ -233,43 +244,157 @@ def _open_claim_rows(db: str) -> list[dict[str, Any]] | None:
         conn = registry.connect_readonly(db)
         try:
             rows = conn.execute(
-                "SELECT run_id, work_key, worktree FROM claims "
-                "WHERE released_at IS NULL").fetchall()
+                "SELECT claim_id, run_id, work_key, issue, owner, mode, "
+                "worktree, claimed_at, released_at, outcome FROM claims"
+            ).fetchall()
         finally:
             conn.close()
     except (OSError, ValueError, sqlite3.Error, registry.RegistryError):
         return None
-    return [
-        {"run_id": row["run_id"], "work_key": row["work_key"],
-         "worktree": row["worktree"]}
+    return [dict(row) for row in rows]
+
+
+def _claim_conflicts(rows: Any, task_id: Any, repo: Any) -> bool:
+    """Whether an OPEN claim still owns this task or its exact checkout."""
+
+    return any(
+        row["released_at"] is None
+        and (row["work_key"] == task_id
+             or (isinstance(repo, str) and repo and row["worktree"] == repo))
         for row in rows
-    ]
+    )
+
+
+def _historical_release_row(
+    row: Any, task: Mapping[str, Any], repo: Any
+) -> bool:
+    """Whether ``row`` is this task's exact RELEASED Registry claim.
+
+    The ledger is the authority: the row must be the exact claim id this record
+    recorded, from the same run, work key and CAO owner, in this task's mode,
+    released with a terminal outcome that matches the record's own disposition,
+    and -- when the row declares a worktree (a WRITE claim does; a READ claim
+    records none) -- from this task's exact checkout. A released claim alone is
+    never enough: the record must also carry the matching released disposition.
+    """
+
+    claim = task.get("claim")
+    if not isinstance(row, Mapping) or not isinstance(claim, Mapping):
+        return False
+    if (not row.get("released_at")
+            or row.get("outcome") not in ("complete", "abandon")
+            or row.get("outcome") != claim.get("outcome")
+            or claim.get("released") is not True
+            or row.get("run_id") != task.get("run_id")
+            or row.get("work_key") != task.get("work_key")
+            or row.get("issue") != ""
+            or row.get("owner") != product_task.OWNER
+            or row.get("mode") != task.get("mode")):
+        return False
+    declared = row.get("worktree")
+    if isinstance(declared, str) and declared:
+        from . import git
+        if git.normalize_worktree(declared) != git.normalize_worktree(repo or ""):
+            return False
+    return True
+
+
+def _historical_close_revalidated(
+    db: str, task: Mapping[str, Any], repo: Any
+) -> bool:
+    """Recompute the historical candidacy immediately before any close.
+
+    The observation-to-effect window is real: a new claim can open between the
+    classification read and the close. The ledger is re-read and the task is
+    held unless its exact released row still matches and no open claim now owns
+    the task or its checkout.
+    """
+
+    rows = _claim_rows(db)
+    if rows is None:
+        return False
+    if _claim_conflicts(rows, task.get("task_id"), repo):
+        return False
+    claim_id = (task.get("claim") or {}).get("claim_id")
+    row = next((r for r in rows if r["claim_id"] == claim_id), None)
+    return _historical_release_row(row, task, repo)
+
+
+def _owned_pane_check(
+    driver: Any, task: Mapping[str, Any], labels: Mapping[str, str]
+) -> tuple[str, str]:
+    """Classify this task's own pane without ever closing it.
+
+    Returns ``(status, reason)``. ``status`` is ``"gone"`` when the exact pane
+    is verifiably absent, ``"own"`` when the exact task-owned pane is observed
+    with a provably stopped own worker, or a held classification
+    (``protected_active``/``protected_unknown``/``unowned``) with its reason. A
+    foreign, reused or unverifiable worker is never ``own``; the pane's occupant
+    is bound to this task's own uniquely named agent, not to the worker KIND.
+    """
+
+    checkpoint = task.get("checkpoint") or {}
+    pane_id = checkpoint.get("pane_id")
+    workspace_id = checkpoint.get("workspace_id")
+    try:
+        pane = driver.pane_get(pane_id)
+    except product_driver.DriverNotFound:
+        return "gone", "the pane is already absent"
+    except product_driver.DriverError:
+        return "protected_unknown", "the pane could not be read"
+    if (not isinstance(pane, Mapping) or pane.get("pane_id") != pane_id
+            or pane.get("workspace_id") != workspace_id
+            or labels.get(workspace_id) != task.get("workspace_label")):
+        return "unowned", "the pane is not this CAO task's own workspace"
+    ownership_error = product_task._named_agent_ownership_error(
+        driver, checkpoint, pane, pane_id, workspace_id)
+    if ownership_error is not None:
+        return "protected_active", ownership_error
+    if isinstance(pane.get("agent"), str) and pane.get("agent"):
+        state = str(pane.get("agent_status") or "").strip().lower()
+        if state not in registry.DEAD_STATES:
+            return "protected_active", "the task's own worker is still active"
+    return "own", ""
 
 
 def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
                    registry_db: str | None = None, apply: bool = False,
                    teams: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Plan (and never close) CAO-owned terminal pane anomalies.
+    """Plan (and, only with ``apply``, close) CAO-owned historical leftovers.
 
-    This is a bounded, read-only aggregation over records the daemon already
-    owns: durable product task records, the read-only Work Registry and the
-    runtime's own pane list. It adds no second daemon, ledger or scheduler, and
-    it never scans or signals an arbitrary process.
+    This is a bounded aggregation over records the daemon already owns: durable
+    product task records, the read-only Work Registry and the runtime's own pane
+    list. It adds no second daemon, ledger or scheduler, and it never scans or
+    signals an arbitrary process.
 
     A pane is proved to belong to this CAO install (matching workspace label),
     free of any active or foreign worker, with no live conflicting claim, no
-    dirty checkout and an accepted terminal task -- but that is never enough to
-    close it. The production lifecycle closes the exact owned pane and records
-    ``pane_closed`` BEFORE it releases the claim, so a real released terminal
-    record has no live owned pane. A terminal pane observed PRESENT is therefore
-    never a closeable orphan: it is held ``protected_unknown`` whether its
-    released-claim/verified-close evidence is present (an unexpected
-    reappearance) or absent (a forged, older or interrupted record). A pane that
-    is absent is simply skipped, so an ordinary completed task does not inflate
-    the held counts. ``eligible`` cannot currently be qualified by invariants
-    that the real native accepted lifecycle cannot produce; the pass keeps the
-    ``apply`` parameter for a future, separately designed task-owned liveness
-    flow, and with ``apply=False`` (the default) the pass is a plan.
+    dirty checkout and no pane reuse -- but ownership alone is never authority
+    to close it. Two states are distinguished:
+
+    * **Unexpected reappearance.** The record durably released its claim AND
+      recorded a verified close of this exact pane, yet the pane is observed
+      PRESENT. A recorded verified absence cannot be reconciled to a present
+      pane without a runtime continuity attestation that does not exist, so it
+      is held ``protected_unknown`` and never closed (the accepted PR #31
+      protection, preserved).
+    * **Corroborated historical leftover.** The record carries a released-claim
+      disposition and NO recorded close of this pane, and the exact RELEASED
+      Registry claim row (claim id, run, work key, CAO owner, mode, release
+      outcome and time, and -- when declared -- worktree) corroborates it in
+      full. The pre-close-first build released the claim without ever closing
+      the pane; the close-first native lifecycle cannot produce this state. Such
+      a pane is ``eligible`` only while it is this task's own exact
+      workspace/pane with its unique named worker provably stopped.
+
+    A forged record whose released boolean the ledger does not corroborate, a
+    missing/unknown/mismatched row, an unaccepted team phase, a dirty or
+    unreadable checkout, a reused pane, a foreign or active worker, a live
+    claim and an unreadable runtime or ledger all hold. ``eligible`` is
+    reported in plan mode; the exact owned pane is closed only when ``apply`` is
+    set, only after re-reading the ledger and re-probing the pane immediately
+    before the close, and only once ``pane_get`` confirms the pane is gone. With
+    ``apply=False`` (the default) the pass is a plan and closes nothing.
     """
 
     db = registry_db or product_config.registry_db_path(env)
@@ -320,8 +445,16 @@ def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
                     labels[workspace_id] = label if isinstance(label, str) else ""
         except Exception:  # noqa: BLE001 - an unreadable runtime proves nothing
             runtime_ok = False
-    claims = _open_claim_rows(db)
+    claims = _claim_rows(db)
     ledger_ok = claims is not None
+    open_claims = (
+        [row for row in claims if row["released_at"] is None]
+        if ledger_ok else []
+    )
+    released_rows = (
+        {row["claim_id"]: row for row in claims if row["released_at"] is not None}
+        if ledger_ok else {}
+    )
 
     # Panes/workspaces referenced by any NON-terminal CAO task: a reused pane
     # or workspace is an active conflict, never a hygiene candidate.
@@ -349,6 +482,7 @@ def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
             dirty_cache[repo] = git.probe_status(repo)
         return dirty_cache[repo] or {"ok": False}
 
+    closes_applied = 0
     for task in tasks:
         task_id = task.get("task_id")
         status = str(task.get("status") or "")
@@ -386,11 +520,7 @@ def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
                      "the Work Registry is unreadable")
             continue
         repo = task.get("repo")
-        if any(
-                row["work_key"] == task_id
-                or (isinstance(repo, str) and repo
-                    and row["worktree"] == repo)
-                for row in claims):
+        if _claim_conflicts(open_claims, task_id, repo):
             classify(task, "protected_active",
                      "a live Registry claim still owns this task or checkout")
             continue
@@ -406,65 +536,85 @@ def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
             classify(task, "protected_active",
                      "the pane or workspace is reused by another task")
             continue
-        try:
-            pane = driver.pane_get(pane_id)
-        except product_driver.DriverNotFound:
-            continue  # the pane is already gone: there is no orphan to close
-        except product_driver.DriverError:
-            classify(task, "protected_unknown", "the pane could not be read")
+        # Bind the pane to this task's own workspace AND its own uniquely named
+        # worker before any close decision. A foreign, reused, unverifiable or
+        # still-active worker is never a candidate.
+        pane_status, pane_reason = _owned_pane_check(driver, task, labels)
+        if pane_status == "gone":
+            continue  # the pane is already absent: there is no leftover to close
+        if pane_status != "own":
+            classify(task, pane_status, pane_reason)
             continue
-        if (not isinstance(pane, Mapping) or pane.get("pane_id") != pane_id
-                or pane.get("workspace_id") != workspace_id
-                or labels.get(workspace_id) != task.get("workspace_label")):
-            classify(task, "unowned",
-                     "the pane is not this CAO task's own workspace")
-            continue
-        # Bind the pane's occupant to this task's own named agent through the
-        # exact production identity fields (a pane carries the worker KIND, not
-        # this task's unique name) and, when a worker is present, require it to
-        # be provably stopped. A foreign, reused or unverifiable worker never is.
-        ownership_error = product_task._named_agent_ownership_error(
-            driver, checkpoint, pane, pane_id, workspace_id)
-        if ownership_error is not None:
-            classify(task, "protected_active", ownership_error)
-            continue
-        if isinstance(pane.get("agent"), str) and pane.get("agent"):
-            state = str(pane.get("agent_status") or "").strip().lower()
-            if state not in registry.DEAD_STATES:
-                classify(task, "protected_active",
-                         "the task's own worker is still active")
-                continue
-        # A terminal task never earns automatic pane closure from status and the
-        # mere absence of a live Registry claim. The production lifecycle closes
-        # the exact owned pane and records ``pane_closed`` BEFORE it releases the
-        # claim (see ``product_task._finish`` and ``stop_task``), so a real
-        # released terminal record has no live owned pane at all. Require that
-        # exact durable disposition here: a durably released claim AND this
-        # task's own recorded verified close of the same pane.
-        claim = task.get("claim") or {}
-        released = (
-            isinstance(claim, Mapping)
-            and claim.get("released") is True
-            and claim.get("outcome") in ("complete", "abandon")
-        )
+        claim = task.get("claim")
         recorded_close = (
             isinstance(task.get("pane_closed"), str)
             and bool(task.get("pane_closed"))
             and task.get("pane_closed") == pane_id
         )
-        if not (released and recorded_close):
-            # Terminal status without a durable released-claim disposition and a
-            # matching verified close is never authority to close a pane: a
-            # forged, older or interrupted record is held UNKNOWN, never closed.
+        if recorded_close:
+            # The record durably released its claim AND recorded a verified close
+            # of this exact pane, yet the pane is observed PRESENT: an unexpected
+            # reappearance or identity reuse. A recorded verified absence cannot
+            # be reconciled to a present pane without a runtime continuity
+            # attestation that does not exist, so preserve the PR #31 protection:
+            # held, never eligible and never closed.
             classify(task, "protected_unknown",
-                     "the terminal task has no durable released claim and "
-                     "verified pane close")
+                     "a terminal pane was observed present after its verified close")
             continue
-        # The task's own durable release and verified close both hold, yet its
-        # pane is observed PRESENT: an unexpected reappearance, identity reuse or
-        # conflict. It is held UNKNOWN and is never closed.
-        classify(task, "protected_unknown",
-                 "a terminal pane was observed present after its verified close")
+        # A terminal record never earns pane closure from status alone. The exact
+        # RELEASED Registry claim row must corroborate the record's own released
+        # disposition in full: a forged released boolean the ledger does not
+        # match, or a mismatched/unknown row, is held rather than closed.
+        claim_id = claim.get("claim_id") if isinstance(claim, Mapping) else None
+        row = released_rows.get(claim_id)
+        if not _historical_release_row(row, task, repo):
+            classify(task, "protected_unknown",
+                     "the terminal task has no corroborated released Registry "
+                     "claim with an unrecorded close")
+            continue
+        # Genuinely reachable historical leftover: the governed ledger holds the
+        # exact released row, the record carries a released disposition and NO
+        # recorded close of this pane, and the pane is this task's own exact
+        # workspace/pane with its unique named worker provably stopped. The
+        # close-first native lifecycle cannot produce this state (it records
+        # ``pane_closed`` before every release); the pre-close-first build
+        # released without closing.
+        classify(task, "eligible",
+                 "an owned historical leftover pane with a corroborated released "
+                 "Registry claim and no recorded close")
+        if not apply:
+            continue
+        if closes_applied >= _MAX_HYGIENE_CLOSES:
+            # Per-tick effects are bounded: the rest of the cohort stays
+            # ``eligible`` and is closed on a later tick.
+            continue
+        # Revalidate the whole candidacy immediately before the effect: the
+        # ledger can change between observation and close.
+        if not _historical_close_revalidated(db, task, repo):
+            classify(task, "protected_unknown",
+                     "the Registry changed between observation and close")
+            continue
+        pane_status, pane_reason = _owned_pane_check(driver, task, labels)
+        if pane_status != "own":
+            classify(task, "protected_unknown" if pane_status == "gone"
+                     else pane_status,
+                     pane_reason or "the pane is no longer this task's own")
+            continue
+        # ``_close_owned_pane`` re-probes this task's exact pane and named
+        # worker, closes only that pane, and confirms absence through
+        # ``pane_get``: an acknowledged close is unverified until the pane is
+        # gone.
+        closed, error = product_task._close_owned_pane(driver, task)
+        if error is not None or not closed:
+            classify(task, "close_failed", "the owned pane was not proven closed")
+            continue
+        try:
+            product_state.update_task(task_id, {"pane_closed": closed}, env)
+        except Exception:  # noqa: BLE001 - an unrecorded close is not a close
+            classify(task, "close_failed", "the verified close could not be recorded")
+            continue
+        closes_applied += 1
+        classify(task, "closed", "closed an owned historical leftover pane")
 
     return {
         "schema": HYGIENE_SCHEMA,
@@ -1370,12 +1520,13 @@ class Daemon:
                 })
         now = evidence.utc_now(self._clock)
         # Conservative bounded hygiene reconciliation on this same tick. It is
-        # default OFF and, even when enabled, defaults to a plan-only dry run:
-        # it never scans arbitrary processes, never force-unlocks the Registry
-        # and never closes a pane. The production lifecycle closes its own pane
-        # before releasing its claim, so a terminal pane still observed present
-        # is an unexpected reappearance that is always held. No second daemon,
-        # ledger or scheduler is added.
+        # default OFF and, even when enabled, defaults to a plan-only dry run.
+        # It never scans arbitrary processes and never force-unlocks the
+        # Registry. An unexpected reappearance of a pane after its recorded close
+        # is always held; only a corroborated historical leftover (an exact
+        # released Registry row with no recorded close) can be closed, and only
+        # with both effects flags set. No second daemon, ledger or scheduler is
+        # added.
         if self._config is not None:
             hygiene = self._hygiene(owners)
             record["hygiene"] = hygiene
@@ -1444,12 +1595,13 @@ class Daemon:
     def _hygiene(self, teams: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """One bounded hygiene pass.
 
-        The generic pass never closes a pane: the production lifecycle already
-        closes its own pane before releasing its claim, so a terminal pane that
-        is still present is an unexpected reappearance and is held. The pass
-        keeps the operator's ``apply`` flag for a future, separately designed
-        task-owned recovery/liveness flow. Any unexpected error is reported as a
-        held pass, never as a successful cleanup.
+        Closure is applied only when the operator has BOTH enabled hygiene and
+        cleared its dry run; otherwise the pass is a plan. An unexpected
+        reappearance of a pane after its recorded close is always held. A
+        corroborated historical leftover is reported ``eligible`` in a plan and
+        closed only under ``apply``, and only after the ledger and pane are
+        revalidated immediately before the close. Any unexpected error is
+        reported as a held pass, never as a successful cleanup.
         """
 
         apply = (self._defaults.hygiene_enabled
