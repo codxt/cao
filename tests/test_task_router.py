@@ -1,9 +1,11 @@
 """Focused tests for the one discoverable 'send to CAO' request entrypoint.
 
-They cover deterministic routing, the Intake admission and its idempotency and
-conflict behavior, the governed-execution route performing no effect, strict
-fail-closed input, and the minimal CLI. Everything is synthetic and hermetic:
-no runtime is contacted, no agent is started and no Registry claim is made.
+They cover the finite routing decision (BACKLOG / INVESTIGATE / IMPLEMENT), the
+deterministic text rules, the durable Intake admission and its idempotency and
+conflict behavior, the governed-execution report, the manual owner-initiated
+``--execute`` convenience route, strict fail-closed input, and the minimal CLI.
+Everything is synthetic and hermetic: no runtime is contacted, no agent is
+started, no worker is dispatched and no Registry claim is made.
 """
 from __future__ import annotations
 
@@ -16,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cao import intake, product_config, task_router, team
+from cao import intake, intake_handoff, product_config, task_router, team
 
 
 def run_cli(argv):
@@ -59,12 +61,18 @@ class RouterCase(unittest.TestCase):
         product_config.write_config(payload)
         self.config = product_config.validate_config(payload)
 
-    def manifest(self, team_id="wave", *, initiative=None, supersedes=None):
+    def repo(self):
+        path = self.root / "repo"
+        path.mkdir(exist_ok=True)
+        return str(path)
+
+    def manifest(self, team_id="wave", *, initiative=None, supersedes=None,
+                 repo=None):
         spec = {
             "schema": team.SPEC_SCHEMA, "team_id": team_id,
             "roles": self.roles,
             "tasks": [{"id": "inspect", "role": "analyst",
-                       "repo": str(self.root / "repo"), "mode": "read",
+                       "repo": repo or str(self.root / "repo"), "mode": "read",
                        "prompt": "Inspect the repository"}],
         }
         if initiative is not None:
@@ -75,6 +83,32 @@ class RouterCase(unittest.TestCase):
             spec["change_reason"] = ("Operator inspected the original issue and "
                                      "approved a successor")
         return spec
+
+    def approve(self, spec, *, config=None):
+        return team.initialize(spec, config=config or product_config.load_config(),
+                               approved=True)
+
+    def summary(self, *, desired="running", status="RUNNING", task_status="running"):
+        """A minimal team status summary shaped exactly like ``team.summary``.
+
+        It lets a test place the one task slot into a chosen state without a
+        runtime, so the router's truthfulness about "an agent started" is proven
+        against evidence, not against a runtime.
+        """
+        return {
+            "schema": "cao.team.status.v1",
+            "team_id": "wave",
+            "desired": desired,
+            "status": status,
+            "tick_count": 1,
+            "tasks": {
+                "inspect": {
+                    "status": task_status, "phase": "work", "round": 0,
+                    "execution_id": None, "head": None, "error": None,
+                    "retry_no": 0, "started_at": None, "progress_at": None,
+                },
+            },
+        }
 
 
 class ClassificationTests(RouterCase):
@@ -93,16 +127,106 @@ class ClassificationTests(RouterCase):
                 self.assertIsNone(task_router.classify(unroutable))
 
 
+class TextDecisionTests(RouterCase):
+    def test_implementation_intent_is_an_immediate_execution_candidate(self):
+        result = task_router.route(
+            {"item_id": "impl-1", "body": "implement a parser for the config"})
+        self.assertEqual(result["decision"], task_router.DECISION_IMPLEMENT)
+        self.assertEqual(result["route"], task_router.ROUTE_EXECUTION)
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertTrue(result["execution"]["requested"])
+        self.assertFalse(result["execution"]["started"])
+        self.assertEqual(result["execution"]["gate"],
+                         task_router.GATE_EXACT_MANIFEST)
+        # Visible as a candidate, but not silently treated as backlog *and* not
+        # started: the durable Intake record is the only persisted effect.
+        self.assertEqual(len(intake.list_submissions()), 1)
+        self.assertEqual(team.list_teams(), [])
+
+    def test_explicit_later_stays_backlog(self):
+        result = task_router.route(
+            {"item_id": "later-1",
+             "body": "add pagination to the user list later"})
+        self.assertEqual(result["decision"], task_router.DECISION_BACKLOG)
+        self.assertEqual(result["route"], task_router.ROUTE_INTAKE)
+        self.assertEqual(result["status"], task_router.STATUS_ADMITTED)
+        self.assertFalse(result["execution"]["requested"])
+        self.assertFalse(result["execution"]["started"])
+        self.assertEqual(len(intake.list_submissions()), 1)
+
+    def test_question_is_held_for_investigation(self):
+        result = task_router.route(
+            {"item_id": "ask-1", "body": "how does the retry logic work?"})
+        self.assertEqual(result["decision"], task_router.DECISION_INVESTIGATE)
+        self.assertEqual(result["route"], task_router.ROUTE_HOLD)
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(result["execution"]["gate"],
+                         task_router.GATE_HUMAN_REVIEW)
+        # The routed record is still durable; only the execution stays held.
+        self.assertEqual(len(intake.list_submissions()), 1)
+
+    def test_mixed_consequential_effect_is_held_not_downgraded(self):
+        result = task_router.route(
+            {"item_id": "mix-1",
+             "body": "fix the flaky test and deploy the service"})
+        self.assertEqual(result["decision"], task_router.DECISION_INVESTIGATE)
+        self.assertEqual(result["execution"]["gate"],
+                         task_router.GATE_CONSEQUENTIAL_EFFECT)
+        self.assertIn("consequential_effect", result["execution"]["needs"])
+        self.assertEqual(team.list_teams(), [])
+
+    def test_plain_statement_is_backlog(self):
+        result = task_router.route({"item_id": "note-1", "body": "just a note"})
+        self.assertEqual(result["decision"], task_router.DECISION_BACKLOG)
+        self.assertEqual(result["status"], task_router.STATUS_ADMITTED)
+
+    def test_negative_directive_is_not_treated_as_implementation(self):
+        # A negated work verb is a stated limitation, not an implementation
+        # directive: the request is recorded, never routed toward execution.
+        result = task_router.route(
+            {"item_id": "neg-1", "body": "do not implement the parser"})
+        self.assertEqual(result["decision"], task_router.DECISION_BACKLOG)
+        self.assertEqual(result["route"], task_router.ROUTE_INTAKE)
+        self.assertFalse(result["execution"]["requested"])
+        self.assertEqual(len(intake.list_submissions()), 1)
+
+    def test_contrast_after_a_negation_keeps_the_positive_work(self):
+        # "do not merge, but implement the fix" negates only the merge; the
+        # implementation directive after the contrast is still seen.
+        result = task_router.route(
+            {"item_id": "neg-2", "body": "do not merge, but implement the fix"})
+        self.assertEqual(result["decision"], task_router.DECISION_IMPLEMENT)
+        self.assertEqual(result["route"], task_router.ROUTE_EXECUTION)
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertTrue(result["execution"]["requested"])
+
+    def test_consequential_classifier_failure_is_held_fail_closed(self):
+        # If B6 cannot read the text it may hide a consequential effect, so the
+        # request is held for a human rather than silently recorded as plain work.
+        with mock.patch.object(task_router.intake_handoff, "classify_effects",
+                               side_effect=intake_handoff.HandoffInvalid("bad")):
+            result = task_router.route(
+                {"item_id": "b6-1", "body": "implement a parser"})
+        self.assertEqual(result["decision"], task_router.DECISION_INVESTIGATE)
+        self.assertEqual(result["route"], task_router.ROUTE_HOLD)
+        self.assertEqual(result["execution"]["gate"],
+                         task_router.GATE_CONSEQUENTIAL_EFFECT)
+        self.assertFalse(result["execution"]["requested"])
+        self.assertEqual(team.list_teams(), [])
+
+
 class IntakeRouteTests(RouterCase):
     def test_plain_request_is_admitted_once_and_is_idempotent(self):
         document = {"item_id": "req-1", "body": "please fix the flaky test"}
         first = task_router.route(document)
-        self.assertEqual(first["route"], task_router.ROUTE_INTAKE)
-        self.assertEqual(first["status"], "ADMITTED")
+        self.assertEqual(first["route"], task_router.ROUTE_EXECUTION)
+        self.assertEqual(first["decision"], task_router.DECISION_IMPLEMENT)
+        self.assertEqual(first["status"], task_router.STATUS_PROPOSED)
         self.assertFalse(first["dispatch"])
         self.assertEqual(first["authority"], "none")
         second = task_router.route(document)
-        self.assertEqual(second["status"], "DUPLICATE")
+        self.assertEqual(second["status"], task_router.STATUS_DUPLICATE)
+        self.assertEqual(second["decision"], task_router.DECISION_IMPLEMENT)
         self.assertEqual(first["submission"]["submission_id"],
                          second["submission"]["submission_id"])
         self.assertEqual(len(intake.list_submissions()), 1)
@@ -111,7 +235,7 @@ class IntakeRouteTests(RouterCase):
         result = task_router.route({"schema": intake.REQUEST_SCHEMA,
                                     "item_id": "req-2", "body": "x"})
         self.assertEqual((result["route"], result["status"]),
-                         (task_router.ROUTE_INTAKE, "ADMITTED"))
+                         (task_router.ROUTE_INTAKE, task_router.STATUS_ADMITTED))
 
     def test_same_item_with_different_content_is_refused_and_original_kept(self):
         task_router.route({"item_id": "req-3", "body": "original"})
@@ -131,18 +255,20 @@ class IntakeRouteTests(RouterCase):
 
     def test_dry_run_admits_nothing(self):
         result = task_router.route({"item_id": "dry", "body": "x"}, dry_run=True)
-        self.assertEqual(result["status"], task_router.STATUS_ROUTED)
+        self.assertEqual(result["status"], task_router.STATUS_ADMITTED)
         self.assertTrue(result["dry_run"])
         self.assertFalse(os.path.exists(intake.intake_dir()))
         self.assertEqual(intake.list_submissions(), [])
 
 
-class ExecutionRouteTests(RouterCase):
+class ExecutionReportTests(RouterCase):
     def test_manifest_routes_to_execution_without_any_effect(self):
         result = task_router.route(self.manifest(), source="/tmp/wave.json")
         self.assertEqual(result["status"], task_router.STATUS_ROUTED)
         self.assertEqual(result["route"], task_router.ROUTE_EXECUTION)
+        self.assertEqual(result["decision"], task_router.DECISION_IMPLEMENT)
         self.assertFalse(result["dispatch"])
+        self.assertFalse(result["execution"]["started"])
         self.assertEqual(result["authority"], "none")
         self.assertEqual(result["team_id"], "wave")
         # No team state, no Intake record and no Registry ledger is created.
@@ -212,17 +338,180 @@ class ExecutionRouteTests(RouterCase):
         self.assertEqual(result["error"]["code"], "TEAM_MODEL_NOT_ALLOWED")
         self.assertFalse(os.path.exists(team.team_path("wave")))
 
+    def test_existing_paused_team_reports_start_not_a_new_init(self):
+        self.write_config({"team_approval": {"mode": "chat"}})
+        spec = self.manifest(initiative="project", repo=self.repo())
+        self.approve(spec)
+        result = task_router.route(spec, source="m.json")
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(result["execution"]["gate"], None)
+        self.assertFalse(result["execution"]["started"])
+        self.assertEqual(result["next_commands"], ["cao team start --id wave"])
+
+    def test_absent_source_yields_no_ambiguous_placeholder_command(self):
+        result = task_router.route(self.manifest())
+        self.assertEqual(result["next_commands"], [])
+
+    def test_generated_commands_quote_an_unsafe_path(self):
+        source = str(self.root / "my manifest.json")
+        result = task_router.route(self.manifest(), source=source)
+        self.assertEqual(result["next_commands"], [
+            "cao team plan --file '{}'".format(source),
+            "cao team init --file '{}'".format(source),
+            "cao team start --id wave",
+        ])
+
+    def test_existing_team_with_a_different_manifest_is_refused(self):
+        # An unknown identity conflict must be refused even on the read-only
+        # route: a manifest that does not match the immutable checkpoint is never
+        # merged, replaced or started against.
+        team.initialize(self.manifest(repo=self.repo()), config=self.config)
+        conflicting = self.manifest(repo=self.repo())
+        conflicting["tasks"][0]["prompt"] = "A different immutable manifest"
+        result = task_router.route(conflicting, source="m.json")
+        self.assertEqual(result["status"], task_router.STATUS_REFUSED)
+        self.assertEqual(result["error"]["code"], "TEAM_IDENTITY_CONFLICT")
+        self.assertEqual(team.status("wave")["desired"], "paused")
+
+
+class ExecutionEvidenceTests(RouterCase):
+    """EXECUTING is reported only when a worker slot actually runs."""
+
+    def test_desired_running_with_an_unstarted_task_is_not_executing(self):
+        spec = self.manifest(repo=self.repo())
+        team.initialize(spec, config=self.config)
+        team.set_desired("wave", "running")
+        result = task_router.route(spec, source="m.json")
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertTrue(result["execution"]["requested"])
+        self.assertFalse(result["execution"]["started"])
+        self.assertEqual(result["team"]["desired"], "running")
+        self.assertEqual(result["team"]["status"], "PENDING")
+        self.assertEqual(result["next_commands"], ["cao team tick --id wave"])
+
+    def test_a_running_task_slot_is_executing(self):
+        spec = self.manifest(repo=self.repo())
+        team.initialize(spec, config=self.config)
+        with mock.patch.object(task_router.team, "status",
+                               return_value=self.summary()):
+            result = task_router.route(spec, source="m.json")
+        self.assertEqual(result["status"], task_router.STATUS_EXECUTING)
+        self.assertTrue(result["execution"]["started"])
+        self.assertEqual(result["execution"]["gate"], None)
+        self.assertEqual(result["next_commands"], [])
+        self.assertEqual(result["team"]["status"], "RUNNING")
+
+    def test_early_idle_after_start_is_executing_not_complete(self):
+        # The runtime can report idle right after a prompt; that early idle keeps
+        # the slot RUNNING with its claim held. It is still a started agent, so
+        # the route is EXECUTING, never a completed or merely-routed status.
+        spec = self.manifest(repo=self.repo())
+        team.initialize(spec, config=self.config)
+        summary = self.summary()
+        summary["tasks"]["inspect"]["started_at"] = "2026-10-17T00:00:00Z"
+        summary["tasks"]["inspect"]["progress_at"] = None
+        with mock.patch.object(task_router.team, "status", return_value=summary):
+            result = task_router.route(spec, source="m.json")
+        self.assertEqual(result["status"], task_router.STATUS_EXECUTING)
+        self.assertTrue(result["execution"]["started"])
+        self.assertNotIn(result["status"], {"COMPLETE", "NOT_STARTED"})
+
+
+class ExecuteTests(RouterCase):
+    def test_chat_execute_without_approval_holds_and_starts_nothing(self):
+        self.write_config({"team_approval": {"mode": "chat"}})
+        result = task_router.route(
+            self.manifest(initiative="project", repo=self.repo()),
+            source=str(self.root / "wave.json"), execute=True)
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(result["execution"]["gate"],
+                         task_router.GATE_OPERATOR_APPROVAL)
+        self.assertTrue(result["execution"]["requested"])
+        self.assertFalse(result["execution"]["started"])
+        # No team, no agent and no Registry effect without the operator's own
+        # recorded approval.
+        self.assertEqual(team.list_teams(), [])
+        self.assertFalse(os.path.exists(team.team_path("wave")))
+        self.assertFalse(os.path.exists(str(self.root / "registry.sqlite3")))
+
+    def test_legacy_execute_advances_the_owner_path_but_dispatches_no_agent(self):
+        result = task_router.route(self.manifest(repo=self.repo()),
+                                   source="m.json", execute=True)
+        # The owner API recorded the operator's start intent (desired=running)
+        # through the existing team.initialize/set_desired, but no worker has been
+        # dispatched, so the truthful status is PROPOSED, not EXECUTING.
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertTrue(result["execution"]["requested"])
+        self.assertFalse(result["execution"]["started"])
+        self.assertEqual(result["team"]["desired"], "running")
+        self.assertEqual(result["team"]["status"], "PENDING")
+        self.assertEqual(result["next_commands"], ["cao team tick --id wave"])
+        teams = team.list_teams()
+        self.assertEqual(len(teams), 1)
+        self.assertEqual(teams[0]["desired"], "running")
+        # Starting a team sets its desired state; it dispatches no worker.
+        self.assertEqual(teams[0]["tasks"]["inspect"]["status"], "pending")
+        self.assertFalse(os.path.exists(str(self.root / "registry.sqlite3")))
+
+    def test_existing_approved_team_is_reconciled_without_a_duplicate_start(self):
+        self.write_config({"team_approval": {"mode": "chat"}})
+        spec = self.manifest(initiative="project", repo=self.repo())
+        self.approve(spec)
+        result = task_router.route(spec, source="m.json", execute=True)
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(result["execution"]["gate"], None)
+        self.assertFalse(result["execution"]["started"])
+        self.assertEqual(result["team_id"], "wave")
+        # Replay is idempotent: one team, still no worker, no second start.
+        replay = task_router.route(spec, source="m.json", execute=True)
+        self.assertEqual(replay["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(len(team.list_teams()), 1)
+        self.assertEqual(team.status("wave")["desired"], "running")
+        # A report after the start observes the advanced team and names the
+        # existing daemon's reconcile rather than a duplicate start command.
+        report = task_router.route(spec, source="m.json")
+        self.assertEqual(report["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(report["next_commands"], ["cao team tick --id wave"])
+
+    def test_execute_holds_when_a_named_repository_is_absent(self):
+        result = task_router.route(
+            self.manifest(repo=str(self.root / "missing-repo")),
+            source="m.json", execute=True)
+        self.assertEqual(result["status"], task_router.STATUS_PROPOSED)
+        self.assertEqual(result["execution"]["gate"],
+                         task_router.GATE_REPOSITORY)
+        self.assertEqual(team.list_teams(), [])
+
+    def test_execute_refuses_an_identity_conflict(self):
+        self.write_config({"team_approval": {"mode": "chat"}})
+        self.approve(self.manifest(initiative="project", repo=self.repo()))
+        conflicting = self.manifest(repo=self.repo())
+        conflicting["tasks"][0]["prompt"] = "A different immutable manifest"
+        result = task_router.route(conflicting, source="m.json", execute=True)
+        self.assertEqual(result["status"], task_router.STATUS_REFUSED)
+        self.assertEqual(result["error"]["code"], "TEAM_IDENTITY_CONFLICT")
+        self.assertEqual(team.status("wave")["desired"], "paused")
+
 
 class RequestCliTests(RouterCase):
-    def test_plain_text_request_admits_then_reports_duplicate(self):
+    def test_plain_text_request_reports_the_decision_then_duplicates(self):
         code, first = run_cli(["--item-id", "cli-1", "--text", "fix it"])
         self.assertEqual(code, task_router.EXIT_OK)
         self.assertEqual(first["schema"], task_router.SCHEMA)
-        self.assertEqual(first["route"], task_router.ROUTE_INTAKE)
-        self.assertEqual(first["status"], "ADMITTED")
+        self.assertEqual(first["route"], task_router.ROUTE_EXECUTION)
+        self.assertEqual(first["decision"], task_router.DECISION_IMPLEMENT)
+        self.assertEqual(first["status"], task_router.STATUS_PROPOSED)
         code, second = run_cli(["--item-id", "cli-1", "--text", "fix it"])
         self.assertEqual(code, task_router.EXIT_OK)
-        self.assertEqual(second["status"], "DUPLICATE")
+        self.assertEqual(second["status"], task_router.STATUS_DUPLICATE)
+
+    def test_ambiguous_or_later_text_is_backlog_with_a_next_step(self):
+        code, payload = run_cli(["--item-id", "cli-note", "--text", "a note"])
+        self.assertEqual(code, task_router.EXIT_OK)
+        self.assertEqual(payload["status"], task_router.STATUS_ADMITTED)
+        self.assertEqual(payload["decision"], task_router.DECISION_BACKLOG)
+        self.assertEqual(payload["route"], task_router.ROUTE_INTAKE)
+        self.assertIn("cao intake triage", payload["execution"]["next"][0])
 
     def test_team_manifest_file_routes_to_execution(self):
         path = self.root / "wave.json"
@@ -261,6 +550,24 @@ class RequestCliTests(RouterCase):
         self.assertEqual(code, task_router.EXIT_UNAVAILABLE)
         self.assertEqual(payload["error"]["code"], "USAGE")
 
+    def test_dry_run_and_execute_cannot_be_combined(self):
+        code, payload = run_cli(["--item-id", "x", "--text", "y",
+                                 "--dry-run", "--execute"])
+        self.assertEqual(code, task_router.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["error"]["code"], "USAGE")
+        self.assertEqual(intake.list_submissions(), [])
+
+    def test_execute_without_a_manifest_is_a_usage_failure(self):
+        code, payload = run_cli(["--item-id", "x", "--text", "y", "--execute"])
+        self.assertEqual(code, task_router.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["error"]["code"], "USAGE")
+        self.assertEqual(intake.list_submissions(), [])
+        refused = task_router.route({"item_id": "x", "body": "y"}, execute=True)
+        self.assertEqual(refused["status"], task_router.STATUS_REFUSED)
+        self.assertEqual(refused["error"]["code"],
+                         "EXECUTION_REQUIRES_MANIFEST")
+        self.assertEqual(intake.list_submissions(), [])
+
     def test_cli_dry_run_admits_nothing(self):
         code, payload = run_cli(
             ["--item-id", "dry-cli", "--text", "x", "--dry-run"])
@@ -272,7 +579,20 @@ class RequestCliTests(RouterCase):
         code, payload = run_cli(
             ["--json", "--item-id", "cli-json", "--text", "x"])
         self.assertEqual(code, task_router.EXIT_OK)
-        self.assertEqual(payload["status"], "ADMITTED")
+        self.assertEqual(payload["status"], task_router.STATUS_ADMITTED)
+
+
+class ReadmeScopeTests(unittest.TestCase):
+    """The README documents the single request entrypoint this change owns."""
+
+    def test_readme_documents_the_one_send_to_cao_entrypoint(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8")
+        self.assertIn("cao request", readme)
+        for token in ("BACKLOG", "INVESTIGATE", "IMPLEMENT", "execution candidate",
+                      "the request text is never\napproval"):
+            with self.subTest(token=token):
+                self.assertIn(token, readme)
 
 
 if __name__ == "__main__":

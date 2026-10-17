@@ -136,45 +136,122 @@ Exit codes are `0` success, `2` usage error, `3` explicit
 ## Send to CAO: one request entrypoint
 
 `cao request` is the single request entrypoint. A caller sends one bounded
-request document and CAO routes it deterministically to exactly one *existing*
-governed path, so the caller never has to choose between Intake and governed
-execution:
+request document, CAO makes **one finite routing decision** and reports it, so
+the caller never has to choose between the Intake API and the governed Team
+Execution API:
 
 ```sh
-cao request --file request.json      # one JSON request document
-cao request --item-id ID --text "…"  # a plain-text ordinary request
-cao request --file request.json --dry-run
+cao request --item-id ID --text "…"           # a plain-text request
+cao request --file manifest.json              # report the governed team route
+cao request --file manifest.json --execute    # route into the owner path
+cao request --file request.json --dry-run     # classify/validate, no effect
 ```
 
-Routing depends only on the document's own declared shape, never on a flag, an
-environment value or a prior admission, so the same request always routes the
-same way:
+### The finite routing decision
 
-| Document | Route | Effect |
-|---|---|---|
-| `cao.intake.request.v1`, or a JSON object with `item_id` and `body` | Intake | admits one durable record through the existing inbound gate |
-| `cao.team.v1` | governed Team Execution | reports the existing route read-only and the exact governed next commands |
+Exactly three decisions are emitted, plus a refusal:
 
-The entrypoint is a **router**, not an orchestrator. It dispatches no team,
-starts no agent, grants no authority, bypasses no Work Registry rule, upgrades no
-privilege, deletes nothing, auto-merges, pushes or deploys nothing, and creates
-no second store. `--dry-run` validates and classifies without admitting
-anything, and an unroutable document is refused (`UNKNOWN_REQUEST`) rather than
-guessed.
+| decision | route | meaning | status |
+|---|---|---|---|
+| `BACKLOG` | `INTAKE` | recorded for later; no execution was requested | `ADMITTED` (or `DUPLICATE` on replay) |
+| `INVESTIGATE` | `HOLD` | a human decision or investigation is required before implementation | `PROPOSED` (held) |
+| `IMPLEMENT` | `EXECUTION` | clearly-expressed implementation intent: a visible execution candidate | `PROPOSED` while gated, `EXECUTING` only with team evidence |
+| — | — | unroutable, invalid or unavailable | `REFUSED` / `UNAVAILABLE` |
 
-An Intake admission is **never** execution consent. The two routes are disjoint,
-and an execution route is qualified only through the existing Team Execution
-authorization: the operator's model allowlist must permit every resolved
-work/review route, and a chat-approved team still needs the operator's own
-`cao team init --approved`. The entrypoint records no approval and performs no
-effect of its own; it returns the exact `cao team plan`, `cao team init` and
-`cao team start` commands for the accountable operator to run.
+Every payload carries `decision`, `route`, `status`, `authority` and an
+`execution` block with `requested`, `started`, `gate`, `needs` and `next`.
+`execution.requested` says execution was **asked for**; `execution.started` says
+it **actually began**. The two are never conflated, and `EXECUTING` is reported
+only when a team checkpoint backs it.
+
+For opaque request text the decision rule table is deterministic and
+documented; first match wins, no model and no hidden state:
+
+1. it asks for a reserved consequential effect (`merge`, `deploy`, `release`,
+   `publish`, `credential`, `permission`, `destructive`) — reusing B6's
+   mention-vs-request classifier — or leaves one unprovable → `INVESTIGATE`; if
+   the classifier cannot read the text at all the request fails **closed** to
+   `INVESTIGATE`, never silently to `BACKLOG`;
+2. it explicitly defers (`later`, `not now`, `backlog`, `someday`, …) →
+   `BACKLOG`;
+3. it carries a risk marker (see B3 triage) → `INVESTIGATE`;
+4. it is a genuine question → `INVESTIGATE` (a leading prohibition such as
+   "do not …" is an imperative limitation, not a question);
+5. it carries a work verb **outside a negating directive** → `IMPLEMENT`; a
+   negative directive ("do not implement X") contains no positive work and is
+   recorded, never executed;
+6. otherwise → `BACKLOG`.
+
+### One durable request, one effect
+
+Every plain request is admitted through the existing Intake gate exactly once
+and idempotently: the same item and content is `DUPLICATE`, the same item with
+different content is `INTAKE_CONFLICT`, and a replayed decision never creates a
+second record. That durable admission is the **only** persisted effect of the
+text route. An `IMPLEMENT` decision makes the request *visible* as an execution
+candidate instead of burying it in the backlog; it starts nothing. The request
+text, a work verb and an Intake admission are **never** approval.
+
+### The governed team route
+
+A `cao.team.v1` manifest is validated and each resolved work/review route is
+independently qualified against the existing Team Execution authorization (the
+operator's model allowlist and the approval policy). Without `--execute` the
+route is reported read-only:
+
+- a new manifest is `ROUTED` with `next_commands` = the exact existing
+  `cao team plan` / `cao team init` / `cao team start` commands (shell-quoted, so
+  an unsafe path can never make a printed command ambiguous);
+- an already-existing team is reconciled by identity: a team whose task slot is
+  **actually running** reports `EXECUTING` with team evidence, a team that is
+  only `PENDING` (desired state set, no worker dispatched) is `PROPOSED`, and an
+  existing team with a different immutable manifest is
+  `TEAM_IDENTITY_CONFLICT` — never replaced or merged. Nothing is ever reported
+  `EXECUTING` from a desired state alone.
+
+`--execute` asks CAO to route the manifest into the existing owner path. It adds
+**no** authority, records no approval and never dispatches a worker:
+
+- **chat mode** only advances a team whose saved operator admission already
+  exists; an absent or unapproved team is `PROPOSED` (`operator_approval`) with
+  the exact commands, because the router will not fabricate the operator's own
+  `cao team init --approved`;
+- **legacy mode** reuses the exact `cao team init`/`cao team start` semantics
+  through the same owner API (`team.initialize`/`team.set_desired`); running
+  `--execute` is the same operator declaration those commands already record.
+  Setting the desired state is intent, not an agent, so the result is `PROPOSED`
+  with `execution.started = false` until a task slot actually runs; the named next
+  step is the existing daemon's reconcile (`cao team tick --id …`), never a
+  duplicate start;
+- an exact manifest that names an absent checkout is `PROPOSED`
+  (`repository_scope_absent`), never started against a path that cannot exist.
+
+Starting a team only sets its desired state; the existing daemon's own tick
+reconciles it through the Work Registry. `--execute` never ticks a team, never
+starts an agent, never writes a Registry row and creates no second store.
+
+The entrypoint is a **router**, not an orchestrator. It grants no authority,
+bypasses no Work Registry rule, upgrades no privilege, deletes nothing,
+auto-merges, pushes or deploys nothing. `--dry-run` validates and classifies
+without admitting or starting anything (`--dry-run --execute` is a usage error),
+`--execute` without an exact `--file` manifest is a usage error, `--json` is
+accepted for compatibility, and an unroutable document is refused
+(`UNKNOWN_REQUEST`) rather than guessed.
+
+### What remains gated
+
+Fully automatic implementation is **not** claimed. A first dispatch, a WRITE, a
+merge, a deploy, a release, a publication, a credential or a permission change
+still require the existing qualified operator authorization (the B6/B7/B8
+in-process adapter, the protected standing grant, or the operator's chat
+approval). Ambiguous or under-specified requests are held with an actionable
+next step rather than guessed.
 
 Broader documentation integration is outstanding: the task-centered backlog view
 (`cao team backlog`, which groups the immutable team records by initiative and
-successor lineage) and this router's execution-route narrative belong in
-`docs/team-execution.md`, which this change deliberately does not edit because
-another CAO team holds an active WRITE claim on that file.
+successor lineage) belongs in `docs/team-execution.md`, which this change
+deliberately does not edit because that shared interface doc requires accountable
+integration review.
 
 ## The inbound bridge (marketplace-only)
 
@@ -825,6 +902,18 @@ uncited, write or competing audits; duplicate admission and crash-restart durabl
 idempotency; a WRITE request that is never dispatched; no new agent or Registry
 claim on a hold; the absence of any raw body, tenant text or credential in a
 plan; private `0700`/`0600` state; and the CLI.
+`tests/test_task_router.py` is the `cao request` entrypoint runnable check: the
+finite BACKLOG/INVESTIGATE/IMPLEMENT decision, the deterministic text rules
+(implement-now, later, review, mixed consequential effects, a negative directive
+and the fail-closed B6 hold), the durable idempotent admission and duplicate
+replay, the read-only governed-execution report and its shell-quoted commands,
+the EXECUTING evidence rule (a desired state or an unstarted PENDING team is
+`PROPOSED`, only a genuinely running task slot or a benign early idle is
+`EXECUTING`), the manual owner-initiated `--execute` route (a chat hold with no
+approval, a legacy advance through the owner path that dispatches no agent, an
+existing approved team reconciled without a duplicate start, a repository or
+identity gate) with zero worker or Registry effects, and the CLI and README
+documentation.
 `tests/test_boundaries.py` additionally
 guards that intake never routes a durable record through the permissive state
 reader and that triage, B4, B5 and B6 reach the Registry through read-only calls

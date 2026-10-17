@@ -228,9 +228,13 @@ class RequestEntrypointTests(CliCase):
         self.assertEqual(code, product_cli.EXIT_OK)
         payload = json.loads(output)
         self.assertEqual(payload["schema"], "cao.request.v1")
-        self.assertEqual(payload["route"], "INTAKE")
-        self.assertEqual(payload["status"], "ADMITTED")
+        # "fix it" clearly expresses implementation intent, so the single
+        # entrypoint surfaces it as an execution candidate, not backlog.
+        self.assertEqual(payload["decision"], "IMPLEMENT")
+        self.assertEqual(payload["route"], "EXECUTION")
+        self.assertEqual(payload["status"], "PROPOSED")
         self.assertFalse(payload["dispatch"])
+        self.assertFalse(payload["execution"]["started"])
 
 
 class DoctorCliTests(CliCase):
