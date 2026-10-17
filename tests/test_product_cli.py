@@ -217,8 +217,20 @@ class HelpTests(CliCase):
                 product_cli.main(["--help"])
         self.assertEqual(ctx.exception.code, 0)
         text = buffer.getvalue()
-        for command in ("doctor", "status", "run", "start", "stop", "logs"):
+        for command in ("doctor", "status", "run", "start", "stop", "logs",
+                        "request"):
             self.assertIn(command, text)
+
+
+class RequestEntrypointTests(CliCase):
+    def test_request_group_is_discoverable_through_the_product_cli(self) -> None:
+        code, output = run_cli(["request", "--item-id", "p1", "--text", "fix it"])
+        self.assertEqual(code, product_cli.EXIT_OK)
+        payload = json.loads(output)
+        self.assertEqual(payload["schema"], "cao.request.v1")
+        self.assertEqual(payload["route"], "INTAKE")
+        self.assertEqual(payload["status"], "ADMITTED")
+        self.assertFalse(payload["dispatch"])
 
 
 class DoctorCliTests(CliCase):

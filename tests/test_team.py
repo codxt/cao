@@ -3077,5 +3077,162 @@ class TeamTests(unittest.TestCase):
         net.assert_not_called()
 
 
+class TeamBacklogTests(unittest.TestCase):
+    """The read-only, task-centered backlog over immutable team records."""
+
+    def summary(self, team_id, *, initiative=None, supersedes=None,
+                status="PAUSED", desired="paused", tasks=None):
+        item = {"team_id": team_id, "desired": desired, "status": status,
+                "tasks": tasks if tasks is not None
+                else {"read": {"status": "pending"}}}
+        if initiative is not None:
+            item["initiative"] = initiative
+        if supersedes is not None:
+            item["supersedes"] = supersedes
+        return item
+
+    def group(self, *records):
+        return team.group_teams(records[0] if len(records) == 1 else list(records))
+
+    def by_id(self, result, initiative):
+        group = next(g for g in result["initiatives"]
+                     if g["initiative"] == initiative)
+        return group, {t["team_id"]: t for t in group["teams"]}
+
+    def test_supersession_marks_head_actionable_and_predecessor_historical(self):
+        result = self.group([self.summary("alpha", initiative="project"),
+                             self.summary("beta", initiative="project",
+                                          supersedes="alpha")])
+        group, teams = self.by_id(result, "project")
+        self.assertEqual(group["head"], "beta")
+        self.assertEqual(group["classification"], team.BACKLOG_ACTIONABLE)
+        self.assertEqual(teams["alpha"]["classification"], team.BACKLOG_HISTORICAL)
+        self.assertEqual(teams["beta"]["classification"], team.BACKLOG_ACTIONABLE)
+        self.assertEqual(teams["beta"]["supersedes"], "alpha")
+        self.assertEqual(teams["alpha"]["successors"], ["beta"])
+        self.assertEqual(result["counts"], {"initiatives": 1, "teams": 2,
+                                            "actionable": 1, "historical": 1,
+                                            "unknown": 0})
+
+    def test_terminal_head_is_historical(self):
+        group, teams = self.by_id(
+            self.group([self.summary("done", initiative="project",
+                                     status="COMPLETE")]), "project")
+        self.assertEqual(group["head"], "done")
+        self.assertEqual(group["classification"], team.BACKLOG_HISTORICAL)
+        self.assertEqual(teams["done"]["classification"], team.BACKLOG_HISTORICAL)
+
+    def test_unknown_and_corrupt_heads_are_reported_unknown(self):
+        for status in ("BLOCKED", "UNKNOWN", "CORRUPT", "WEIRD"):
+            with self.subTest(status=status):
+                group, teams = self.by_id(
+                    self.group([self.summary("x", initiative="project",
+                                             status=status)]), "project")
+                self.assertEqual(group["classification"], team.BACKLOG_UNKNOWN)
+                self.assertEqual(teams["x"]["classification"], team.BACKLOG_UNKNOWN)
+
+    def test_legacy_team_without_initiative_is_preserved(self):
+        result = self.group([self.summary("legacy")])
+        group, teams = self.by_id(result, None)
+        self.assertEqual(group["head"], "legacy")
+        self.assertEqual(teams["legacy"]["classification"], team.BACKLOG_ACTIONABLE)
+
+    def test_duplicate_team_id_makes_the_group_unknown_and_keeps_both(self):
+        result = self.group([self.summary("dup", initiative="project"),
+                             self.summary("dup", initiative="project")])
+        group, teams = self.by_id(result, "project")
+        self.assertEqual(group["classification"], team.BACKLOG_UNKNOWN)
+        self.assertIsNone(group["head"])
+        self.assertEqual(len(group["teams"]), 2)
+        self.assertEqual(result["counts"]["teams"], 2)
+
+    def test_two_successors_of_one_predecessor_is_ambiguous(self):
+        result = self.group([self.summary("a", initiative="project"),
+                             self.summary("b", initiative="project", supersedes="a"),
+                             self.summary("c", initiative="project", supersedes="a")])
+        group, teams = self.by_id(result, "project")
+        self.assertEqual(group["classification"], team.BACKLOG_UNKNOWN)
+        self.assertIsNone(group["head"])
+        self.assertTrue(all(t["classification"] == team.BACKLOG_UNKNOWN
+                            for t in teams.values()))
+
+    def test_dangling_predecessor_is_ambiguous(self):
+        group, _ = self.by_id(
+            self.group([self.summary("b", initiative="project",
+                                     supersedes="missing")]), "project")
+        self.assertEqual(group["classification"], team.BACKLOG_UNKNOWN)
+
+    def test_cycle_is_ambiguous(self):
+        group, _ = self.by_id(
+            self.group([self.summary("a", initiative="project", supersedes="b"),
+                        self.summary("b", initiative="project", supersedes="a")]),
+            "project")
+        self.assertEqual(group["classification"], team.BACKLOG_UNKNOWN)
+        self.assertIsNone(group["head"])
+
+    def test_two_unrelated_teams_in_one_initiative_are_ambiguous(self):
+        group, _ = self.by_id(
+            self.group([self.summary("a", initiative="project"),
+                        self.summary("b", initiative="project")]), "project")
+        self.assertEqual(group["classification"], team.BACKLOG_UNKNOWN)
+
+    def test_ordering_and_counts_are_deterministic_and_consistent(self):
+        records = [self.summary("z", initiative="project"),
+                   self.summary("a", initiative="alpha", status="COMPLETE"),
+                   self.summary("y", initiative="project", supersedes="z"),
+                   self.summary("solo")]
+        first = self.group(records)
+        self.assertEqual(first, self.group(records))
+        self.assertEqual([g["initiative"] for g in first["initiatives"]],
+                         ["alpha", "project", None])
+        counted = (first["counts"]["actionable"] + first["counts"]["historical"]
+                   + first["counts"]["unknown"])
+        self.assertEqual(counted, first["counts"]["teams"])
+        self.assertEqual(first["counts"]["teams"], len(records))
+
+    def test_backlog_reads_the_durable_successor_lineage(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        env = {"XDG_STATE_HOME": str(root / "state"),
+               "XDG_CONFIG_HOME": str(root / "config")}
+        raw = {"schema": product_config.SCHEMA,
+               "provider": {"cli": "opencode", "id": "test",
+                            "model": "opencode/default"},
+               "team_approval": {"mode": "chat"},
+               "registry_db": str(root / "shared.sqlite3")}
+        product_config.write_config(raw, product_config.config_path(env))
+        config = product_config.validate_config(raw)
+        roles = {"reviewer": {"instruction": "Inspect source",
+                              "model": "opencode/review"}}
+
+        def spec(team_id, supersedes=None):
+            item = {"schema": team.SPEC_SCHEMA, "team_id": team_id,
+                    "initiative": "project", "roles": roles,
+                    "tasks": [{"id": "read", "role": "reviewer",
+                               "repo": str(root / "repo"), "mode": "read",
+                               "prompt": "Review exact source"}],
+                    "max_parallel": 1, "max_writers": 0}
+            if supersedes is not None:
+                item["supersedes"] = supersedes
+                item["change_reason"] = ("Operator inspected the original issue "
+                                         "and approved a successor")
+            return item
+
+        team.initialize(spec("alpha"), env=env, config=config, approved=True)
+        registry.connect(raw["registry_db"]).close()
+        team.initialize(spec("beta", supersedes="alpha"), env=env,
+                        config=config, approved=True)
+        result = team.backlog(env=env)
+        self.assertEqual(result["schema"], team.BACKLOG_SCHEMA)
+        group, teams = self.by_id(result, "project")
+        self.assertEqual(group["head"], "beta")
+        self.assertEqual(teams["alpha"]["classification"], team.BACKLOG_HISTORICAL)
+        self.assertEqual(teams["beta"]["classification"], team.BACKLOG_ACTIONABLE)
+        self.assertEqual(teams["alpha"]["successors"], ["beta"])
+        # Both immutable records are preserved; neither is rewritten.
+        self.assertEqual(len(team.list_teams(env=env)), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

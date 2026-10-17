@@ -133,6 +133,49 @@ cao intake transports                        # the inbound transport contract
 Exit codes are `0` success, `2` usage error, `3` explicit
 `UNAVAILABLE`/conflict.
 
+## Send to CAO: one request entrypoint
+
+`cao request` is the single request entrypoint. A caller sends one bounded
+request document and CAO routes it deterministically to exactly one *existing*
+governed path, so the caller never has to choose between Intake and governed
+execution:
+
+```sh
+cao request --file request.json      # one JSON request document
+cao request --item-id ID --text "…"  # a plain-text ordinary request
+cao request --file request.json --dry-run
+```
+
+Routing depends only on the document's own declared shape, never on a flag, an
+environment value or a prior admission, so the same request always routes the
+same way:
+
+| Document | Route | Effect |
+|---|---|---|
+| `cao.intake.request.v1`, or a JSON object with `item_id` and `body` | Intake | admits one durable record through the existing inbound gate |
+| `cao.team.v1` | governed Team Execution | reports the existing route read-only and the exact governed next commands |
+
+The entrypoint is a **router**, not an orchestrator. It dispatches no team,
+starts no agent, grants no authority, bypasses no Work Registry rule, upgrades no
+privilege, deletes nothing, auto-merges, pushes or deploys nothing, and creates
+no second store. `--dry-run` validates and classifies without admitting
+anything, and an unroutable document is refused (`UNKNOWN_REQUEST`) rather than
+guessed.
+
+An Intake admission is **never** execution consent. The two routes are disjoint,
+and an execution route is qualified only through the existing Team Execution
+authorization: the operator's model allowlist must permit every resolved
+work/review route, and a chat-approved team still needs the operator's own
+`cao team init --approved`. The entrypoint records no approval and performs no
+effect of its own; it returns the exact `cao team plan`, `cao team init` and
+`cao team start` commands for the accountable operator to run.
+
+Broader documentation integration is outstanding: the task-centered backlog view
+(`cao team backlog`, which groups the immutable team records by initiative and
+successor lineage) and this router's execution-route narrative belong in
+`docs/team-execution.md`, which this change deliberately does not edit because
+another CAO team holds an active WRITE claim on that file.
+
 ## The inbound bridge (marketplace-only)
 
 The inbound path is a **data** path, not a service. This build runs no custom
