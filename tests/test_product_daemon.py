@@ -1921,6 +1921,595 @@ class HygieneTests(DaemonCase):
         self.assertGreaterEqual(hygiene["counts"]["protected_unknown"], 1)
         self.assertEqual(hygiene["counts"]["eligible"], 0)
 
+    # ------------------------------------------------------------------
+    # Historical leftover: a REALISTIC replay of the pre-close-first build.
+    #
+    # The fixture below is NOT the adversarial ``forged_terminal_read`` above.
+    # It replays what the real old build actually persisted: the governed
+    # Registry really proposes, claims and RELEASES the task's work through its
+    # own API, and the task record carries the legacy shape -- a released claim
+    # disposition with NO recorded pane close -- because that build released its
+    # claim without ever closing the pane (see the git history of
+    # ``product_task._finish`` before commit 6d2f271). That state is the
+    # positive canary for the corroborated-leftover gate; the modern close-first
+    # lifecycle cannot produce it.
+    # ------------------------------------------------------------------
+
+    def legacy_released_read(self, driver, task_id="legacy-read", *,
+                             run_id=None, mode="READ", scope=("a.txt",),
+                             release_outcome="complete",
+                             record_outcome="complete",
+                             register_agent=True, agent_status="done",
+                             label=None, claim=True, release=True):
+        run_id = run_id or product_config.DEFAULT_RUN_ID
+        created = driver.workspace_create("cao-review-" + task_id,
+                                          cwd=str(self.repo))
+        pane_id = created["pane_id"]
+        if label is not None:
+            driver._workspaces[created["workspace_id"]]["label"] = label
+        agent_name = "cao-" + task_id
+        if register_agent:
+            driver._agents[agent_name] = pane_id
+        driver._panes[pane_id]["agent"] = "opencode"
+        driver._panes[pane_id]["agent_status"] = agent_status
+        claim_id = None
+        conn = registry.connect(self.db)
+        try:
+            registry.propose(conn, run_id, task_id, str(self.repo),
+                             paths=list(scope))
+            if claim:
+                result = registry.claim(conn, registry.ClaimSpec(
+                    run_id=run_id, work_key=task_id, owner=product_task.OWNER,
+                    mode=mode, issue="",
+                    worktree=str(self.repo) if mode == registry.WRITE else "",
+                ))
+                claim_id = result.get("claim_id")
+                if release:
+                    registry.release(conn, run_id, product_task.OWNER, task_id,
+                                     issue="", outcome=release_outcome)
+        finally:
+            conn.close()
+        stamp = "2026-01-01T00:00:00Z"
+        product_state.write_task({
+            "schema": product_state.TASK_SCHEMA,
+            "task_id": task_id,
+            "run_id": run_id,
+            "work_key": task_id,
+            "repo": str(self.repo),
+            "prompt": "Review this repository",
+            "mode": mode, "scope": list(scope),
+            "agent_kind": "opencode", "agent_args": [],
+            "workspace_label": "cao-review-" + task_id,
+            "status": "complete",
+            "checkpoint": {
+                "workspace_id": created["workspace_id"],
+                "tab_id": created["tab_id"], "pane_id": pane_id,
+                "agent_name": agent_name, "agent_started": True,
+                "start_attempted": True, "prompt_issued": True,
+                "prompt_ack": "accepted", "stage": "prompted",
+            },
+            "created_at": stamp, "updated_at": stamp,
+            "claim": {"claim_id": claim_id, "status": "RELEASED",
+                      "released": True, "outcome": record_outcome},
+            "output": None, "output_truncated": False, "output_bounds": None,
+            "output_observations": [], "observation": None, "error": None,
+            "refusal": None, "pane_closed": None,
+        }, self.env)
+        return pane_id
+
+    def test_corroborated_historical_leftover_plans_then_closes_once(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-close")
+        # Default OFF + dry run: the corroborated leftover is reported eligible
+        # and NOTHING is closed. Activation is never a source change.
+        plan = self.build(driver)
+        plan.start()
+        plan.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["mode"], "plan")
+        self.assertEqual(hygiene["counts"]["eligible"], 1)
+        self.assertEqual(hygiene["counts"]["closed"], 0)
+        self.assertIn(pane_id, driver._panes)
+        # Enabled AND dry-run cleared: the exact owned pane is closed once and
+        # its verified close is recorded on the shared task record.
+        applied = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        applied.start()
+        applied.tick()
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertNotIn(pane_id, driver._panes)
+        record = product_state.read_task("legacy-close", self.env)
+        self.assertEqual(record["pane_closed"], pane_id)
+        # Exactly one final classification for the applied pane: a successful
+        # close is ``closed``, never both ``eligible`` and ``closed``.
+        applied_hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(applied_hygiene["counts"]["closed"], 1)
+        self.assertEqual(applied_hygiene["counts"]["eligible"], 0)
+        self.assertEqual(sum(applied_hygiene["counts"].values()), 1)
+        # Idempotent across a restart: the pane is gone, so nothing more closes.
+        restarted = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        restarted.tick()
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        restarted_hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(restarted_hygiene["counts"]["closed"], 0)
+        self.assertEqual(restarted_hygiene["counts"]["eligible"], 0)
+        self.assertEqual(sum(restarted_hygiene["counts"].values()), 0)
+
+    def test_historical_leftover_without_a_released_row_holds(self):
+        # A released boolean the ledger does not corroborate is never authority.
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="no-row",
+                                            claim=False)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertGreaterEqual(report["counts"]["protected_unknown"], 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_historical_leftover_row_mismatch_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="row-mismatch")
+        record = product_state.read_task("row-mismatch", self.env)
+        record["work_key"] = "a-different-work-key"
+        product_state.write_task(record, self.env)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_historical_leftover_outcome_mismatch_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="outcome-mismatch",
+            release_outcome="abandon", record_outcome="complete")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_reappeared_pane_with_a_real_released_row_still_holds(self):
+        # PR #31 protection, preserved: a recorded verified close plus a present
+        # pane is held even when the ledger corroborates the released row.
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-reappear")
+        record = product_state.read_task("legacy-reappear", self.env)
+        record["pane_closed"] = pane_id
+        product_state.write_task(record, self.env)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertGreaterEqual(report["counts"]["protected_unknown"], 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_active_worker_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-active", agent_status="working")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertGreaterEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_foreign_agent_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-foreign", register_agent=False)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertGreaterEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_foreign_workspace_label_historical_leftover_is_unowned(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-label", label="someone-elses-workspace")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertGreaterEqual(report["counts"]["unowned"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_dirty_checkout_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-dirty")
+        (self.repo / "untracked.txt").write_text("wip\n", encoding="utf-8")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertGreaterEqual(report["counts"]["protected_unknown"], 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_reused_pane_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-reuse")
+        task = product_state.read_task("legacy-reuse", self.env)
+        active = dict(task)
+        active.update(task_id="legacy-reuse-active",
+                      work_key="legacy-reuse-active", status="blocked")
+        active["checkpoint"] = dict(task["checkpoint"])
+        product_state.write_task(active, self.env)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertGreaterEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_live_claim_on_the_checkout_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-conflict")
+        product_task.run_task(
+            driver=driver, repo=str(self.repo), prompt="Edit the code",
+            task_id="another-writer", mode="write", write_scope=("a.txt",),
+            observation=RuntimeObservation.empty(), config=self.config,
+            env=self.env, registry_db=self.db, wait_ms=0)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertGreaterEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_open_claim_from_another_owner_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-multiowner")
+        conn = registry.connect(self.db)
+        try:
+            registry.propose(conn, "another-run", "other-work", str(self.repo),
+                             paths=["a.txt"])
+            registry.claim(conn, registry.ClaimSpec(
+                run_id="another-run", work_key="other-work",
+                owner="another-owner", mode=registry.WRITE, issue="",
+                branch="main", worktree=str(self.repo)),
+                RuntimeObservation.empty())
+        finally:
+            conn.close()
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertGreaterEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_unaccepted_team_historical_leftover_holds(self):
+        driver = FakeDriver()
+        task_id = team._execution_id("squad", "a", "work", 0)
+        pane_id = self.legacy_released_read(
+            driver, task_id=task_id, run_id="cao-team-squad")
+        spec = {
+            "schema": team.SPEC_SCHEMA, "team_id": "squad",
+            "roles": {"analyst": {"instruction": "Read only."}},
+            "tasks": [{"id": "a", "role": "analyst", "repo": str(self.repo),
+                       "mode": "read", "prompt": "Analyze source"}],
+        }
+        team.initialize(spec, env=self.env)
+        record = team._required("squad", self.env)
+        record["slots"]["a"].update(status="unknown", execution_id=task_id,
+                                    prompt="Analyze source")
+        team._save(record, self.env)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertGreaterEqual(report["counts"]["protected_unknown"], 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_unreadable_ledger_historical_leftover_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-noledger")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver,
+            registry_db=str(self.root / "missing.sqlite3"), apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["registry"], "UNAVAILABLE")
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_absent_pane_historical_leftover_is_skipped(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-gone")
+        driver.pane_close(pane_id)  # the leftover resolved itself: no orphan
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(report["counts"]["protected_unknown"], 0)
+
+    def test_absent_pane_with_unaccepted_team_is_not_protected_unknown(self):
+        # The pane is genuinely absent. An unaccepted historical team is an
+        # unrelated predicate: it must not turn a non-existent leftover into a
+        # held count.
+        driver = FakeDriver()
+        task_id = team._execution_id("squad", "a", "work", 0)
+        pane_id = self.legacy_released_read(
+            driver, task_id=task_id, run_id="cao-team-squad")
+        spec = {
+            "schema": team.SPEC_SCHEMA, "team_id": "squad",
+            "roles": {"analyst": {"instruction": "Read only."}},
+            "tasks": [{"id": "a", "role": "analyst", "repo": str(self.repo),
+                       "mode": "read", "prompt": "Analyze source"}],
+        }
+        team.initialize(spec, env=self.env)
+        record = team._required("squad", self.env)
+        record["slots"]["a"].update(status="unknown", execution_id=task_id,
+                                    prompt="Analyze source")
+        team._save(record, self.env)
+        driver.pane_close(pane_id)  # the test removes the pane itself
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        # Only the test setup closed a pane; hygiene closed nothing.
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertEqual(report["counts"]["protected_unknown"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+
+    def test_absent_pane_with_dirty_checkout_is_not_protected_unknown(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-gone-dirty")
+        driver.pane_close(pane_id)  # the test removes the pane itself
+        (self.repo / "untracked.txt").write_text("wip\n", encoding="utf-8")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        # Only the test setup closed a pane; hygiene closed nothing.
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertEqual(report["counts"]["protected_unknown"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+
+    def test_absent_pane_with_unknown_team_lane_is_not_protected_unknown(self):
+        driver = FakeDriver()
+        task_id = team._execution_id("ghost", "a", "work", 0)
+        pane_id = self.legacy_released_read(
+            driver, task_id=task_id, run_id="cao-team-ghost")
+        driver.pane_close(pane_id)  # the test removes the pane itself
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        # Only the test setup closed a pane; hygiene closed nothing.
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertEqual(report["counts"]["protected_unknown"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+
+    def test_absent_pane_without_released_row_is_not_protected_unknown(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-gone-norow", claim=False)
+        driver.pane_close(pane_id)  # the test removes the pane itself
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        # Only the test setup closed a pane; hygiene closed nothing.
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertEqual(report["counts"]["protected_unknown"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+
+    def test_absent_pane_with_unreadable_runtime_still_holds(self):
+        # An unreadable runtime proves nothing about pane absence: the task is
+        # held UNKNOWN rather than silently skipped as if the pane were gone.
+        driver = FakeDriver()
+        self.legacy_released_read(driver, task_id="legacy-dark")
+        driver.readable = False
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["runtime"], "UNAVAILABLE")
+        self.assertEqual(report["counts"]["protected_unknown"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+
+    def test_registry_change_between_observation_and_close_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-race")
+        observed = product_daemon._claim_rows(self.db)
+        self.assertIsNotNone(observed)
+        conflicting = {
+            "claim_id": 999, "run_id": "another-run", "work_key": "another-work",
+            "issue": "", "owner": "someone-else", "mode": "WRITE",
+            "worktree": str(self.repo), "claimed_at": "2026-01-01T00:00:00Z",
+            "released_at": None, "outcome": None,
+        }
+        calls = {"n": 0}
+
+        def racing_rows(db):
+            # The observation read sees the released row; the revalidation read
+            # immediately before the close sees a new conflicting claim.
+            calls["n"] += 1
+            return observed if calls["n"] == 1 else observed + [conflicting]
+
+        with mock.patch.object(product_daemon, "_claim_rows",
+                               side_effect=racing_rows):
+            report = product_daemon.hygiene_report(
+                env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["protected_unknown"], 1)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_multi_owner_claim_racing_the_close_holds(self):
+        # A second owner's OPEN claim appears only at the revalidation read,
+        # after the first observation saw the exact released row. The full
+        # Registry predicate is re-proved immediately before the effect.
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-race-owner")
+        observed = product_daemon._claim_rows(self.db)
+        self.assertIsNotNone(observed)
+        foreign = {
+            "claim_id": 777, "run_id": "other-run", "work_key": "other-work",
+            "issue": "", "owner": "another-owner", "mode": "WRITE",
+            "worktree": str(self.repo), "claimed_at": "2026-01-01T00:00:00Z",
+            "released_at": None, "outcome": None,
+        }
+        calls = {"n": 0}
+
+        def racing_rows(db):
+            calls["n"] += 1
+            return observed if calls["n"] == 1 else observed + [foreign]
+
+        with mock.patch.object(product_daemon, "_claim_rows",
+                               side_effect=racing_rows):
+            report = product_daemon.hygiene_report(
+                env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["protected_unknown"], 1)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_worker_became_active_at_final_close_holds(self):
+        # The first pane check proves the own worker stopped. Immediately before
+        # the close it is active again, so the closer must not knowingly close
+        # an active worker.
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-active-race")
+        original = product_daemon._owned_pane_check
+        calls = {"n": 0}
+
+        def racing(driver_arg, task, labels):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                driver_arg._panes[pane_id]["agent_status"] = "working"
+            return original(driver_arg, task, labels)
+
+        with mock.patch.object(product_daemon, "_owned_pane_check",
+                               side_effect=racing):
+            report = product_daemon.hygiene_report(
+                env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_worker_became_foreign_at_final_close_holds(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-foreign-race")
+        original = product_daemon._owned_pane_check
+        calls = {"n": 0}
+
+        def racing(driver_arg, task, labels):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                driver_arg._agents.pop("cao-legacy-foreign-race", None)
+            return original(driver_arg, task, labels)
+
+        with mock.patch.object(product_daemon, "_owned_pane_check",
+                               side_effect=racing):
+            report = product_daemon.hygiene_report(
+                env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_task_becoming_non_terminal_before_close_holds(self):
+        # The task record is mutable too: a record that becomes non-terminal
+        # between observation and effect is never closed.
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-task-race")
+        original = product_daemon._revalidate_historical_close
+
+        def racing(**kwargs):
+            record = product_state.read_task("legacy-task-race", self.env)
+            record["status"] = "running"
+            product_state.write_task(record, self.env)
+            return original(**kwargs)
+
+        with mock.patch.object(product_daemon, "_revalidate_historical_close",
+                               side_effect=racing):
+            report = product_daemon.hygiene_report(
+                env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["protected_active"], 1)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIn(pane_id, driver._panes)
+
+    def test_verified_close_that_cannot_be_recorded_is_not_reclaimed(self):
+        # Irreducible crash window: the pane close is verified but persisting
+        # ``pane_closed`` fails. The tick reports close_failed (never closed),
+        # and a later pass sees the pane absent and claims nothing.
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(
+            driver, task_id="legacy-unrecorded")
+        real_update = product_state.update_task
+
+        def failing_update(task_id, patch, env=None):
+            if patch.get("pane_closed"):
+                raise OSError("state write unavailable")
+            return real_update(task_id, patch, env)
+
+        with mock.patch.object(product_state, "update_task",
+                               side_effect=failing_update):
+            report = product_daemon.hygiene_report(
+                env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn(pane_id, driver._panes)
+        self.assertEqual(report["counts"]["close_failed"], 1)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIsNone(
+            product_state.read_task("legacy-unrecorded", self.env)["pane_closed"])
+        second = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertEqual(sum(second["counts"].values()), 0)
+        self.assertEqual(driver.names().count("pane_close"), 1)
+
+    def test_partial_close_failure_is_reported_and_pane_remains(self):
+        driver = FakeDriver()
+        pane_id = self.legacy_released_read(driver, task_id="legacy-fail")
+
+        def boom(pane_id):
+            driver._note("pane_close", pane_id)
+            raise product_driver.DriverTransportError("close unavailable")
+
+        driver.pane_close = boom
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertIn(pane_id, driver._panes)
+        self.assertEqual(report["counts"]["closed"], 0)
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertEqual(report["counts"]["close_failed"], 1)
+        self.assertEqual(sum(report["counts"].values()), 1)
+        self.assertIsNone(
+            product_state.read_task("legacy-fail", self.env)["pane_closed"])
+
+    def test_per_tick_close_bound_limits_a_large_cohort(self):
+        driver = FakeDriver()
+        total = product_daemon._MAX_HYGIENE_CLOSES + 1
+        for index in range(total):
+            self.legacy_released_read(driver, task_id="legacy-bound-%02d" % index)
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        # One final classification per terminal pane: the applied cohort is
+        # ``closed`` only, while the cap-skipped remainder stays ``eligible``.
+        self.assertEqual(report["counts"]["closed"],
+                         product_daemon._MAX_HYGIENE_CLOSES)
+        self.assertEqual(report["counts"]["eligible"],
+                         total - product_daemon._MAX_HYGIENE_CLOSES)
+        self.assertEqual(sum(report["counts"].values()), total)
+        self.assertEqual(driver.names().count("pane_close"),
+                         product_daemon._MAX_HYGIENE_CLOSES)
+
 
 class WakeTests(DaemonCase):
     def test_manager_wake_is_deduped_across_a_restart(self) -> None:
