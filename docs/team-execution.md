@@ -225,9 +225,12 @@ on a done receipt alone. CAO never scans or signals an arbitrary process, never
 force-unlocks the Registry and never closes a pane it cannot prove is its own.
 Pane absence is the only closure CAO claims: an OS process exit it cannot prove
 through a stable recorded identity is reported as unverified, not asserted.
-Historical records written before this protocol may still hold a terminal pane;
-the opt-in, default-off daemon hygiene pass below can plan (and, when enabled,
-apply) closing those.
+Historical records written before this protocol may still hold a terminal pane.
+The opt-in, default-off daemon hygiene pass below is observe-only today: the
+accepted lifecycle closes its pane before it releases its claim, so the pass
+cannot qualify a real positive and reports such a pane `protected_unknown` and
+holds. Close a historical pane manually with the runtime's own close primitive
+until a separately designed, task-owned recovery/liveness flow exists.
 
 Team task agent names use a readable prefix and digest of their full ID.
 This prevents longer team/task names from colliding after terminal name-length
