@@ -69,6 +69,7 @@ _PRODUCT_GROUPS = frozenset(
         "team",
         "improve",
         "intake",
+        "request",
         "run",
         "start",
         "stop",
@@ -453,6 +454,13 @@ def build_parser() -> argparse.ArgumentParser:
     intake_command.add_argument("args", nargs=argparse.REMAINDER)
     intake_command.set_defaults(handler=_cmd_start)  # main dispatches separately
 
+    request_command = subcommands.add_parser(
+        "request",
+        help="send one request: routes to Intake or governed Team Execution",
+    )
+    request_command.add_argument("args", nargs=argparse.REMAINDER)
+    request_command.set_defaults(handler=_cmd_start)  # main dispatches separately
+
     for name, help_text, handler in (
         ("run", "submit a task", _cmd_run),
         ("start", "start the service (unavailable in this build)", _cmd_start),
@@ -504,6 +512,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args_list and args_list[0] == "intake":
         from . import intake_cli
         return intake_cli.main(args_list[1:])
+    if args_list and args_list[0] == "request":
+        from . import task_router
+        return task_router.main(args_list[1:])
 
     parser = build_parser()
     args = parser.parse_args(args_list)

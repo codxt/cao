@@ -48,6 +48,20 @@ class TeamCliTests(unittest.TestCase):
         code, p = self.run_cao("pause", "--id", "pilot")
         self.assertEqual((code, p["desired"]), (0, "paused"))
 
+    def test_backlog_groups_a_legacy_team_without_dispatching(self):
+        self.run_cao("init", "--file", str(self.manifest))
+        code, p = self.run_cao("backlog")
+        self.assertEqual(code, 0)
+        self.assertEqual(p["schema"], "cao.team.backlog.v1")
+        self.assertEqual(p["counts"]["teams"], 1)
+        group = p["initiatives"][0]
+        self.assertEqual(group["head"], "pilot")
+        self.assertEqual(group["classification"], "ACTIONABLE")
+        self.assertEqual(group["teams"][0]["team_id"], "pilot")
+        # The read-only backlog never dispatches or starts anything.
+        self.assertEqual(self.run_cao("status", "--id", "pilot")[1]
+                         ["tasks"]["inspect"]["status"], "pending")
+
     def test_resume_only_unknown_task_is_refused_for_pending(self):
         self.run_cao("init", "--file", str(self.manifest))
         code, p = self.run_cao("resume", "--id", "pilot", "--task", "inspect")

@@ -35,6 +35,20 @@ MAX_PARALLEL = 8
 #: A task whose durable record reached one of these can no longer change, so it
 #: can never be reported as stalled.
 _TERMINAL_TASK_STATUSES = ("complete", "stopped")
+#: Backlog grouping is a read-only projection over the immutable team records.
+#: Every stored team is preserved exactly once and each initiative group is
+#: classified by what an operator can still act on: the single supersession head
+#: is ACTIONABLE while it can progress, HISTORICAL once it is terminal, and any
+#: malformed or contradictory lineage is UNKNOWN rather than guessed.
+BACKLOG_SCHEMA = "cao.team.backlog.v1"
+BACKLOG_ACTIONABLE = "ACTIONABLE"
+BACKLOG_HISTORICAL = "HISTORICAL"
+BACKLOG_UNKNOWN = "UNKNOWN"
+#: A team whose summary status is terminal (HISTORICAL) or can still progress
+#: (ACTIONABLE). Anything else (BLOCKED, CORRUPT or an unrecognized status) is
+#: reported UNKNOWN.
+_BACKLOG_TERMINAL_TEAM_STATUSES = ("COMPLETE",)
+_BACKLOG_ACTIVE_TEAM_STATUSES = ("PENDING", "RUNNING", "PAUSED")
 
 
 class TeamError(ValueError):
@@ -824,6 +838,153 @@ def list_teams(*, env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
                            "error": _error_code(getattr(exc, "code", None),
                                                 type(exc).__name__)})
     return output
+
+
+def _backlog_entry(summary: Any) -> dict[str, Any]:
+    """One bounded, public-safe view of a stored team summary.
+
+    Only the immutable identity and the durable task statuses are kept: no
+    prompt, output, role instruction, repository path or error text is copied
+    into the backlog. A missing or ill-typed field stays absent or ``None`` so a
+    malformed record is never rounded up to a valid identity.
+    """
+
+    source = summary if isinstance(summary, Mapping) else {}
+
+    def text(value: Any) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    tasks: dict[str, str | None] = {}
+    raw_tasks = source.get("tasks")
+    if isinstance(raw_tasks, Mapping):
+        for name in sorted(raw_tasks):
+            slot = raw_tasks[name]
+            tasks[str(name)] = (slot.get("status")
+                                if isinstance(slot, Mapping) else None)
+    return {
+        "team_id": text(source.get("team_id")),
+        "initiative": text(source.get("initiative")),
+        "supersedes": text(source.get("supersedes")),
+        "desired": text(source.get("desired")) or "unknown",
+        "status": text(source.get("status")) or BACKLOG_UNKNOWN,
+        "tasks": tasks,
+    }
+
+
+def _backlog_head_class(status: str) -> str:
+    if status in _BACKLOG_TERMINAL_TEAM_STATUSES:
+        return BACKLOG_HISTORICAL
+    if status in _BACKLOG_ACTIVE_TEAM_STATUSES:
+        return BACKLOG_ACTIONABLE
+    return BACKLOG_UNKNOWN
+
+
+def _backlog_group(initiative: str | None,
+                   members: list[dict[str, Any]]) -> dict[str, Any]:
+    """Classify one initiative group and preserve every member record.
+
+    A single well-formed successor chain has exactly one head: the team no other
+    team supersedes. Every superseded predecessor is HISTORICAL, and the head is
+    ACTIONABLE/HISTORICAL/UNKNOWN by its own durable status. A duplicate team
+    id, two successors of one predecessor, a dangling or self predecessor, a
+    cycle, or more than one head makes the whole group UNKNOWN: no head is
+    guessed and no record is dropped.
+    """
+
+    by_id: dict[str, dict[str, Any]] = {}
+    ambiguous = False
+    for entry in members:
+        team_id = entry["team_id"]
+        if team_id is None or team_id in by_id:
+            ambiguous = True
+            continue
+        by_id[team_id] = entry
+    successors: dict[str, list[str]] = {}
+    for team_id, entry in by_id.items():
+        prior = entry["supersedes"]
+        if prior is None:
+            continue
+        if prior == team_id or prior not in by_id:
+            ambiguous = True
+            continue
+        successors.setdefault(prior, []).append(team_id)
+    if any(len(kids) > 1 for kids in successors.values()):
+        ambiguous = True
+    for start in by_id:
+        seen: set[str] = set()
+        cursor: str | None = start
+        while cursor is not None and cursor in by_id and cursor not in seen:
+            seen.add(cursor)
+            cursor = by_id[cursor]["supersedes"]
+        if cursor is not None and cursor in by_id and cursor in seen:
+            ambiguous = True
+            break
+    heads = [team_id for team_id in by_id if team_id not in successors]
+    if len(heads) != 1:
+        ambiguous = True
+    head = None if ambiguous else heads[0]
+    classification: dict[str, str] = {}
+    if head is not None:
+        classification[head] = _backlog_head_class(by_id[head]["status"])
+        for team_id in by_id:
+            if team_id in successors:
+                classification[team_id] = BACKLOG_HISTORICAL
+    teams = []
+    for entry in members:
+        team_id = entry["team_id"]
+        claimed = (BACKLOG_UNKNOWN if ambiguous or team_id is None
+                   else classification.get(team_id, BACKLOG_UNKNOWN))
+        teams.append({
+            **entry,
+            "successors": sorted(successors.get(team_id, [])) if team_id else [],
+            "classification": claimed,
+        })
+    group_class = (classification[head] if not ambiguous and head is not None
+                   else BACKLOG_UNKNOWN)
+    return {
+        "initiative": initiative,
+        "classification": group_class,
+        "head": head,
+        "teams": teams,
+    }
+
+
+def group_teams(summaries: Any) -> dict[str, Any]:
+    """Group team summaries by initiative and successor lineage, read-only.
+
+    The pure half of :func:`backlog`: it performs no I/O, starts nothing and
+    writes nothing, so an operator can render a truthful task-centered backlog
+    from any read-only team evidence. Every supplied record appears exactly once.
+    """
+
+    members: dict[str | None, list[dict[str, Any]]] = {}
+    for summary in summaries or ():
+        entry = _backlog_entry(summary)
+        members.setdefault(entry["initiative"], []).append(entry)
+    groups = [
+        _backlog_group(initiative, group)
+        for initiative, group in sorted(
+            members.items(), key=lambda item: (item[0] is None, item[0] or ""))
+    ]
+    counts = {"initiatives": len(groups), "teams": 0, "actionable": 0,
+              "historical": 0, "unknown": 0}
+    for group in groups:
+        for team in group["teams"]:
+            counts["teams"] += 1
+            counts[team["classification"].lower()] += 1
+    return {"schema": BACKLOG_SCHEMA, "status": "OK",
+            "initiatives": groups, "counts": counts}
+
+
+def backlog(*, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Group every stored team by initiative and successor lineage, read-only.
+
+    It reads the same durable team checkpoints ``cao team list`` reads, so a
+    legacy team without an initiative, a corrupt record and every historical
+    predecessor are all preserved and classified rather than hidden.
+    """
+
+    return group_teams(list_teams(env=env))
 
 
 def _git_head(repo: str) -> str | None:

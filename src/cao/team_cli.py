@@ -105,6 +105,9 @@ def main(arguments: Sequence[str]) -> int:
     retry.add_argument("--id", required=True)
     retry.add_argument("--task", required=True)
     subs.add_parser("list", help="inspect all stored teams")
+    subs.add_parser(
+        "backlog",
+        help="group stored teams by initiative and successor lineage (read-only)")
     try:
         args = parser.parse_args(list(arguments))
     except SystemExit as exc:
@@ -127,6 +130,8 @@ def main(arguments: Sequence[str]) -> int:
                 result = team.initialize(spec, config=config, approved=args.approved)
         elif args.command == "list":
             result = {"schema": "cao.team.list.v1", "teams": team.list_teams()}
+        elif args.command == "backlog":
+            result = team.backlog()
         elif args.command == "status":
             result = team.status(args.id)
         elif args.command == "resume":
