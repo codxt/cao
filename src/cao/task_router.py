@@ -1,48 +1,116 @@
 """The one discoverable "send to CAO" request entrypoint: a deterministic router.
 
-A caller sends exactly one bounded request document. This module classifies it
-deterministically and routes it to exactly one *existing* governed path:
+A caller sends exactly one bounded request document. CAO decides *one* finite
+route and reports it truthfully, so the caller never has to choose between the
+Intake API and the Team Execution API.
 
-* an ordinary request is admitted through the existing Intake gate, which
-  persists one durable record and starts nothing; or
+The decision vocabulary is deliberately small and closed:
+
+``BACKLOG``
+    The request is recorded for later. It is admitted through the existing
+    Intake gate (one durable, idempotent record) and nothing else happens.
+``INVESTIGATE``
+    The request needs a human decision or an investigation before any grounded
+    implementation position exists. It is still admitted durably, and it is held
+    with an actionable next step rather than guessed at.
+``IMPLEMENT``
+    The request clearly expresses implementation intent, so it becomes a visible
+    **execution candidate**. It is admitted durably *and* routed toward the
+    existing governed Team Execution path. It is only ever *started* when a
+    separately qualified, exact team manifest and actual existing operator
+    authorization are both available.
+
+An Intake admission is **never** execution consent. A work verb in the request
+text is **never** operator approval. The two mechanical routes are disjoint:
+
+* a plain request (or a ``cao.intake.request.v1`` document) is admitted through
+  the existing Intake gate, which persists one durable record; and
 * an already-shaped ``cao.team.v1`` manifest is routed to the existing CAO Team
-  Execution contract, reported read-only with the exact governed next step.
+  Execution contract, reported read-only with the exact governed next commands
+  (and, only with the operator's explicit ``--execute`` and an *existing*
+  qualification, advanced through the exact same owner API ``cao team init`` and
+  ``cao team start`` already use).
 
-The router never dispatches a team, starts an agent, grants authority, bypasses
-the Work Registry, upgrades privilege, deletes anything, auto-merges, pushes,
-deploys or creates a second store. An Intake admission is **never** execution
-consent: the two routes are disjoint, and an execution route is qualified only
-through the existing Team Execution authorization (the operator's model
-allowlist and the team approval policy). A document that cannot be classified
-with certainty is refused, never guessed.
-
-This module is the routing contract, not an orchestrator: the execution route
-records no approval and performs no effect, because only the operator's own
-governed ``cao team init``/``cao team start`` decisions authorize a team.
+The router itself never fabricates an approval, a manifest, a scope or an
+authority. It raises no privilege, bypasses no Work Registry rule, dispatches no
+worker, writes no Registry row, deletes nothing, auto-merges, pushes or deploys
+nothing, and creates no second store. A document it cannot classify with
+certainty is refused, never guessed.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
+import shlex
 import stat
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from . import intake, product_config, team, team_approval
+from . import (intake, intake_handoff, intake_triage, product_config, team,
+               team_approval)
 
-__all__ = ["main", "build_parser", "classify", "route", "SCHEMA",
-           "ROUTE_INTAKE", "ROUTE_EXECUTION", "STATUS_ROUTED", "STATUS_REFUSED",
-           "EXIT_OK", "EXIT_USAGE", "EXIT_UNAVAILABLE"]
+__all__ = [
+    "main",
+    "build_parser",
+    "classify",
+    "route",
+    "SCHEMA",
+    "ROUTE_INTAKE",
+    "ROUTE_EXECUTION",
+    "ROUTE_HOLD",
+    "DECISION_BACKLOG",
+    "DECISION_INVESTIGATE",
+    "DECISION_IMPLEMENT",
+    "DECISIONS",
+    "STATUS_ADMITTED",
+    "STATUS_PROPOSED",
+    "STATUS_EXECUTING",
+    "STATUS_ROUTED",
+    "STATUS_REFUSED",
+    "STATUS_DUPLICATE",
+    "GATE_EXACT_MANIFEST",
+    "GATE_OPERATOR_APPROVAL",
+    "GATE_HUMAN_REVIEW",
+    "GATE_CONSEQUENTIAL_EFFECT",
+    "GATE_REPOSITORY",
+    "EXIT_OK",
+    "EXIT_USAGE",
+    "EXIT_UNAVAILABLE",
+]
 
 SCHEMA = "cao.request.v1"
 
 ROUTE_INTAKE = "INTAKE"
 ROUTE_EXECUTION = "EXECUTION"
+ROUTE_HOLD = "HOLD"
 
+DECISION_BACKLOG = "BACKLOG"
+DECISION_INVESTIGATE = "INVESTIGATE"
+DECISION_IMPLEMENT = "IMPLEMENT"
+DECISIONS = (DECISION_BACKLOG, DECISION_INVESTIGATE, DECISION_IMPLEMENT)
+
+STATUS_ADMITTED = "ADMITTED"
+#: Execution was requested but is not started; the request is held with a
+#: concrete, actionable next step (the operator's approval, an exact manifest, a
+#: human review, ...). ``PROPOSED`` is the finite status for every such hold.
+STATUS_PROPOSED = "PROPOSED"
+#: Execution was actually started or is already running, proved by team
+#: evidence. Reported only when a team checkpoint backs it.
+STATUS_EXECUTING = "EXECUTING"
 STATUS_ROUTED = "ROUTED"
 STATUS_REFUSED = "REFUSED"
+STATUS_DUPLICATE = "DUPLICATE"
+
+#: The finite set of gates that hold an execution candidate. A gate is a fact,
+#: never an authority: the router reports it and names the smallest next step.
+GATE_EXACT_MANIFEST = "exact_team_manifest"
+GATE_OPERATOR_APPROVAL = "operator_approval"
+GATE_HUMAN_REVIEW = "human_review"
+GATE_CONSEQUENTIAL_EFFECT = "consequential_effect"
+GATE_REPOSITORY = "repository_scope_absent"
 
 #: The largest request document this entrypoint will read. A team manifest may
 #: carry up to MAX_TASKS long prompts, so it is bounded above an Intake
@@ -53,23 +121,107 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
 
-_ROUTED_OUTCOMES = frozenset({"ADMITTED", "DUPLICATE", STATUS_ROUTED})
+_ROUTED_OUTCOMES = frozenset({STATUS_ADMITTED, STATUS_DUPLICATE, STATUS_ROUTED,
+                              STATUS_PROPOSED, STATUS_EXECUTING})
+
+#: An explicit "for later" declaration. A request that asks to be deferred stays
+#: backlog even when it also contains a work verb.
+_LATER = re.compile(
+    r"\b(later|backlog|someday|defer|deferred|postpone|postponed|not now|"
+    r"not yet|no rush|for later|queue for|triage later|roadmap)\b",
+    re.IGNORECASE,
+)
+
+#: The reserved categories that turn a request into a held consequential one.
+_CONSEQUENTIAL_VERDICTS = ("REQUESTED", "AMBIGUOUS")
+
+#: A leading prohibition is an imperative limitation, not a question opener: B3's
+#: question predicate reads a leading "do" as interrogative, so "do not implement
+#: X" would otherwise be held as a question instead of read as a negated
+#: directive.
+_DIRECTIVE_NEGATION = re.compile(
+    r"^(?:do not|don't|never|no|not|without)\b", re.IGNORECASE)
+
+#: Common positive action verbs the shared B3 work predicate predates. They are
+#: matched here, task-router-locally, rather than by silently broadening
+#: ``intake_triage._WORK_SHAPED`` for its other callers: an explicit "execute
+#: now" or "continue the batch" is implementation intent, not a backlog note.
+_WORK_EXTRA = re.compile(
+    r"\b(execute|executes|executing|executed|run|runs|running|ran|continue|"
+    r"continues|continuing|continued|resume|resumes|resuming|resumed|finish|"
+    r"finishes|finishing|finished|complete|completes|completing|completed|"
+    r"proceed|proceeds|proceeding|proceeded)\b",
+    re.IGNORECASE,
+)
+
+#: Imperative review/investigation verbs. A request to look at, audit or
+#: investigate something is a genuine hold for a human decision: neither a plain
+#: backlog note nor, on its own, an implementation directive.
+_REVIEW_SHAPED = re.compile(
+    r"\b(review|reviews|reviewing|reviewed|audit|audits|auditing|audited|"
+    r"inspect|inspects|inspecting|inspected|investigate|investigates|"
+    r"investigating|investigated|analyze|analyzes|analyzing|analyzed|analyse|"
+    r"analyses|analysing|analysed|assess|assesses|assessing|assessed|diagnose|"
+    r"diagnoses|diagnosing|diagnosed|compare|compares|comparing|compared|"
+    r"research|researches|researching|researched|check|checks|checking|"
+    r"checked)\b",
+    re.IGNORECASE,
+)
+
+#: A quoted span is a mention, never a directive: a caller quoting an example or
+#: a policy string does not thereby authorize the quoted verb. Backticks and
+#: straight double quotes are stripped before the local verb predicates run;
+#: single quotes are left alone so contractions ("don't") keep their negation.
+_QUOTED = re.compile(r"`[^`]*`|\"[^\"]*\"")
+
+
+def _unquote(body: str) -> str:
+    return _QUOTED.sub(" ", body)
 
 
 def _emit(payload: Mapping[str, Any]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
 
 
-def _refusal(code: str, message: str, *,
-             status: str = STATUS_REFUSED) -> dict[str, Any]:
+def _execution(*, requested: bool, started: bool, gate: str | None,
+               needs: Sequence[str] = (), next_steps: Sequence[str] = ()
+               ) -> dict[str, Any]:
+    """The one execution block, used by every truthful outcome.
+
+    ``requested`` and ``started`` are kept separate on purpose: a caller can see
+    that execution was *asked for* while nothing has been *started*.
+    """
+
     return {
+        "requested": bool(requested),
+        "started": bool(started),
+        "gate": gate,
+        "needs": list(needs),
+        "next": list(next_steps),
+    }
+
+
+def _payload(status: str, decision: str | None, route: str | None,
+             execution: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "schema": SCHEMA,
         "status": status,
-        "route": None,
+        "decision": decision,
+        "route": route,
         "authority": "none",
         "dispatch": False,
-        "error": {"code": code, "verdict": status, "message": message},
+        "execution": dict(execution),
     }
+    payload.update(extra)
+    return payload
+
+
+def _refusal(code: str, message: str, *,
+             status: str = STATUS_REFUSED) -> dict[str, Any]:
+    payload = _payload(status, None, None,
+                       _execution(requested=False, started=False, gate=None))
+    payload["error"] = {"code": code, "verdict": status, "message": message}
+    return payload
 
 
 def classify(document: Any) -> str | None:
@@ -95,43 +247,310 @@ def classify(document: Any) -> str | None:
     return None
 
 
-def _route_intake(document: Mapping[str, Any], *, env: Mapping[str, str] | None,
-                  dry_run: bool, clock: Any) -> dict[str, Any]:
-    """Admit one ordinary request through the existing Intake gate.
+# ---------------------------------------------------------------------------
+# The deterministic decision for opaque request text
+# ---------------------------------------------------------------------------
 
-    A plain request that omitted the Intake schema is completed from the
-    document's own ``item_id``/``body`` (the exact fields :func:`classify`
-    required) before the existing gate validates it; no identity is invented and
-    no other field is added.
+
+def _unnegated(pattern: re.Pattern[str], body: str) -> bool:
+    """Whether ``pattern`` matches outside a negating directive.
+
+    Negation is scoped exactly as the existing B6 classifier scopes it -- a
+    contrastive coordinator ("do not merge, but implement the fix") ends an
+    earlier negation -- so an explicit request after a contrast is still seen as
+    positive, while a plain negated directive is not.
+    """
+
+    for clause in intake_handoff._clauses(body):
+        for match in pattern.finditer(clause):
+            scope = intake_handoff._negation_scope_start(clause, match.start())
+            scoped = clause[scope:match.start()]
+            if not scoped.strip():
+                return True
+            if not (intake_handoff._NEG_START.search(scoped)
+                    or intake_handoff._NEG_ANY.search(scoped)
+                    or intake_handoff._NEG_LOCAL.search(scoped)):
+                return True
+    return False
+
+
+def _positive_work(body: str) -> bool:
+    """Whether a work verb appears outside a negating directive.
+
+    ``intake_triage._work_shaped`` alone would read "do not implement X" as an
+    implementation directive, and it predates several common action verbs
+    ("execute", "run", "continue", "resume", "finish", "complete", "proceed").
+    Negation is scoped exactly as the existing B6 classifier scopes it, and the
+    local additions are consulted in the same task-router-local way so the shared
+    advisory predicate is never silently broadened. A quoted span is a mention,
+    not a directive.
+    """
+
+    prose = _unquote(body)
+    return (_unnegated(intake_triage._WORK_SHAPED, prose)
+            or _unnegated(_WORK_EXTRA, prose))
+
+
+def _imperative_review(body: str) -> bool:
+    """Whether an imperative review/investigation verb appears, un-negated.
+
+    A request to review, audit or investigate something is a genuine hold for a
+    human decision: it is neither a plain backlog note nor, on its own, an
+    implementation directive. It is consulted only *after* explicit positive work
+    has been ruled out, so a mixed "review then implement the fix" stays
+    IMPLEMENT. A quoted span is a mention, not a directive.
+    """
+
+    return _unnegated(_REVIEW_SHAPED, _unquote(body))
+
+
+def _question(body: str) -> bool:
+    """Whether the text is a genuine question rather than an imperative.
+
+    Reuses the existing B3 question predicate, but a leading prohibition
+    ("do not ...", "never ...") is an imperative limitation, not an
+    interrogative: B3 reads a leading "do" as a question opener, so it is
+    excluded here rather than turning "do not implement X" into a hold.
+    """
+
+    return (intake_triage._question_shaped(body)
+            and not _DIRECTIVE_NEGATION.match(body.strip()))
+
+
+def _classify_text(body: str) -> tuple[str, dict[str, Any]]:
+    """The finite decision for one plain-text request body.
+
+    First match wins, on a documented deterministic rule table (no model, no
+    hidden state). Text is opaque data: it is inspected, never executed. The
+    shape predicates are reused from the existing B3 advisory triage so a request
+    is classified the same way an operator's triage would read it.
+    """
+
+    try:
+        verdicts = intake_handoff.classify_effects(body)
+    except intake_handoff.HandoffError:
+        # B6 could not classify the text. Fail closed: an unreadable classifier
+        # may hide a consequential effect, so the request is held for a human
+        # rather than silently recorded (or executed) as plain work.
+        return DECISION_INVESTIGATE, {"gate": GATE_CONSEQUENTIAL_EFFECT,
+                                      "effects_unknown": True}
+    effects = {category: verdict for category, verdict in verdicts.items()
+               if verdict in _CONSEQUENTIAL_VERDICTS}
+    if effects:
+        return DECISION_INVESTIGATE, {"gate": GATE_CONSEQUENTIAL_EFFECT,
+                                      "effects": effects}
+    if _LATER.search(body):
+        return DECISION_BACKLOG, {"gate": None}
+    risk = intake_triage._risk_flags(body)
+    if risk:
+        return DECISION_INVESTIGATE, {"gate": GATE_HUMAN_REVIEW,
+                                      "risk_flags": list(risk)}
+    # A question-shaped request is held for investigation even when it contains a
+    # work verb: the intent is not a clear implementation directive, and guessing
+    # "yes, implement it" from a question is exactly what this router must not do.
+    if _question(body):
+        return DECISION_INVESTIGATE, {"gate": GATE_HUMAN_REVIEW}
+    # Only a work verb outside a negating directive is implementation intent: a
+    # negative directive ("do not implement X") is recorded, never executed.
+    if _positive_work(body):
+        return DECISION_IMPLEMENT, {"gate": GATE_EXACT_MANIFEST}
+    # An imperative review/investigation request ("review the changes",
+    # "investigate the failure") is a hold for a human decision, not a plain
+    # backlog note. It is checked after positive work so a mixed request that
+    # names explicit work ("review then implement the fix") stays IMPLEMENT.
+    if _imperative_review(body):
+        return DECISION_INVESTIGATE, {"gate": GATE_HUMAN_REVIEW}
+    return DECISION_BACKLOG, {"gate": None}
+
+
+def _triage_command(submission_id: str) -> str:
+    return f"cao intake triage --id {submission_id}"
+
+
+def _route_text(document: Mapping[str, Any], *, env: Mapping[str, str] | None,
+                dry_run: bool, clock: Any) -> dict[str, Any]:
+    """Decide and durably admit one ordinary request.
+
+    The durable Intake admission is the one persisted effect and always happens
+    (idempotently); the decision then makes an implementation-intent request
+    *visible* as an execution candidate instead of burying it in the backlog. The
+    request text is never treated as approval and nothing is started here.
     """
 
     if document.get("schema") is None:
         document = {**document, "schema": intake.REQUEST_SCHEMA}
+    # Normalize first (no store on a dry run) so the decision is made on exactly
+    # the redacted, bounded body the durable record will carry.
+    record = intake.normalize_submission(document, clock=clock)
+    decision, detail = _classify_text(record["body"])
     if dry_run:
-        record = intake.normalize_submission(document, clock=clock)
-        return {
-            "schema": SCHEMA, "status": STATUS_ROUTED, "route": ROUTE_INTAKE,
-            "authority": "none", "dispatch": False, "dry_run": True,
-            "source": "intake", "submission": intake.public_view(record),
+        admission = {
+            "status": STATUS_ADMITTED,
+            "duplicate": False,
+            "submission": intake.public_view(record),
         }
-    admission = intake.submit(document, env=env, clock=clock)
-    return {
-        "schema": SCHEMA, "status": admission["status"], "route": ROUTE_INTAKE,
-        "authority": "none", "dispatch": False, "dry_run": False,
-        "source": "intake", "duplicate": admission["duplicate"],
-        "submission": admission["submission"],
+    else:
+        admission = intake.submit(document, env=env, clock=clock)
+    submission_id = admission["submission"]["submission_id"]
+    duplicate = admission["status"] == STATUS_DUPLICATE
+    status = STATUS_DUPLICATE if duplicate else STATUS_ADMITTED
+
+    if decision == DECISION_IMPLEMENT:
+        execution = _execution(
+            requested=True, started=False, gate=GATE_EXACT_MANIFEST,
+            needs=("exact_team_manifest", "operator_approval"),
+            next_steps=(_triage_command(submission_id),),
+        )
+        if not duplicate:
+            status = STATUS_PROPOSED
+        return _payload(status, decision, ROUTE_EXECUTION, execution,
+                        dry_run=bool(dry_run), source="intake",
+                        duplicate=duplicate,
+                        submission=admission["submission"])
+    if decision == DECISION_INVESTIGATE:
+        gate = detail.get("gate") or GATE_HUMAN_REVIEW
+        needs = ["human_review"]
+        if gate == GATE_CONSEQUENTIAL_EFFECT:
+            needs = ["human_review", "consequential_effect"]
+        execution = _execution(
+            requested=False, started=False, gate=gate, needs=needs,
+            next_steps=(_triage_command(submission_id),),
+        )
+        if not duplicate:
+            status = STATUS_PROPOSED
+        return _payload(status, decision, ROUTE_HOLD, execution,
+                        dry_run=bool(dry_run), source="intake",
+                        duplicate=duplicate,
+                        submission=admission["submission"])
+    # BACKLOG: recorded for later; no execution was requested.
+    execution = _execution(
+        requested=False, started=False, gate=None,
+        next_steps=(_triage_command(submission_id),),
+    )
+    return _payload(status, DECISION_BACKLOG, ROUTE_INTAKE, execution,
+                    dry_run=bool(dry_run), source="intake",
+                    duplicate=duplicate,
+                    submission=admission["submission"])
+
+
+# ---------------------------------------------------------------------------
+# The governed Team Execution route
+# ---------------------------------------------------------------------------
+
+
+def _quote(reference: str | None) -> str | None:
+    """A shell-safe rendering of a manifest path, or ``None`` when absent.
+
+    An absent path yields no command rather than an unquoted placeholder that
+    reads like a runnable command with a literal ``<manifest.json>`` argument.
+    """
+
+    if reference is None:
+        return None
+    return shlex.quote(os.fspath(reference))
+
+
+def _governed_commands(source: str | None, mode: str,
+                       team_id: str) -> list[str]:
+    """The exact existing commands the accountable operator must run.
+
+    Paths are shell-quoted so a checkout path with spaces or metacharacters
+    cannot make the printed command ambiguous or unsafe. The commands are
+    ``cao team plan``/``init``/``start`` verbatim -- the router adds no authority
+    flag and never an ``--approved`` on the operator's behalf.
+    """
+
+    reference = _quote(source)
+    if reference is None:
+        return []
+    commands = [f"cao team plan --file {reference}"]
+    if mode == "chat":
+        commands.append(f"cao team init --file {reference} --approved")
+    else:
+        commands.append(f"cao team init --file {reference}")
+    commands.append(f"cao team start --id {team_id}")
+    return commands
+
+
+def _team_evidence(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """The minimal, public-safe team evidence that backs an EXECUTING status."""
+
+    evidence: dict[str, Any] = {
+        "team_id": summary.get("team_id"),
+        "desired": summary.get("desired"),
+        "status": summary.get("status"),
+        "tasks": len(summary.get("tasks") or {}),
     }
+    if summary.get("initiative") is not None:
+        evidence["initiative"] = summary["initiative"]
+    proof = summary.get("approval")
+    if isinstance(proof, Mapping):
+        evidence["approval"] = {"method": proof.get("method"),
+                                "spec_sha256": proof.get("spec_sha256")}
+    return evidence
 
 
-def _route_execution(spec: Any, *, config: Any,
-                     source: str | None) -> dict[str, Any]:
-    """Report the existing governed Team Execution route for one manifest.
+def _team_running(summary: Mapping[str, Any]) -> bool:
+    """Whether a dispatched worker slot is actually running.
 
-    The manifest is structurally validated and each resolved work/review route
-    is independently qualified against the existing Team Execution
-    authorization (the operator's model allowlist and approval policy). The
-    route records no approval and performs no effect: it returns the exact
-    governed next commands the accountable operator must run.
+    ``desired == "running"`` is intent, not execution, and an unstarted
+    ``PENDING`` team is not an agent: only a task slot the daemon put into
+    ``running`` proves an agent actually started. An early/transient idle -- a
+    worker that reported idle before a settled result -- leaves its slot running,
+    so a started agent is still reported as started.
+    """
+
+    tasks = summary.get("tasks")
+    if not isinstance(tasks, Mapping):
+        return False
+    return any(isinstance(slot, Mapping) and slot.get("status") == "running"
+               for slot in tasks.values())
+
+
+def _waiting_next_steps(team_id: str, summary: Mapping[str, Any], *,
+                        blocked: bool, commands: Sequence[str]) -> list[str]:
+    """The smallest exact next step when a team exists but is not running yet.
+
+    An unapproved chat team needs the operator's own approval commands; a paused
+    team needs ``cao team start``; a team whose desired state is already running
+    but that has dispatched no worker only needs the existing daemon's reconcile
+    (a manual ``cao team tick``).
+    """
+
+    if blocked:
+        return list(commands)
+    if summary.get("desired") == "running":
+        return [f"cao team tick --id {team_id}"]
+    return [f"cao team start --id {team_id}"]
+
+
+def _missing_repositories(spec: Mapping[str, Any]) -> list[str]:
+    """The task repositories that are not readable directories right now.
+
+    Only consulted when the operator explicitly asks to execute: an exact manifest
+    that names an absent checkout is held, never started against a path that
+    cannot exist.
+    """
+
+    missing: list[str] = []
+    for task in spec["tasks"]:
+        repo = task["repo"]
+        if not os.path.isdir(repo) and repo not in missing:
+            missing.append(repo)
+    return missing
+
+
+def _route_execution(spec: Any, *, env: Mapping[str, str] | None, config: Any,
+                     source: str | None, execute: bool, dry_run: bool
+                     ) -> dict[str, Any]:
+    """Route one ``cao.team.v1`` manifest to the governed Team Execution path.
+
+    Without ``--execute`` this is a read-only report that also reconciles an
+    already-existing team (so a second identical request never looks like a new
+    start). With ``--execute`` the request is only ever advanced through the
+    existing owner API (``team.initialize``/``team.set_desired``) when the
+    existing operator authorization is already present: chat mode needs a saved
+    admission, and the text itself is never approval.
     """
 
     try:
@@ -166,51 +585,184 @@ def _route_execution(spec: Any, *, config: Any,
         mode = team_approval.policy(resolved)["mode"]
     except team_approval.ApprovalError as exc:
         return _refusal(getattr(exc, "code", None) or "TEAM_INVALID", str(exc))
-    reference = source or "<manifest.json>"
-    next_commands = [f"cao team plan --file {reference}"]
-    if mode == "chat":
-        next_commands.append(f"cao team init --file {reference} --approved")
-    else:
-        next_commands.append(f"cao team init --file {reference}")
-    next_commands.append(f"cao team start --id {selected['team_id']}")
-    return {
-        "schema": SCHEMA, "status": STATUS_ROUTED, "route": ROUTE_EXECUTION,
-        "authority": "none", "dispatch": False, "dry_run": False,
-        "source": "team_execution",
-        "team_id": selected["team_id"],
-        "initiative": selected.get("initiative"),
-        "spec_sha256": team.fingerprint(selected),
-        "authorization": {
-            "authority_source": "team_execution",
-            "approval_mode": mode,
-            "independent_authorization_required": mode == "chat",
-        },
-        "next_commands": next_commands,
+
+    team_id = selected["team_id"]
+    commands = _governed_commands(source, mode, team_id)
+    authorization = {
+        "authority_source": "team_execution",
+        "approval_mode": mode,
+        "independent_authorization_required": mode == "chat",
     }
+    try:
+        existing = team._read(team_id, env)
+    except team.TeamError as exc:
+        return _refusal(getattr(exc, "code", None) or "TEAM_INVALID", str(exc))
+    if existing is not None and existing["spec_hash"] != team.fingerprint(selected):
+        return _refusal(
+            "TEAM_IDENTITY_CONFLICT",
+            "an existing team already uses this id with a different immutable "
+            "manifest; the router never replaces or merges it",
+        )
+
+    if not execute:
+        # Read-only report. Reconcile an already-existing team so a repeat
+        # request reports what is true instead of proposing a duplicate start.
+        if existing is None:
+            execution = _execution(
+                requested=True, started=False, gate=GATE_OPERATOR_APPROVAL
+                if mode == "chat" else None,
+                needs=("operator_approval",) if mode == "chat" else (),
+                next_steps=commands,
+            )
+            return _payload(
+                STATUS_ROUTED, DECISION_IMPLEMENT, ROUTE_EXECUTION, execution,
+                dry_run=bool(dry_run), source="team_execution",
+                team_id=team_id, initiative=selected.get("initiative"),
+                spec_sha256=team.fingerprint(selected),
+                authorization=authorization, next_commands=commands,
+            )
+        summary = team.status(team_id, env=env)
+        started = _team_running(summary)
+        blocked = mode == "chat" and existing.get("admission") is None
+        next_steps = ([] if started
+                      else _waiting_next_steps(team_id, summary,
+                                               blocked=blocked,
+                                               commands=commands))
+        execution = _execution(
+            requested=True, started=started,
+            gate=GATE_OPERATOR_APPROVAL if blocked and not started else None,
+            needs=("operator_approval",) if blocked and not started else (),
+            next_steps=next_steps,
+        )
+        return _payload(
+            STATUS_EXECUTING if started else STATUS_PROPOSED, DECISION_IMPLEMENT,
+            ROUTE_EXECUTION, execution,
+            dry_run=bool(dry_run), source="team_execution",
+            team_id=team_id, initiative=selected.get("initiative"),
+            spec_sha256=team.fingerprint(selected),
+            authorization=authorization,
+            next_commands=next_steps,
+            team=_team_evidence(summary),
+        )
+
+    # --execute: only route into the owner path where authorization already
+    # exists. In chat mode that is a saved admission; the router never records
+    # one, so an unapproved or absent team is held with the exact next commands.
+    approved_existing = existing is not None and existing.get("admission") is not None
+    if mode == "chat" and not approved_existing:
+        execution = _execution(
+            requested=True, started=False, gate=GATE_OPERATOR_APPROVAL,
+            needs=("operator_approval",), next_steps=commands,
+        )
+        return _payload(
+            STATUS_PROPOSED, DECISION_IMPLEMENT, ROUTE_EXECUTION, execution,
+            dry_run=bool(dry_run), source="team_execution",
+            team_id=team_id, initiative=selected.get("initiative"),
+            spec_sha256=team.fingerprint(selected),
+            authorization=authorization, next_commands=commands,
+        )
+    missing = _missing_repositories(selected)
+    if missing:
+        execution = _execution(
+            requested=True, started=False, gate=GATE_REPOSITORY,
+            needs=("readable_repository",), next_steps=commands,
+        )
+        return _payload(
+            STATUS_PROPOSED, DECISION_IMPLEMENT, ROUTE_EXECUTION, execution,
+            dry_run=bool(dry_run), source="team_execution",
+            team_id=team_id, initiative=selected.get("initiative"),
+            spec_sha256=team.fingerprint(selected),
+            authorization=authorization, next_commands=commands,
+        )
+    if dry_run:
+        execution = _execution(requested=True, started=False,
+                               gate=None, next_steps=commands)
+        return _payload(
+            STATUS_PROPOSED, DECISION_IMPLEMENT, ROUTE_EXECUTION, execution,
+            dry_run=True, source="team_execution",
+            team_id=team_id, initiative=selected.get("initiative"),
+            spec_sha256=team.fingerprint(selected),
+            authorization=authorization, next_commands=commands,
+        )
+    try:
+        # The exact existing owner API, with no new authority flag: initialize is
+        # idempotent on an identical manifest, set_desired re-verifies the
+        # admission itself, and neither dispatches a worker nor writes a claim.
+        team.initialize(selected, env=env, config=resolved, approved=False)
+        summary = team.set_desired(team_id, "running", env=env)
+    except team.TeamAdmissionError as exc:
+        execution = _execution(
+            requested=True, started=False, gate=GATE_OPERATOR_APPROVAL,
+            needs=("operator_approval",), next_steps=commands,
+        )
+        payload = _payload(
+            STATUS_PROPOSED, DECISION_IMPLEMENT, ROUTE_EXECUTION, execution,
+            dry_run=False, source="team_execution",
+            team_id=team_id, initiative=selected.get("initiative"),
+            spec_sha256=team.fingerprint(selected),
+            authorization=authorization, next_commands=commands,
+        )
+        payload["error"] = {"code": getattr(exc, "code", None) or
+                            "TEAM_APPROVAL_REQUIRED",
+                            "verdict": STATUS_PROPOSED, "message": str(exc)}
+        return payload
+    except (team.TeamError, product_config.ProductConfigError) as exc:
+        return _refusal(getattr(exc, "code", None) or "TEAM_INVALID", str(exc))
+    # ``--execute`` reuses the exact owner API ``cao team init`` / ``cao team
+    # start`` already use, but setting the desired state dispatches no worker: it
+    # is intent, not an agent. Only a slot the daemon actually put into
+    # ``running`` is reported as started, so a just-advanced team is PROPOSED
+    # (waiting for the existing daemon's reconcile), never falsely EXECUTING.
+    started = _team_running(summary)
+    next_steps = ([] if started
+                  else _waiting_next_steps(team_id, summary, blocked=False,
+                                           commands=commands))
+    return _payload(
+        STATUS_EXECUTING if started else STATUS_PROPOSED, DECISION_IMPLEMENT,
+        ROUTE_EXECUTION,
+        _execution(requested=True, started=started, gate=None,
+                   next_steps=next_steps),
+        dry_run=False, source="team_execution",
+        team_id=team_id, initiative=selected.get("initiative"),
+        spec_sha256=team.fingerprint(selected),
+        authorization=authorization, next_commands=next_steps,
+        team=_team_evidence(summary),
+    )
 
 
 def route(document: Any, *, env: Mapping[str, str] | None = None,
           config: Any = None, source: str | None = None,
-          dry_run: bool = False, clock: Any = None) -> dict[str, Any]:
+          execute: bool = False, dry_run: bool = False,
+          clock: Any = None) -> dict[str, Any]:
     """Route one request document deterministically and fail closed.
 
-    The two routes are disjoint: an Intake request is only ever admitted, a
-    ``cao.team.v1`` manifest is only ever reported to the governed Team
-    Execution path. Neither route starts work, so no caller can obtain a first
-    WRITE dispatch, a grant or a Registry effect from this entrypoint.
+    The two mechanical routes are disjoint: an Intake request is admitted (and
+    classified), a ``cao.team.v1`` manifest is reported to the governed Team
+    Execution path. Nothing is dispatched by either route; a worker starts only
+    later, through the existing daemon's own tick over an authorized team.
     """
 
     kind = classify(document)
     if kind == ROUTE_INTAKE:
+        if execute:
+            # Execution needs an exact manifest; a plain request can be an
+            # execution *candidate*, but the flag is never silently ignored.
+            return _refusal(
+                "EXECUTION_REQUIRES_MANIFEST",
+                "a plain request cannot be executed directly; provide an exact "
+                "cao.team.v1 manifest with --file",
+            )
         try:
-            return _route_intake(document, env=env, dry_run=dry_run, clock=clock)
+            return _route_text(document, env=env, dry_run=dry_run, clock=clock)
         except intake.IntakeUnavailable as exc:
             return _refusal(getattr(exc, "code", None) or "INTAKE_UNAVAILABLE",
                             str(exc), status="UNAVAILABLE")
         except intake.IntakeError as exc:
-            return _refusal(getattr(exc, "code", None) or "INTAKE_INVALID", str(exc))
+            return _refusal(getattr(exc, "code", None) or "INTAKE_INVALID",
+                            str(exc))
     if kind == ROUTE_EXECUTION:
-        return _route_execution(document, config=config, source=source)
+        return _route_execution(document, env=env, config=config, source=source,
+                                execute=execute, dry_run=dry_run)
     return _refusal(
         "UNKNOWN_REQUEST",
         "the request is neither a valid Intake request nor a cao.team.v1 "
@@ -277,8 +829,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cao request",
         description=(
-            "Send one request to CAO. It routes deterministically to Intake or to "
-            "the existing governed Team Execution path; it dispatches nothing."
+            "Send one request to CAO. CAO decides BACKLOG (recorded for later), "
+            "INVESTIGATE or IMPLEMENT, routes to the existing Intake or governed "
+            "Team Execution path, and dispatches nothing."
         ),
     )
     parser.add_argument("--file", metavar="PATH",
@@ -287,8 +840,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stable item id for a plain-text request")
     parser.add_argument("--text", metavar="TEXT",
                         help="plain-text request body")
+    parser.add_argument("--execute", action="store_true",
+                        help=("route an exact qualified manifest into the existing "
+                              "Team Execution owner path; it never records approval "
+                              "and only advances a team whose authorization exists"))
     parser.add_argument("--dry-run", action="store_true",
-                        help="classify and validate; admit nothing")
+                        help="classify and validate; admit nothing and start nothing")
+    parser.add_argument("--json", action="store_true",
+                        help="accepted for compatibility; output is always JSON")
     return parser
 
 
@@ -299,14 +858,17 @@ def _error(code: str, message: str) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args_list = [arg for arg in (argv or ()) if arg != "--json"]
     parser = build_parser()
     try:
-        args = parser.parse_args(args_list)
+        args = parser.parse_args(list(argv or ()))
     except SystemExit as exc:
         return int(exc.code)
     if args.file and (args.item_id or args.text):
         return _error("USAGE", "--file cannot be combined with --item-id/--text")
+    if args.dry_run and args.execute:
+        return _error("USAGE", "--dry-run cannot be combined with --execute")
+    if args.execute and not args.file:
+        return _error("USAGE", "--execute requires an exact --file team manifest")
     if args.file:
         try:
             document = _load_document(args.file)
@@ -319,7 +881,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         source = None
     else:
         return _error("USAGE", "request requires --file, or --item-id and --text")
-    result = route(document, source=source, dry_run=bool(args.dry_run))
+    result = route(document, source=source, execute=bool(args.execute),
+                   dry_run=bool(args.dry_run))
     _emit(result)
     return EXIT_OK if result.get("status") in _ROUTED_OUTCOMES else EXIT_UNAVAILABLE
 

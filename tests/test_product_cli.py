@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from cao import (
+    intake,
     product_cli,
     product_config,
     product_daemon,
@@ -228,9 +229,34 @@ class RequestEntrypointTests(CliCase):
         self.assertEqual(code, product_cli.EXIT_OK)
         payload = json.loads(output)
         self.assertEqual(payload["schema"], "cao.request.v1")
-        self.assertEqual(payload["route"], "INTAKE")
-        self.assertEqual(payload["status"], "ADMITTED")
+        # "fix it" clearly expresses implementation intent, so the single
+        # entrypoint surfaces it as an execution candidate, not backlog.
+        self.assertEqual(payload["decision"], "IMPLEMENT")
+        self.assertEqual(payload["route"], "EXECUTION")
+        self.assertEqual(payload["status"], "PROPOSED")
         self.assertFalse(payload["dispatch"])
+        self.assertFalse(payload["execution"]["started"])
+
+    def test_request_dry_run_corrects_the_observed_false_backlog(self) -> None:
+        # The two exactly-observed requests that a production-shaped dry run
+        # routed to BACKLOG: an imperative implementation request and an
+        # imperative review request. Both are proved at the ``./cao request``
+        # ``--dry-run`` boundary; a dry run admits nothing.
+        for body, decision in (
+                ("Execute the approved routing implementation now", "IMPLEMENT"),
+                ("Review whether the routing needs further changes",
+                 "INVESTIGATE")):
+            with self.subTest(body=body):
+                code, output = run_cli(
+                    ["request", "--item-id", "obs", "--text", body, "--dry-run"])
+                self.assertEqual(code, product_cli.EXIT_OK)
+                payload = json.loads(output)
+                self.assertEqual(payload["schema"], "cao.request.v1")
+                self.assertEqual(payload["decision"], decision)
+                self.assertTrue(payload["dry_run"])
+                self.assertFalse(payload["dispatch"])
+                self.assertFalse(payload["execution"]["started"])
+                self.assertEqual(intake.list_submissions(), [])
 
 
 class DoctorCliTests(CliCase):
