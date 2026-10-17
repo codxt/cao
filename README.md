@@ -71,6 +71,14 @@ exists. See
 [`docs/intake.md`](docs/intake.md) and the
 [B3–B5 governed-intake roadmap](docs/intake-roadmap.md).
 
+`cao request` is the single send-to-CAO entrypoint: one bounded request is
+decided `BACKLOG` (recorded for later), `INVESTIGATE` or `IMPLEMENT`, and is
+routed to the existing Intake or governed Team Execution path without
+dispatching anything. An implementation-intent request becomes a visible
+execution candidate, but only a separately qualified exact team manifest and an
+existing operator authorization can start one; the request text is never
+approval.
+
 ## Install
 
 Requires Python 3.10+ and a POSIX `sh`. The read-only core is pure Python and
