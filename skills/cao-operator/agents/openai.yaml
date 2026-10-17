@@ -1,0 +1,3 @@
+interface:
+  display_name: "CAO Operator"
+  short_description: "Inspect and operate the CAO AgentOps control plane safely"
