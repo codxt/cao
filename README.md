@@ -125,6 +125,17 @@ installing:
 PYTHONPATH=src python3 -m cao --help
 ```
 
+### Portable agent skill
+
+A first-party, vendor-neutral operator skill ships at
+[`skills/cao-operator/`](skills/cao-operator/). It teaches a coding agent to
+inspect and operate CAO within its gates, keeping the effectful product `./cao`
+CLI separate from the read-only `python -m cao` CLI. Installing it only makes
+the instructions discoverable; it grants no authorization and no live CAO
+access. See [`docs/agent-skill.md`](docs/agent-skill.md) for portable symlink
+installation into `~/.agents/skills`, `~/.codex/skills` and
+`~/.config/opencode/skills`.
+
 ## Team Execution
 
 The product launcher supports specialist team roles, declared dependencies,
