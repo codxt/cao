@@ -472,42 +472,57 @@ rm -rf "$PILOT"
 Do not touch any workspace, pane, session or process this pilot did not create,
 and do not stop the runtime's own server.
 
-## 12. Historical pane hygiene (opt-in, default off)
+## 12. Historical pane hygiene (observe-only; activation not ready)
 
-A fresh CAO only **observes and plans**: it never closes a historical pane
-until an operator explicitly opts in. The existing daemon performs one bounded
-hygiene pass per tick and reports it on the existing status surface under
-`hygiene` (counts only, never raw process output):
+A fresh CAO only **observes and plans**: it never closes a historical pane. The
+existing daemon performs one bounded hygiene pass per tick and reports it on the
+existing status surface under `hygiene` (counts only, never raw process output):
 
 ```sh
 ./cao daemon status | python3 -c "import json,sys;print(json.load(sys.stdin)['hygiene'])"
 ```
 
-Expected with no configuration: `"mode": "plan"`, and `eligible` naming any
-CAO-owned accepted terminal orphan panes. Nothing is closed. The classification
-counts are `eligible`, `closed`, `protected_active`, `protected_unknown`,
-`unowned`, `missing_pane`, `close_failed` and `process_leak`.
+Expected with no configuration: `"mode": "plan"`. The classification counts are
+`eligible`, `closed`, `protected_active`, `protected_unknown`, `unowned`,
+`missing_pane`, `close_failed` and `process_leak`.
 
-To allow closing only its own proved orphans, the operator adds a typed
-`daemon` section to the product config (`$XDG_CONFIG_HOME/cao/config.json`):
+**Activation is not ready.** `hygiene_enabled` defaults to `false` and
+`hygiene_dry_run` defaults to `true`, and both must stay that way until a
+separately designed, task-owned recovery/liveness flow exists. The generic pass
+cannot qualify a real positive today:
 
-```json
-{
-  "daemon": {"hygiene_enabled": true, "hygiene_dry_run": false}
-}
-```
+* the accepted native lifecycle closes the exact owned pane and records
+  `pane_closed` **before** it releases the claim (`cao run`, `cao stop`), so a
+  real released terminal task has **no live owned pane** at all;
+* a terminal pane observed **present** is therefore an unexpected reappearance
+  or identity conflict. It is reported `protected_unknown` and held, never
+  `eligible` and never closed, whether or not the record also carries a
+  released-claim and pane-close disposition;
+* a terminal record without a durable released claim **and** a matching verified
+  close is likewise `protected_unknown` and held. A terminal pane that is
+  simply absent is skipped and does not inflate the held counts.
 
-`hygiene_enabled` defaults to `false` and `hygiene_dry_run` defaults to `true`,
-so both must be set deliberately. A pane is eligible only when it is proved to
-belong to this CAO install (matching `cao-review-<task_id>` label), to be free
-of any active or foreign worker, to have no live Registry claim and no dirty
-checkout, and to belong to an accepted terminal task. Everything else holds,
-including unknown team results, reused panes, foreign workers, missing
-identities, live claims and dirty worktrees. The pass is never a second daemon,
-ledger or scheduler, never scans or signals an arbitrary process and never
-force-unlocks the Registry. `process_leak` is only ever reported with real
-evidence; CAO records no pane-child process identity, so it is never
-fabricated.
+The earlier generic "terminal orphan" positive was **synthetic and
+inconsistent**: it fabricated a released claim together with a live pane, a
+state the production lifecycle cannot produce. A passing test suite is **not**
+operating activation, and `eligible` cannot be qualified by inventing a
+post-release pane. The opt-in switch therefore changes nothing today; the
+`eligible` and `closed` classes remain in the vocabulary only for a future,
+separately designed task-owned recovery/liveness flow that must ship with real
+positive **and** negative native operating proof before it can be trusted.
+
+Everything else holds, including unknown team results, reused panes, foreign
+workers, missing identities, live claims and dirty worktrees. The pass is never
+a second daemon, ledger or scheduler, never scans or signals an arbitrary
+process and never force-unlocks the Registry. `process_leak` is only ever
+reported with real evidence; CAO records no pane-child process identity, so it
+is never fabricated.
+
+For a historical record written by an older build that still holds a terminal
+pane, close the CAO-created surface manually (section 11) after confirming the
+CAO-owned `cao-review-<task_id>` workspace label; this hygiene pass will not do
+it for you.
+
 
 ## Evidence
 

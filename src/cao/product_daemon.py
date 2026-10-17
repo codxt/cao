@@ -81,9 +81,13 @@ __all__ = [
 DAEMON_STATUS_SCHEMA = "cao.product.daemon.status.v0"
 
 #: The bounded classification vocabulary of one hygiene reconnaissance pass.
-#: Only an ``eligible`` pane of an accepted, CAO-owned, terminal task may ever
-#: be closed; every other class holds. Nothing here scans arbitrary processes,
-#: force-unlocks the Work Registry or acts as a second scheduler or ledger.
+#: Nothing here scans arbitrary processes, force-unlocks the Work Registry or
+#: acts as a second scheduler or ledger. Because the production lifecycle closes
+#: its own pane before releasing its claim, no generic terminal pane is a
+#: closeable orphan today: a terminal pane observed present is always
+#: ``protected_unknown`` and a pane that is absent is skipped. The ``eligible``
+#: and ``closed`` classes remain in the vocabulary for a future, separately
+#: designed task-owned recovery/liveness flow; this pass never qualifies them.
 HYGIENE_SCHEMA = "cao.product.hygiene.v0"
 HYGIENE_CLASSIFICATIONS = (
     "eligible",
@@ -245,17 +249,27 @@ def _open_claim_rows(db: str) -> list[dict[str, Any]] | None:
 def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
                    registry_db: str | None = None, apply: bool = False,
                    teams: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Plan (and optionally apply) closure of CAO-owned terminal orphan panes.
+    """Plan (and never close) CAO-owned terminal pane anomalies.
 
     This is a bounded, read-only aggregation over records the daemon already
     owns: durable product task records, the read-only Work Registry and the
     runtime's own pane list. It adds no second daemon, ledger or scheduler, and
-    it never scans or signals an arbitrary process. A pane is eligible ONLY
-    when it is proved to belong to this CAO install (matching workspace label),
-    to be free of any active or foreign worker, to have no live conflicting
-    claim and no dirty checkout, and to belong to an accepted terminal task.
-    Every other class holds. With ``apply=False`` (the default) the pass is a
-    plan: it counts eligible orphans and closes nothing.
+    it never scans or signals an arbitrary process.
+
+    A pane is proved to belong to this CAO install (matching workspace label),
+    free of any active or foreign worker, with no live conflicting claim, no
+    dirty checkout and an accepted terminal task -- but that is never enough to
+    close it. The production lifecycle closes the exact owned pane and records
+    ``pane_closed`` BEFORE it releases the claim, so a real released terminal
+    record has no live owned pane. A terminal pane observed PRESENT is therefore
+    never a closeable orphan: it is held ``protected_unknown`` whether its
+    released-claim/verified-close evidence is present (an unexpected
+    reappearance) or absent (a forged, older or interrupted record). A pane that
+    is absent is simply skipped, so an ordinary completed task does not inflate
+    the held counts. ``eligible`` cannot currently be qualified by invariants
+    that the real native accepted lifecycle cannot produce; the pass keeps the
+    ``apply`` parameter for a future, separately designed task-owned liveness
+    flow, and with ``apply=False`` (the default) the pass is a plan.
     """
 
     db = registry_db or product_config.registry_db_path(env)
@@ -420,22 +434,37 @@ def hygiene_report(*, env: Mapping[str, str] | None = None, driver: Any = None,
                 classify(task, "protected_active",
                          "the task's own worker is still active")
                 continue
-        # Everything is proved: an owned, inactive, unreused, clean, accepted
-        # terminal orphan pane.
-        classify(task, "eligible",
-                 "an owned accepted terminal orphan pane")
-        if not apply:
+        # A terminal task never earns automatic pane closure from status and the
+        # mere absence of a live Registry claim. The production lifecycle closes
+        # the exact owned pane and records ``pane_closed`` BEFORE it releases the
+        # claim (see ``product_task._finish`` and ``stop_task``), so a real
+        # released terminal record has no live owned pane at all. Require that
+        # exact durable disposition here: a durably released claim AND this
+        # task's own recorded verified close of the same pane.
+        claim = task.get("claim") or {}
+        released = (
+            isinstance(claim, Mapping)
+            and claim.get("released") is True
+            and claim.get("outcome") in ("complete", "abandon")
+        )
+        recorded_close = (
+            isinstance(task.get("pane_closed"), str)
+            and bool(task.get("pane_closed"))
+            and task.get("pane_closed") == pane_id
+        )
+        if not (released and recorded_close):
+            # Terminal status without a durable released-claim disposition and a
+            # matching verified close is never authority to close a pane: a
+            # forged, older or interrupted record is held UNKNOWN, never closed.
+            classify(task, "protected_unknown",
+                     "the terminal task has no durable released claim and "
+                     "verified pane close")
             continue
-        closed, error = product_task._close_owned_pane(driver, task)
-        if error is not None or not closed:
-            classify(task, "close_failed", "the owned pane was not proven closed")
-            continue
-        try:
-            product_state.update_task(task_id, {"pane_closed": closed}, env)
-        except Exception:  # noqa: BLE001 - an unrecorded close is not a close
-            classify(task, "close_failed", "the verified close could not be recorded")
-            continue
-        classify(task, "closed", "closed an owned terminal orphan pane")
+        # The task's own durable release and verified close both hold, yet its
+        # pane is observed PRESENT: an unexpected reappearance, identity reuse or
+        # conflict. It is held UNKNOWN and is never closed.
+        classify(task, "protected_unknown",
+                 "a terminal pane was observed present after its verified close")
 
     return {
         "schema": HYGIENE_SCHEMA,
@@ -1343,8 +1372,10 @@ class Daemon:
         # Conservative bounded hygiene reconciliation on this same tick. It is
         # default OFF and, even when enabled, defaults to a plan-only dry run:
         # it never scans arbitrary processes, never force-unlocks the Registry
-        # and never closes a pane that is not proved to be its own accepted
-        # terminal orphan. No second daemon, ledger or scheduler is added.
+        # and never closes a pane. The production lifecycle closes its own pane
+        # before releasing its claim, so a terminal pane still observed present
+        # is an unexpected reappearance that is always held. No second daemon,
+        # ledger or scheduler is added.
         if self._config is not None:
             hygiene = self._hygiene(owners)
             record["hygiene"] = hygiene
@@ -1411,11 +1442,14 @@ class Daemon:
         return collect_occupancy(self._driver)
 
     def _hygiene(self, teams: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """One bounded hygiene pass, default plan-only.
+        """One bounded hygiene pass.
 
-        Closure is applied only when the operator has both enabled hygiene and
-        cleared its dry run. Any unexpected error is reported as a held pass,
-        never as a successful cleanup.
+        The generic pass never closes a pane: the production lifecycle already
+        closes its own pane before releasing its claim, so a terminal pane that
+        is still present is an unexpected reappearance and is held. The pass
+        keeps the operator's ``apply`` flag for a future, separately designed
+        task-owned recovery/liveness flow. Any unexpected error is reported as a
+        held pass, never as a successful cleanup.
         """
 
         apply = (self._defaults.hygiene_enabled
