@@ -190,7 +190,7 @@ _REQUEST = re.compile(
 #: Framing that genuinely directs an action. Quantifiers such as "one" and
 #: "single" are deliberately excluded: they shape a noun phrase ("one squash
 #: merge of the branch") but they do not, on their own, outrank a compound
-#: reference ("one reviewed squash-merge commit") or a conditional reservation.
+#: reference ("one reviewed squash-merge commit").
 _REQUEST_STRONG = re.compile(
     r"\b(?:please|seek|require|requires|required|perform|request|requested|"
     r"requesting|execute|run|apply|complete|finish|proceed|ensure|submit|"
@@ -224,17 +224,6 @@ _QUALIFIED_PREFIX = re.compile(
     r"latest|retirement|serving|merged|deployed|released|published)\s+"
     r"(?:(?:merge|release|deploy|deployment|publish|publication|credential|"
     r"permission|change|changes)\s+){0,2}\Z",
-    re.I,
-)
-#: A conditional plan or reservation. The effect is not asked for now; it is
-#: contingent on a later, separately verified event. An explicit strong request
-#: verb still wins ("if qualified, seek one squash merge" asks for the merge).
-_CONDITIONAL = re.compile(
-    r"\b(?:if|when|whenever|unless|once|provided(?: that)?|subject to|pending|"
-    r"contingent on|conditional on|only after|only if)\b"
-    r"[^.;\n]{0,96}?"
-    r"\b(?:approved|authori[sz]ed|qualified|reviewed|ratified|permitted|granted|"
-    r"cleared|allowed|accepted|separately)\b",
     re.I,
 )
 #: A bare claim about an already-finished effect, not a request for one.
@@ -411,20 +400,6 @@ def _claim_context(clause: str, match: re.Match[str]) -> bool:
     return bool(_CLAIM_BEFORE.search(prefix))
 
 
-def _conditional_context(clause: str, match: re.Match[str]) -> bool:
-    """Whether this occurrence is part of a conditional plan or reservation.
-
-    A trailing condition only governs the phrase it closes; a comma ends that
-    phrase, so an unconditional directive before it ("merge now, deploy if
-    approved") is not silently made conditional.
-    """
-
-    scope = _negation_scope_start(clause, match.start())
-    before = clause[scope: match.start()]
-    after = clause[match.start(): match.start() + 96].split(",", 1)[0]
-    return bool(_CONDITIONAL.search(before) or _CONDITIONAL.search(after))
-
-
 def _negation_scope_start(clause: str, position: int) -> int:
     """The index where the negation scope governing ``position`` begins.
 
@@ -480,14 +455,16 @@ def classify_effects(body: str) -> dict[str, str]:
                 window = prefix[-_REQUEST_WINDOW:]
                 if forbids or _NEG_LOCAL.search(prefix):
                     verdict = "NEGATED"
-                elif (_conditional_context(clause, match)
-                      or _qualified_reference(clause, match)
+                elif (_qualified_reference(clause, match)
                       or _claim_context(clause, match)):
-                    # A conditional reservation, a compound reference or a bare
-                    # claim is not an asked-for action. It is a mention even when
-                    # a weak quantifier ("one") or a nominal clause opener would
-                    # otherwise look like framing. An explicit strong request
-                    # verb still outranks it ("please merge the merge commit").
+                    # A compound reference or a bare claim is not an asked-for
+                    # action. It is a mention even when a weak quantifier ("one")
+                    # or a nominal clause opener would otherwise look like
+                    # framing. An explicit strong request verb still outranks it
+                    # ("please merge the merge commit"). A future condition
+                    # ("when approved") is a trigger, never a negation of the
+                    # requested intent, so it does not make a bare directive a
+                    # mention.
                     verdict = ("REQUESTED"
                                if _REQUEST_STRONG.search(window)
                                else "MENTIONED")

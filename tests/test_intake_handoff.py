@@ -245,6 +245,42 @@ class ClassificationTests(HandoffCase):
         self.assertEqual(effects["merge"], "MENTIONED")
         self.assertEqual(effects["deploy"], "MENTIONED")
 
+    def test_future_condition_does_not_downgrade_a_requested_effect(self) -> None:
+        # A future condition is a trigger, never a negation of the requested
+        # intent. Each of these asks for the effect and must fail closed.
+        cases = {
+            "Implement feature and deploy when approved.": "deploy",
+            "Deploy when approved.": "deploy",
+            "Implement feature and merge the PR if approved.": "merge",
+            "Implement feature, and then publish once approved.": "publish",
+            "Implement fix and delete stale files when approved.": "destructive",
+        }
+        self.assertEqual(len(cases), 5)
+        for body, category in cases.items():
+            with self.subTest(body=body):
+                self.assertIn(
+                    intake_handoff.classify_effects(body)[category],
+                    ("REQUESTED", "AMBIGUOUS"),
+                )
+
+    def test_future_condition_reference_is_not_a_request(self) -> None:
+        # A nominal reference to a separately authorized future effect, an
+        # explicit exclusion and a status report stay non-requested.
+        cases = {
+            "Implement code, one reviewed squash-merge commit if separately "
+            "authorized.": {"merge": "MENTIONED"},
+            "Implement code; no auto-merge, deployment or credentials.": {
+                "merge": "NEGATED", "deploy": "NEGATED"},
+            "Implement code; report source merge and deployment states.": {
+                "merge": "MENTIONED", "deploy": "MENTIONED"},
+        }
+        self.assertEqual(len(cases), 3)
+        for body, expected in cases.items():
+            with self.subTest(body=body):
+                effects = intake_handoff.classify_effects(body)
+                for category, verdict in expected.items():
+                    self.assertEqual(effects[category], verdict)
+
     def test_gate_label_compounds_are_mentions(self) -> None:
         effects = intake_handoff.classify_effects(
             "Keep the review/merge and Factory release gates unchanged."

@@ -376,9 +376,39 @@ class SourcePreflightRegressionTests(RouterCase):
         for body in (
                 "Implement the parser. One squash-merge commit if separately "
                 "authorized.",
-                "Implement the parser. Deploy when approved.",
                 "Implement the parser, subject to approval, then report "
                 "deployment states."):
+            with self.subTest(body=body):
+                result = self.decision(body)
+                self.assertEqual(result["decision"],
+                                 task_router.DECISION_IMPLEMENT)
+                self.assertEqual(result["execution"]["gate"],
+                                 task_router.GATE_EXACT_MANIFEST)
+
+    def test_future_condition_directives_are_held(self):
+        # A future condition is a trigger, not a negation of requested intent.
+        for body in (
+                "Implement feature and deploy when approved.",
+                "Deploy when approved.",
+                "Implement feature and merge the PR if approved.",
+                "Implement feature, and then publish once approved.",
+                "Implement fix and delete stale files when approved."):
+            with self.subTest(body=body):
+                result = self.decision(body)
+                self.assertEqual(result["decision"],
+                                 task_router.DECISION_INVESTIGATE)
+                self.assertEqual(result["route"], task_router.ROUTE_HOLD)
+                self.assertEqual(result["execution"]["gate"],
+                                 task_router.GATE_CONSEQUENTIAL_EFFECT)
+
+    def test_future_condition_references_stay_implementation(self):
+        # The same trigger over a nominal reference, an exclusion or a status
+        # report names no fresh requested effect.
+        for body in (
+                "Implement code, one reviewed squash-merge commit if separately "
+                "authorized.",
+                "Implement code; no auto-merge, deployment or credentials.",
+                "Implement code; report source merge and deployment states."):
             with self.subTest(body=body):
                 result = self.decision(body)
                 self.assertEqual(result["decision"],
