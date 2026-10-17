@@ -485,7 +485,19 @@ under `hygiene` (counts only, never raw process output):
 
 Expected with no configuration: `"mode": "plan"`. The classification counts are
 `eligible`, `closed`, `protected_active`, `protected_unknown`, `unowned`,
-`missing_pane`, `close_failed` and `process_leak`.
+`missing_pane`, `close_failed` and `process_leak`. Exactly one final
+classification is recorded per terminal pane per tick: an applied success is
+`closed` (not both `eligible` and `closed`), a race or close failure reports its
+final hold/failure, and a candidate skipped by the per-tick bound stays
+`eligible`.
+
+Pane existence is probed read-only first. After a valid terminal pane identity
+and a readable runtime, a genuinely absent pane is skipped **before** any
+team/lane, checkout or Work Registry/owner-acceptance test. An absent pane is
+neither `eligible` nor a held `protected_unknown` count: an unrelated predicate
+that cannot be proved is not evidence that a leftover exists. An unreadable pane
+or runtime is never treated as absence and still holds, and an unreadable ledger
+is still reported `UNAVAILABLE` and never grants a close.
 
 **Default off.** `hygiene_enabled` defaults to `false` and `hygiene_dry_run`
 defaults to `true`, and both must stay that way in source. Committing code never
@@ -527,10 +539,17 @@ false`); source defaults never change.
 ```
 
 When enabled, an applied pass closes only the revalidated eligible cohort: for
-each candidate it re-reads the ledger and re-probes the pane immediately before
-the close, closes only this task's exact owned pane, confirms absence through
-the runtime (`pane_get`), and records the verified close as `pane_closed` on the
-shared task record.
+each candidate it re-reads the mutable task record, current pane/workspace reuse
+conflicts, the team's durable acceptance, a fresh checkout cleanliness probe, the
+full original released Registry row, and the pane's own named worker immediately
+before the close. A task that became non-terminal, a worker that became active
+or foreign, a newly opened claim (including another owner's), a newly dirty or
+unreadable checkout, and a changed row all hold. It then closes only this task's
+exact owned pane, confirms absence through the runtime (`pane_get`), and records
+the verified close as `pane_closed` on the shared task record. The small instant
+between the final check and the runtime's own close call is an irreducible
+runtime race: CAO never knowingly closes an active or foreign worker, and it
+never claims a closure that `pane_get` did not confirm.
 
 **Audit receipts.** The daemon record's `hygiene` block -- its counts plus a
 bounded item list of `task_id`/`classification`/`reason` -- is the receipt,
@@ -546,6 +565,13 @@ or a `pane_get` that still finds the pane after an acknowledged close all fail
 closed to a held classification -- never a fabricated `closed`. `process_leak`
 is only ever reported with a real recorded process identity; CAO records no
 pane-child process identity, so it is never fabricated.
+
+One crash window is irreducible: the close can be verified while persisting
+`pane_closed` on the task record fails. That tick reports `close_failed`, never
+`closed`; the record remains without a verified close and the next pass sees the
+pane absent, skips it as having no leftover, and claims nothing further. CAO
+therefore never fabricates a closure it could not attribute to a persisted task
+record.
 
 If no eligible cohort survives review, leave the switches at their defaults and
 close the specific historical pane manually (section 11) after confirming the
