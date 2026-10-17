@@ -361,9 +361,12 @@ def _classify_text(body: str) -> tuple[str, dict[str, Any]]:
     risk = intake_triage._risk_flags(body)
     if (risk and "reserved_action" in risk and not effects
             and not _RESIDUAL_RESERVED.search(body)):
-        # B6 has already proved every reserved effect non-consequential
-        # (mentioned, negated or conditional); the generic reserved-word marker
-        # adds no new fact. An unmodelled reserved action still holds.
+        # B6 has already proved every reserved effect non-requested: only
+        # MENTIONED and NEGATED verdicts reach here and neither is an asked-for
+        # action. A future-conditional directive ("deploy when approved")
+        # remains REQUESTED and an unclear one AMBIGUOUS, and both are held
+        # above. The generic reserved-word marker adds no new fact. An
+        # unmodelled reserved action still holds.
         risk = [flag for flag in risk if flag != "reserved_action"]
     if risk:
         return DECISION_INVESTIGATE, {"gate": GATE_HUMAN_REVIEW,

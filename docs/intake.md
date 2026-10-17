@@ -169,11 +169,17 @@ documented; first match wins, no model and no hidden state:
 
 1. it asks for a reserved consequential effect (`merge`, `deploy`, `release`,
    `publish`, `credential`, `permission`, `destructive`) — reusing B6's
-   mention-vs-request classifier — or leaves one unprovable → `INVESTIGATE`; a
-   mentioned, negated, conditional or already-finished effect is not an asked-for
-   action, so it does not hold an otherwise clear implementation request; if
-   the classifier cannot read the text at all the request fails **closed** to
-   `INVESTIGATE`, never silently to `BACKLOG`;
+   mention-vs-request classifier — or leaves one unprovable → `INVESTIGATE`; an
+   explicit action request stays `REQUESTED` and holds the request even when it
+   is gated by a future condition ("Deploy when approved"), because a future
+   condition is a trigger, never a negation of the asked-for action; a negative
+   instruction ("no auto-merge"), a nominal reference ("one reviewed
+   squash-merge commit") or a past-state claim ("the merge is complete") is not
+   automatically an asked-for action, so it does not hold an otherwise clear
+   implementation request; a reserved effect the rules cannot prove
+   non-actionable fails **closed** to `INVESTIGATE`; and if the classifier
+   cannot read the text at all the request fails **closed** to `INVESTIGATE`,
+   never silently to `BACKLOG`;
 2. it explicitly defers (`later`, `not now`, `backlog`, `someday`, …) →
    `BACKLOG`;
 3. it carries a risk marker (see B3 triage) → `INVESTIGATE`;
@@ -683,10 +689,17 @@ B3 flags a reserved word as a risk marker and hands almost every such request to
 - an effect the rules **cannot prove non-actionable** is a `HOLD` with a precise
   reason, never a silent pass;
 - a **compound reference** ("squash-merge commit", "merge and deployment
-  states"), a **conditional plan** ("if separately authorized", "when approved",
-  "subject to review") and a **bare claim** ("the merge is complete") are
-  mentions, not requests: they name an artifact, a future condition or a
-  finished state;
+  states") and a **bare claim** ("the merge is complete") are mentions, not
+  requests: they name an artifact or a finished state. The framing words of a
+  **conditional plan** ("if separately authorized", "when approved", "subject to
+  review") do not by themselves prove that no action was requested: a bare
+  directive so conditioned is still an explicit request, so "Deploy when
+  approved" classifies `REQUESTED` and stays a `HOLD`, whereas "one reviewed
+  squash-merge commit if separately authorized" is a nominal reference to an
+  artifact and stays `MENTIONED`. A future condition is a trigger, never a
+  negation; explicit negations remain `NEGATED`, and a mixed request retains
+  the stronger verdict, so one explicit request is never masked by a later
+  mention. Nothing in this routing grants approval or team authority;
 - a request that mixes a consequential effect with a read scope is **never**
   silently downgraded to a READ plan (`mixed_effect_and_read_request`);
 - only a request that declares a read scope and holds no consequential effect is
