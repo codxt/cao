@@ -347,7 +347,13 @@ def _decode(model_output: Any) -> dict:
         except UnicodeDecodeError as exc:
             raise DecisionHeld("invalid_json", "model output is not valid UTF-8") from exc
     if isinstance(model_output, str):
-        if len(model_output.encode("utf-8")) > MAX_PLAN_BYTES:
+        try:
+            output_size = len(model_output.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise DecisionHeld(
+                "invalid_json", "model output is not valid UTF-8"
+            ) from exc
+        if output_size > MAX_PLAN_BYTES:
             raise DecisionHeld("oversize", "model output exceeds the byte bound")
         try:
             parsed = json.loads(model_output, parse_constant=_reject_constant)

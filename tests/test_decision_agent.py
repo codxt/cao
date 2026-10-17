@@ -253,6 +253,12 @@ class MalformedOutputTests(unittest.TestCase):
     def test_invalid_json_is_refused(self) -> None:
         self.assertEqual(run("{not json")["code"], "invalid_json")
 
+    def test_lone_surrogate_output_is_held_not_raised(self) -> None:
+        result = run('{"plan":"' + chr(0xD800) + '"}')
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "invalid_json")
+        self.assertFalse(result["dispatch"])
+
     def test_non_object_json_is_refused(self) -> None:
         self.assertEqual(run(json.dumps(["a"]))["code"], "plan_not_object")
 
