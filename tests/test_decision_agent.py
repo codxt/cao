@@ -262,6 +262,31 @@ class MalformedOutputTests(unittest.TestCase):
     def test_oversize_object_is_refused(self) -> None:
         self.assertEqual(run(plan(plan="y" * (da.MAX_PLAN_BYTES)))["code"], "oversize")
 
+    def test_json_nan_is_held_not_raised(self) -> None:
+        result = run('{"plan": NaN}')
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "invalid_json")
+
+    def test_json_infinity_is_held_not_raised(self) -> None:
+        self.assertEqual(run('{"plan": Infinity}')["code"], "invalid_json")
+
+    def test_json_negative_infinity_is_held_not_raised(self) -> None:
+        self.assertEqual(run('{"plan": -Infinity}')["code"], "invalid_json")
+
+    def test_json_overflow_literal_is_held_not_raised(self) -> None:
+        self.assertEqual(run('{"plan": 1e400}')["code"], "invalid_json")
+
+    def test_deeply_nested_json_is_held_not_raised(self) -> None:
+        deep = "[" * 12500 + "]" * 12500
+        result = run(deep)
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "invalid_json")
+
+    def test_mixed_key_types_mapping_is_held_not_raised(self) -> None:
+        result = run({1: "a", "b": "c"})
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "invalid_json")
+
     def test_out_of_vocabulary_action_class_is_refused(self) -> None:
         self.assertEqual(run(plan(action_class="ADMIN"))["code"], "action_class_invalid")
 

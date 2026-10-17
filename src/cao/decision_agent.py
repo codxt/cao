@@ -336,6 +336,10 @@ def _confidence(value: Any) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _reject_constant(name: str) -> float:
+    raise ValueError(f"non-finite number: {name}")
+
+
 def _decode(model_output: Any) -> dict:
     if isinstance(model_output, (bytes, bytearray)):
         try:
@@ -346,15 +350,21 @@ def _decode(model_output: Any) -> dict:
         if len(model_output.encode("utf-8")) > MAX_PLAN_BYTES:
             raise DecisionHeld("oversize", "model output exceeds the byte bound")
         try:
-            parsed = json.loads(model_output)
-        except (ValueError, TypeError) as exc:
+            parsed = json.loads(model_output, parse_constant=_reject_constant)
+        except (ValueError, TypeError, RecursionError) as exc:
             raise DecisionHeld("invalid_json", "model output is not valid JSON") from exc
         model_output = parsed
     if isinstance(model_output, Mapping):
         node = dict(model_output)
     else:
         raise DecisionHeld("plan_not_object", "model output must be a JSON object")
-    if len(evidence.canonical_json(node).encode("utf-8")) > MAX_PLAN_BYTES:
+    try:
+        size = len(evidence.canonical_json(node).encode("utf-8"))
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise DecisionHeld(
+            "invalid_json", "model plan is not canonicalizable JSON"
+        ) from exc
+    if size > MAX_PLAN_BYTES:
         raise DecisionHeld("oversize", "model plan exceeds the byte bound")
     return node
 
