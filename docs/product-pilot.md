@@ -531,6 +531,35 @@ operating cohort. To activate, the operator clears the dry run **locally** in
 the installation's own config (`hygiene_enabled: true`, `hygiene_dry_run:
 false`); source defaults never change.
 
+**Technical qualification is not operating authority.** The accepted disposable
+empty-pane canary and the accepted native stopped named-worker canary were run
+against a synthetic legacy release ordering in an isolated Registry. They prove
+the closure mechanism itself -- a single close, the durable `pane_closed` receipt
+and idempotence across a daemon restart -- and an independent review may confirm
+that. A positive accepted-team path regression proves the team acceptance gate in
+a fake driver only. This evidence, and any review that recommends activation,
+qualifies the technical behavior; it does not qualify an operating cohort and
+never grants operating authority on its own. The installation operator still has
+to independently verify an actual eligible live production pre-close-first cohort
+-- its exact RELEASED Work Registry rows, its `cao-review-<task_id>` workspace and
+its pane -- before clearing the dry run under this policy.
+
+**No eligible cohort stays in plan mode.** A canary that exercises the mechanism
+is not itself an eligible cohort. When the installation's own plan reports
+`eligible: 0`, remain in plan mode even after a successful canary: there is
+nothing reviewed to close. `protected_active` (a live or IDLE worker, a reused
+pane or workspace, or a live claim) is reported separately from
+`protected_unknown` (an unaccepted team slot, an unreadable or dirty checkout, a
+missing or mismatched released row, an unreadable runtime or ledger). An IDLE
+worker and an unaccepted team are never eligible.
+
+**Alternate governance choice (not accepted).** Clearing the dry run while the
+plan reports `eligible: 0` -- preemptive activation -- is not an accepted contract
+and is not enabled behavior. It is noted here only as a possible, different
+governance choice that would require its own separate and explicit policy
+revision, with its own accountable decision. The policy above is unchanged until
+such a revision is accepted.
+
 **Operator canary.**
 
 ```sh

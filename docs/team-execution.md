@@ -245,6 +245,20 @@ enables both switches locally; source never changes the defaults. Close a
 specific historical pane manually with the runtime's own close primitive until
 an installation's own plan run proves a reviewed eligible cohort.
 
+The accepted disposable empty-pane and native stopped named-worker canaries, run
+against a synthetic legacy release ordering in an isolated Registry, prove this
+closure mechanism -- a single close, the durable receipt and idempotence across a
+restart -- and a positive accepted-team regression proves the team acceptance
+gate in a fake driver only. That is technical qualification, not operating
+authority: it does not by itself authorize enabling the effect. An operator must
+still independently verify a live eligible pre-close-first cohort and its exact
+released Registry rows, workspace and pane in that installation before clearing
+the dry run, and a plan that reports no eligible candidate remains plan-only even
+after a successful canary. An IDLE worker and an unaccepted team are never
+eligible; `protected_active` and `protected_unknown` are held and reported
+separately. Preemptive activation with no eligible cohort is not accepted
+behavior; it would require a separate, explicit policy revision.
+
 Team task agent names use a readable prefix and digest of their full ID.
 This prevents longer team/task names from colliding after terminal name-length
 truncation. The original task record remains the idempotency authority.

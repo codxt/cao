@@ -2207,6 +2207,96 @@ class HygieneTests(DaemonCase):
         self.assertGreaterEqual(report["counts"]["protected_unknown"], 1)
         self.assertIn(pane_id, driver._panes)
 
+    def team_read_leftover(self, driver, *, task_id, slot_status="complete"):
+        """A durable team-owned historical READ leftover, in the governed shape.
+
+        The team is initialized through its own public API, then its current work
+        slot is written with the exact execution identity, the checkout's real
+        source revision and a substituted durable status. The result is a
+        well-formed checkpoint, never a forged partial one: with
+        ``slot_status="complete"`` the owning team has genuinely accepted the
+        result (``team._required`` validates it), and any other status is a
+        well-formed but unaccepted slot. Returns the leftover pane id.
+        """
+
+        pane_id = self.legacy_released_read(
+            driver, task_id=task_id, run_id="cao-team-squad")
+        spec = {
+            "schema": team.SPEC_SCHEMA, "team_id": "squad",
+            "roles": {"analyst": {"instruction": "Read only."}},
+            "tasks": [{"id": "a", "role": "analyst", "repo": str(self.repo),
+                       "mode": "read", "prompt": "Analyze source"}],
+        }
+        team.initialize(spec, env=self.env)
+        record = team._required("squad", self.env)
+        record["slots"]["a"].update(
+            status=slot_status, phase="work", round=0, execution_id=task_id,
+            prompt="Analyze source", head=team._git_head(str(self.repo)))
+        team._save(record, self.env)
+        return pane_id
+
+    def test_accepted_team_historical_leftover_plans_then_closes_once(self):
+        # The same governed leftover as the unaccepted test above, but the
+        # owning team slot is a genuinely ACCEPTED, durably ``complete`` result
+        # carrying the checkout's real source revision. A team-owned historical
+        # READ task is eligible only on that durable team acceptance: it plans
+        # first, then closes exactly once and records the verified close, and
+        # stays idempotent across a daemon restart.
+        driver = FakeDriver()
+        task_id = team._execution_id("squad", "a", "work", 0)
+        pane_id = self.team_read_leftover(driver, task_id=task_id)
+        # Default OFF + dry run: the accepted team leftover is reported eligible
+        # and NOTHING is closed.
+        plan = self.build(driver)
+        plan.start()
+        plan.tick()
+        self.assertNotIn("pane_close", driver.names())
+        hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(hygiene["mode"], "plan")
+        self.assertEqual(hygiene["counts"]["eligible"], 1)
+        self.assertEqual(hygiene["counts"]["closed"], 0)
+        self.assertEqual(hygiene["counts"]["protected_unknown"], 0)
+        self.assertIn(pane_id, driver._panes)
+        # Enabled AND dry-run cleared: the exact owned pane is closed once and
+        # its verified close is recorded on the shared task record.
+        applied = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        applied.start()
+        applied.tick()
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        self.assertNotIn(pane_id, driver._panes)
+        record = product_state.read_task(task_id, self.env)
+        self.assertEqual(record["pane_closed"], pane_id)
+        applied_hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(applied_hygiene["counts"]["closed"], 1)
+        self.assertEqual(applied_hygiene["counts"]["eligible"], 0)
+        self.assertEqual(sum(applied_hygiene["counts"].values()), 1)
+        # Idempotent across a restart: the pane is gone, so nothing more closes.
+        restarted = self.build(
+            driver, config=self.hygiene_config(enabled=True, dry_run=False))
+        restarted.tick()
+        self.assertEqual(driver.names().count("pane_close"), 1)
+        restarted_hygiene = product_state.read_daemon(self.env)["hygiene"]
+        self.assertEqual(restarted_hygiene["counts"]["closed"], 0)
+        self.assertEqual(restarted_hygiene["counts"]["eligible"], 0)
+        self.assertEqual(sum(restarted_hygiene["counts"].values()), 0)
+
+    def test_well_formed_but_unaccepted_team_leftover_still_holds(self):
+        # The ONLY difference from the accepted test above is the slot's durable
+        # status: a well-formed but not-yet-complete team slot is not acceptance.
+        # The identical leftover holds, so the gate is the team's own durable
+        # acceptance -- not merely a parseable (non-CORRUPT) checkpoint.
+        driver = FakeDriver()
+        task_id = team._execution_id("squad", "a", "work", 0)
+        pane_id = self.team_read_leftover(
+            driver, task_id=task_id, slot_status="running")
+        report = product_daemon.hygiene_report(
+            env=self.env, driver=driver, registry_db=self.db, apply=True)
+        self.assertNotIn("pane_close", driver.names())
+        self.assertEqual(report["counts"]["eligible"], 0)
+        self.assertGreaterEqual(report["counts"]["protected_unknown"], 1)
+        self.assertIn(pane_id, driver._panes)
+
     def test_unreadable_ledger_historical_leftover_holds(self):
         driver = FakeDriver()
         pane_id = self.legacy_released_read(driver, task_id="legacy-noledger")
