@@ -38,6 +38,40 @@ not be opened), `RELAY_STATE_NOT_FOUND` (the named relay state file does not
 exist), `RELAY_STATE_UNREADABLE` (the state file could not be read or is not a
 JSON object), `RELAY_STATE_INVALID` (the state is not a valid relay ledger).
 
+## Request review
+
+`cao request --review` is the single read-only review surface over requests CAO
+already admitted. It derives its view from existing Intake, B5, B6 and B7 state
+and creates no second ledger, cache, scheduler, team or worker:
+
+```sh
+cao request --review
+cao request --review --item-id ID
+```
+
+It prints bounded public-safe metadata and a proposed routing candidate. No raw
+request body, redacted body, credential or prompt is ever included. A linked CAO
+team is reported only when its provenance is attributable to that exact
+submission; otherwise the team and backlog verdicts are `UNKNOWN` rather than a
+title/path guess. An `IMPLEMENT` candidate is never reported as approved,
+running or dispatched: it has a source id, `execution.requested = true`, and
+`execution.started`, `worker.started`, `worker.dispatched` and `approved` all
+`false`.
+
+If any source is absent, corrupt or above the fixed review bound, the command
+prints one `UNAVAILABLE` payload and exits `3`; it never shows a truncated or
+partial view. `--review` cannot be combined with `--file`, `--text`, `--execute`
+or `--dry-run`. The review opens an existing Registry read-only and never creates
+one, initializes or starts a team, ticks the queue or dispatches an agent.
+
+The original human message establishes intent, not host-authenticated identity
+and not a broad grant. Clear requested work should not need a second subjective
+accept/reject decision once an authenticated, scope-bound owner approval is
+available, but the actual first WRITE dispatch still requires the existing
+approved team and a live Registry/route qualification. Approval is rechecked
+only when the scope, model route/privacy, identity or a reserved effect changes;
+no standing authority or automatic permission elevation is created.
+
 ## Runtime plugins
 
 ```sh

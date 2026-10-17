@@ -49,15 +49,18 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from . import (intake, intake_handoff, intake_triage, product_config, team,
-               team_approval)
+from . import (intake, intake_handoff, intake_queue, intake_resolution,
+               intake_triage, product_config, team, team_approval)
+from .state import StateError
 
 __all__ = [
     "main",
     "build_parser",
     "classify",
     "route",
+    "review",
     "SCHEMA",
+    "REVIEW_SCHEMA",
     "ROUTE_INTAKE",
     "ROUTE_EXECUTION",
     "ROUTE_HOLD",
@@ -82,6 +85,13 @@ __all__ = [
 ]
 
 SCHEMA = "cao.request.v1"
+#: The read-only unified review projection served by ``cao request --review``.
+REVIEW_SCHEMA = "cao.request.review.v1"
+#: The review reads at most this many admitted items and fails closed above it
+#: rather than silently truncating the operator's view.
+MAX_REVIEW_ITEMS = 32
+#: The most attributable backlog intents reported for one item.
+MAX_REVIEW_BACKLOG = 8
 
 ROUTE_INTAKE = "INTAKE"
 ROUTE_EXECUTION = "EXECUTION"
@@ -173,6 +183,13 @@ _REVIEW_SHAPED = re.compile(
 #: straight double quotes are stripped before the local verb predicates run;
 #: single quotes are left alone so contractions ("don't") keep their negation.
 _QUOTED = re.compile(r"`[^`]*`|\"[^\"]*\"")
+
+#: A reserved action B3 flags that B6 does not model as its own category. It
+#: keeps its risk hold even when every B6 effect is only a mention; the other
+#: reserved terms are already covered by a B6 category verdict.
+_RESIDUAL_RESERVED = re.compile(
+    r"\bpush to (?:github|origin|remote)\b", re.IGNORECASE
+)
 
 
 def _unquote(body: str) -> str:
@@ -342,6 +359,12 @@ def _classify_text(body: str) -> tuple[str, dict[str, Any]]:
     if _LATER.search(body):
         return DECISION_BACKLOG, {"gate": None}
     risk = intake_triage._risk_flags(body)
+    if (risk and "reserved_action" in risk and not effects
+            and not _RESIDUAL_RESERVED.search(body)):
+        # B6 has already proved every reserved effect non-consequential
+        # (mentioned, negated or conditional); the generic reserved-word marker
+        # adds no new fact. An unmodelled reserved action still holds.
+        risk = [flag for flag in risk if flag != "reserved_action"]
     if risk:
         return DECISION_INVESTIGATE, {"gate": GATE_HUMAN_REVIEW,
                                       "risk_flags": list(risk)}
@@ -770,6 +793,232 @@ def route(document: Any, *, env: Mapping[str, str] | None = None,
     )
 
 
+# ---------------------------------------------------------------------------
+# The one read-only operator review projection
+# ---------------------------------------------------------------------------
+
+
+class ReviewUnavailable(Exception):
+    """A review source is absent, unreadable or outside its fixed bound."""
+
+    code = "REVIEW_UNAVAILABLE"
+
+
+def _mover_view(mover: Any) -> dict[str, Any] | None:
+    """A bounded next-mover projection: role and action, never a person."""
+
+    if not isinstance(mover, Mapping):
+        return None
+    return {
+        "role": str(mover.get("role") or "")[:32],
+        "action": str(mover.get("action") or "")[:200],
+        "basis": str(mover.get("basis") or "")[:240],
+    }
+
+
+def _team_view(linked: Mapping[str, Any]) -> dict[str, Any]:
+    """Only a validated attributable link is reported; otherwise UNKNOWN."""
+
+    if linked.get("verdict") == "SUPPORTED" and linked.get("team_id"):
+        claims = linked.get("claims")
+        return {
+            "verdict": "SUPPORTED",
+            "team_id": str(linked["team_id"]),
+            "status": linked.get("status"),
+            "desired": linked.get("desired"),
+            "claims": ({"verdict": str(claims.get("verdict")),
+                        "count": len(claims.get("claims") or [])}
+                       if isinstance(claims, Mapping) else None),
+            "reason": None,
+        }
+    return {
+        "verdict": "UNKNOWN",
+        "team_id": None,
+        "status": "UNKNOWN",
+        "desired": None,
+        "claims": None,
+        "reason": str(linked.get("reason") or "no linked team is attributable"),
+    }
+
+
+def _backlog_view(submission_id: str, env: Mapping[str, str] | None
+                  ) -> dict[str, Any]:
+    """The queue intent(s) bound to this exact submission, or UNKNOWN."""
+
+    matches = [
+        intent for intent in intake_queue.list_intents(env)
+        if (intent.get("binding") or {}).get("submission_id") == submission_id
+    ]
+    if len(matches) > MAX_REVIEW_BACKLOG:
+        raise ReviewUnavailable(
+            "more backlog intents are attributable to this item than the "
+            "review bound permits"
+        )
+    if not matches:
+        return {"verdict": "UNKNOWN", "status": None, "count": 0,
+                "intents": [],
+                "reason": "no queue backlog entry is attributable to this item"}
+    return {
+        "verdict": "SUPPORTED",
+        "status": matches[-1].get("status"),
+        "count": len(matches),
+        "intents": [
+            {
+                "intent_id": intent.get("intent_id"),
+                "status": intent.get("status"),
+                "priority": intent.get("priority"),
+                "team_id": (intent.get("binding") or {}).get("team_id"),
+                "created_at": intent.get("created_at"),
+            }
+            for intent in matches
+        ],
+        "reason": None,
+    }
+
+
+def _review_item(view: Mapping[str, Any], *, env: Mapping[str, str] | None,
+                 clock: Any) -> dict[str, Any]:
+    """One item's bounded public-safe review, derived only from existing state."""
+
+    submission_id = view["submission_id"]
+    try:
+        record = intake.read_submission(submission_id, env)
+    except intake.IntakeError as exc:
+        raise ReviewUnavailable(
+            "the admitted submission is present but not readable"
+        ) from exc
+    decision, detail = _classify_text(record["body"])
+    resolution = intake_resolution.derive_status(
+        submission_id, env=env, clock=clock
+    )
+    handoff = intake_handoff.handoff_status(
+        submission_id, env=env, clock=clock
+    )
+    if (resolution.get("submission_id") != submission_id
+            or handoff.get("submission_id") != submission_id):
+        raise ReviewUnavailable(
+            "the derived evidence is not bound to the reviewed submission"
+        )
+    linked = handoff.get("linked") or {}
+    eligibility = handoff.get("eligibility") or {}
+    plan = handoff.get("plan") or {}
+    execution_requested = decision == DECISION_IMPLEMENT
+    candidate_route = (ROUTE_EXECUTION if execution_requested else
+                       ROUTE_HOLD if decision == DECISION_INVESTIGATE else
+                       ROUTE_INTAKE)
+    return {
+        "submission_id": submission_id,
+        "item_id": view["item_id"],
+        "request": {
+            "submission_id": submission_id,
+            "item_id": view["item_id"],
+            "title": view["title"],
+            "source": view["source"],
+            "state": view["state"],
+            "admitted_at": view["admitted_at"],
+            "fingerprint": view["fingerprint"],
+            "body_included": False,
+        },
+        "candidate": {
+            "source": "intake",
+            "source_id": submission_id,
+            "decision": decision,
+            "route": candidate_route,
+            "status": (STATUS_ADMITTED if decision == DECISION_BACKLOG
+                       else STATUS_PROPOSED),
+            "execution": {
+                "requested": execution_requested,
+                "started": False,
+                "gate": detail.get("gate"),
+            },
+            "worker": {"started": False, "dispatched": False},
+            "approved": False,
+            "authority": "none",
+        },
+        "resolution": {
+            "status": resolution.get("status"),
+            "summary": resolution.get("summary"),
+            "next_mover": _mover_view(resolution.get("next_mover")),
+        },
+        "eligibility": {
+            "status": handoff.get("status"),
+            "verdict": eligibility.get("verdict"),
+            "holds": [
+                {"code": str(hold.get("code") or "")[:64],
+                 "category": hold.get("category")}
+                for hold in (eligibility.get("holds") or [])
+                if isinstance(hold, Mapping)
+            ],
+            "plan_status": plan.get("status") if isinstance(plan, Mapping) else None,
+        },
+        "team": _team_view(linked),
+        "backlog": _backlog_view(submission_id, env),
+    }
+
+
+def review(*, item_id: str | None = None,
+           env: Mapping[str, str] | None = None,
+           clock: Any = None) -> dict[str, Any]:
+    """The one read-only unified review over existing Intake and team state.
+
+    It reads the Intake record, the B5 resolution, the B6 eligibility/link and
+    the B7 backlog; it writes no record, creates no team, dispatches no worker
+    and sends nothing. Absent, corrupt or over-bound state raises
+    :class:`ReviewUnavailable` instead of returning a partial or guessed view.
+    """
+
+    try:
+        views = intake.list_submissions(env)
+    except intake.IntakeError as exc:
+        raise ReviewUnavailable(
+            f"the Intake store could not be read ({exc.code})"
+        ) from exc
+    if len(views) > MAX_REVIEW_ITEMS:
+        raise ReviewUnavailable(
+            "the Intake store holds more items than the review bound permits"
+        )
+    if item_id is not None:
+        try:
+            submission_id = intake.submission_id_for(item_id)
+        except intake.IntakeError as exc:
+            raise ReviewUnavailable("the item id is not a valid Intake item") from exc
+        views = [view for view in views if view["submission_id"] == submission_id]
+        if not views:
+            raise ReviewUnavailable("no admitted item has that item id")
+    try:
+        items = [_review_item(view, env=env, clock=clock) for view in views]
+    except ReviewUnavailable:
+        raise
+    except (intake.IntakeError, intake_resolution.ResolutionError,
+            intake_handoff.HandoffError, intake_queue.QueueError,
+            StateError) as exc:
+        raise ReviewUnavailable(
+            f"a review source could not be read ({type(exc).__name__})"
+        ) from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ReviewUnavailable(
+            f"a review source could not be read ({type(exc).__name__})"
+        ) from exc
+    return {
+        "schema": REVIEW_SCHEMA,
+        "status": "OK",
+        "command": "request",
+        "mode": "review",
+        "read_only": True,
+        "authority": "none",
+        "dispatch": False,
+        "count": len(items),
+        "items": items,
+        "notes": [
+            "this review is a read-only projection over existing Intake, B5, "
+            "B6 and B7 evidence; it creates no team, ledger, cache or worker",
+            "an IMPLEMENT candidate is proposed intent, not approval or a "
+            "running agent; any linked team is reported separately and only "
+            "when its provenance is attributable",
+        ],
+    }
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -844,6 +1093,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=("route an exact qualified manifest into the existing "
                               "Team Execution owner path; it never records approval "
                               "and only advances a team whose authorization exists"))
+    parser.add_argument("--review", action="store_true",
+                        help=("read one bounded unified review of existing Intake, "
+                              "B5/B6 eligibility and linked team/backlog state; it "
+                              "writes nothing and dispatches nothing"))
     parser.add_argument("--dry-run", action="store_true",
                         help="classify and validate; admit nothing and start nothing")
     parser.add_argument("--json", action="store_true",
@@ -857,12 +1110,44 @@ def _error(code: str, message: str) -> int:
     return EXIT_UNAVAILABLE
 
 
+def _review_error(code: str, message: str) -> int:
+    _emit({"schema": REVIEW_SCHEMA, "status": "UNAVAILABLE",
+           "command": "request", "mode": "review", "read_only": True,
+           "authority": "none", "dispatch": False,
+           "error": {"code": code, "verdict": "UNAVAILABLE", "message": message}})
+    return EXIT_UNAVAILABLE
+
+
+def _run_review(item_id: str | None) -> int:
+    """Serve one read-only review and return the matching exit code."""
+
+    try:
+        payload = review(item_id=item_id)
+    except ReviewUnavailable as exc:
+        return _review_error(exc.code, str(exc))
+    except (intake.IntakeError, intake_resolution.ResolutionError,
+            intake_handoff.HandoffError, intake_queue.QueueError,
+            StateError) as exc:
+        return _review_error(getattr(exc, "code", None) or "REVIEW_UNAVAILABLE",
+                             str(exc))
+    except (OSError, UnicodeError, ValueError) as exc:
+        return _review_error("REVIEW_UNAVAILABLE", type(exc).__name__)
+    _emit(payload)
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(list(argv or ()))
     except SystemExit as exc:
         return int(exc.code)
+    if args.review:
+        if (args.file or args.text or args.execute or args.dry_run):
+            return _error("USAGE",
+                          "--review cannot be combined with --file, --text, "
+                          "--execute or --dry-run")
+        return _run_review(args.item_id)
     if args.file and (args.item_id or args.text):
         return _error("USAGE", "--file cannot be combined with --item-id/--text")
     if args.dry_run and args.execute:

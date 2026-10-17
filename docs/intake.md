@@ -169,7 +169,9 @@ documented; first match wins, no model and no hidden state:
 
 1. it asks for a reserved consequential effect (`merge`, `deploy`, `release`,
    `publish`, `credential`, `permission`, `destructive`) — reusing B6's
-   mention-vs-request classifier — or leaves one unprovable → `INVESTIGATE`; if
+   mention-vs-request classifier — or leaves one unprovable → `INVESTIGATE`; a
+   mentioned, negated, conditional or already-finished effect is not an asked-for
+   action, so it does not hold an otherwise clear implementation request; if
    the classifier cannot read the text at all the request fails **closed** to
    `INVESTIGATE`, never silently to `BACKLOG`;
 2. it explicitly defers (`later`, `not now`, `backlog`, `someday`, …) →
@@ -209,6 +211,43 @@ second record. That durable admission is the **only** persisted effect of the
 text route. An `IMPLEMENT` decision makes the request *visible* as an execution
 candidate instead of burying it in the backlog; it starts nothing. The request
 text, a work verb and an Intake admission are **never** approval.
+
+### One read-only unified review
+
+`cao request --review` is the one local review surface over the requests CAO
+already admitted. It derives a bounded view from existing state only — the
+Intake record, the B5 resolution, the B6 eligibility/link and the B7 backlog —
+and adds no ledger, cache, scheduler, team or worker:
+
+```sh
+cao request --review                      # every admitted item, bounded
+cao request --review --item-id ID         # exactly one item
+```
+
+Each item reports public-safe Intake metadata (ids, title, source, state,
+admission time and fingerprint), the deterministic route decision as a
+**candidate**, the B5 status and next mover, the B6 eligibility holds and plan
+status, and only then the linked team and backlog state. The request body is
+never included: `request.body_included` is always `false`, and no body,
+redacted body, credential or prompt is echoed.
+
+An `IMPLEMENT` candidate carries its source id and
+`execution.requested = true`, but `execution.started`, `worker.started`,
+`worker.dispatched` and `approved` are all `false`; the candidate is proposed
+intent, never approval and never a running agent. A linked CAO team is shown only
+when its provenance is attributable to this exact submission (validated READ
+team, immutable manifest citing the submission). Otherwise `team.verdict` is
+`UNKNOWN` with no team id. Backlog is attributed only by the queue intent's exact
+`submission_id` binding; an unrelated intent is never matched by title, path or
+guesswork. If an Intake, team, Registry or queue source is unavailable, corrupt
+or above the fixed review bound, the command prints one `UNAVAILABLE` payload
+and exits `3` rather than showing a partial or truncated view. `--review` cannot
+be combined with `--file`, `--text`, `--execute` or `--dry-run`; that is a usage
+error.
+
+The review writes nothing. It opens the Registry read-only when a ledger already
+exists and never creates one, never initializes or starts a team, never ticks the
+queue and never dispatches an agent.
 
 ### The governed team route
 
@@ -264,6 +303,20 @@ still require the existing qualified operator authorization (the B6/B7/B8
 in-process adapter, the protected standing grant, or the operator's chat
 approval). Ambiguous or under-specified requests are held with an actionable
 next step rather than guessed.
+
+The original human message establishes **intent**, not an independently
+host-authenticated identity and not a broad grant. This entrypoint never invents
+an authenticated approval, never records one from text or a CLI flag, and never
+relaxes the exact team manifest/model route digest or the Registry writer gates.
+
+Once an authenticated, scope-bound owner approval is available, clear requested
+work should not need a second subjective accept/reject decision: the approval
+is the decision. The **actual first WRITE dispatch** still needs the existing
+approved team and a live Registry/route qualification at dispatch time, because
+approval of a scope is not proof that the current writer, source head or claim
+state is unchanged. Approval is rechecked only when the scope, the model
+route/privacy, the identity or a reserved effect changes. This creates no
+standing authority and no automatic permission elevation.
 
 Broader documentation integration is outstanding: the task-centered backlog view
 (`cao team backlog`, which groups the immutable team records by initiative and
@@ -629,6 +682,11 @@ B3 flags a reserved word as a risk marker and hands almost every such request to
 - an effect the request **explicitly asks for** is a `HOLD`;
 - an effect the rules **cannot prove non-actionable** is a `HOLD` with a precise
   reason, never a silent pass;
+- a **compound reference** ("squash-merge commit", "merge and deployment
+  states"), a **conditional plan** ("if separately authorized", "when approved",
+  "subject to review") and a **bare claim** ("the merge is complete") are
+  mentions, not requests: they name an artifact, a future condition or a
+  finished state;
 - a request that mixes a consequential effect with a read scope is **never**
   silently downgraded to a READ plan (`mixed_effect_and_read_request`);
 - only a request that declares a read scope and holds no consequential effect is

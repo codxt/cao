@@ -187,19 +187,76 @@ _REQUEST = re.compile(
     r"\b(?:please|seek|require|requires|required|perform|request|requested|"
     r"requesting|execute|run|apply|complete|finish|proceed|then|next action|"
     r"exactly one|single|one|ensure|submit|issue|close|open|make)\b", re.I)
+#: Framing that genuinely directs an action. Quantifiers such as "one" and
+#: "single" are deliberately excluded: they shape a noun phrase ("one squash
+#: merge of the branch") but they do not, on their own, outrank a compound
+#: reference ("one reviewed squash-merge commit") or a conditional reservation.
+_REQUEST_STRONG = re.compile(
+    r"\b(?:please|seek|require|requires|required|perform|request|requested|"
+    r"requesting|execute|run|apply|complete|finish|proceed|ensure|submit|"
+    r"issue|close|open|make|do|must|next action|exactly one)\b", re.I)
 #: How far before an effect word a framing marker must appear to be its request.
 _REQUEST_WINDOW = 48
-#: A compound/reference form that names an existing artifact rather than an act.
-_QUALIFIED = re.compile(
-    r"\b(?:merge|release|deploy|publish|credential|permission)s?[ _-]"
+#: A nominal reference head. An effect word followed (possibly through a short
+#: coordinated list) by one of these names an artifact or a report about it:
+#: "squash-merge commit", "source merge and deployment states".
+_REFERENCE_HEAD = (
     r"(?:note|notes|fingerprint|fingerprints|surface|surfaces|gate|gates|"
-    r"candidate|cadence|plan|plans|record|records|history|lineage|tag|tags|"
-    r"commit|commits|channel|channels|workflow|workflows|shaped|only|scoped|"
-    r"free|safe|evidence|checklist|policy|policies|model)\b"
-    r"|\b(?:legacy|previous|prior|existing|current|original|historical|past|"
-    r"old|latest|retirement|serving)\s+"
-    r"(?:merge|release|deploy|publish|credential|permission)s?\b"
-    r"|\bmerged[- ]main\b|\bcredential[- ]shaped\b|\brelease[- ]only\b", re.I)
+    r"candidate|candidates|cadence|plan|plans|record|records|history|lineage|"
+    r"tag|tags|commit|commits|channel|channels|workflow|workflows|shaped|only|"
+    r"scoped|free|safe|evidence|checklist|policy|policies|model|models|state|"
+    r"states|status|statuses|report|reports|summary|summaries|account|accounts|"
+    r"path|paths|mode|modes)"
+)
+_QUALIFIED_SUFFIX = re.compile(
+    r"(?:\s*(?:and|or|,)\s*[A-Za-z][A-Za-z_-]*){0,5}\s+" + _REFERENCE_HEAD + r"\b",
+    re.I,
+)
+#: A slash compound naming a gate or policy ("review/merge and Factory release
+#: gates"). The slash form with a nearby reference head is a label, not a verb.
+_SLASH_REFERENCE = re.compile(
+    r"[^.;\n]{0,48}?\b(?:gate|gates|state|states|status|statuses|note|notes|"
+    r"record|records|policy|policies)\b",
+    re.I,
+)
+_QUALIFIED_PREFIX = re.compile(
+    r"\b(?:legacy|previous|prior|existing|current|original|historical|past|old|"
+    r"latest|retirement|serving|merged|deployed|released|published)\s+"
+    r"(?:(?:merge|release|deploy|deployment|publish|publication|credential|"
+    r"permission|change|changes)\s+){0,2}\Z",
+    re.I,
+)
+#: A conditional plan or reservation. The effect is not asked for now; it is
+#: contingent on a later, separately verified event. An explicit strong request
+#: verb still wins ("if qualified, seek one squash merge" asks for the merge).
+_CONDITIONAL = re.compile(
+    r"\b(?:if|when|whenever|unless|once|provided(?: that)?|subject to|pending|"
+    r"contingent on|conditional on|only after|only if)\b"
+    r"[^.;\n]{0,96}?"
+    r"\b(?:approved|authori[sz]ed|qualified|reviewed|ratified|permitted|granted|"
+    r"cleared|allowed|accepted|separately)\b",
+    re.I,
+)
+#: A bare claim about an already-finished effect, not a request for one.
+_CLAIM_AFTER = re.compile(
+    r"\s*(?:(?:is|are|was|were|has|have|had)\s+(?:been\s+)?(?:already\s+)?"
+    r"(?:done|complete|completed|finished|merged|deployed|released|published|"
+    r"live|ready|closed|recorded|approved|denied)"
+    r"|(?:already\s+)?(?:done|complete|completed|finished|happened|occurred|"
+    r"landed|succeeded|failed))\b",
+    re.I,
+)
+_CLAIM_BEFORE = re.compile(
+    r"(?:\b(?:already|successfully|previously|recently)\s+"
+    r"|\b(?:is|are|was|were|has|have|had)\s+(?:been\s+)?(?:already\s+)?)\Z",
+    re.I,
+)
+#: Past participles used attributively name a state ("the merged branch",
+#: "merged-main tag"), never a fresh request.
+_ATTRIBUTIVE = frozenset(
+    {"merged", "deployed", "released", "published", "deleted", "removed",
+     "dropped", "destroyed", "revoked", "wiped", "purged", "decommissioned"}
+)
 #: A declared read scope. Only such a request can become an executable READ plan.
 _READ_SCOPE = re.compile(
     r"\b(?:read[ _-]only|read only|audit|inspect|inspection|verify|"
@@ -326,6 +383,48 @@ def _clauses(body: str) -> list[str]:
     return [part.strip() for part in _CLAUSE_SPLIT.split(body) if part.strip()]
 
 
+def _qualified_reference(clause: str, match: re.Match[str]) -> bool:
+    """Whether this occurrence names an existing artifact, not an action.
+
+    The check is per occurrence, never per clause: a reference elsewhere in the
+    same clause must not turn an explicit directive into a mention.
+    """
+
+    if _QUALIFIED_SUFFIX.match(clause, match.end()):
+        return True
+    if (match.start() > 0 and clause[match.start() - 1] == "/"
+            and _SLASH_REFERENCE.match(clause, match.end())):
+        return True
+    if (match.group(0).lower() in _ATTRIBUTIVE
+            and re.match(r"[ _-][A-Za-z]", clause[match.end():])):
+        return True
+    prefix = clause[max(0, match.start() - 48): match.start()]
+    return bool(_QUALIFIED_PREFIX.search(prefix))
+
+
+def _claim_context(clause: str, match: re.Match[str]) -> bool:
+    """Whether this occurrence states an already-finished effect."""
+
+    if _CLAIM_AFTER.match(clause, match.end()):
+        return True
+    prefix = clause[max(0, match.start() - 32): match.start()]
+    return bool(_CLAIM_BEFORE.search(prefix))
+
+
+def _conditional_context(clause: str, match: re.Match[str]) -> bool:
+    """Whether this occurrence is part of a conditional plan or reservation.
+
+    A trailing condition only governs the phrase it closes; a comma ends that
+    phrase, so an unconditional directive before it ("merge now, deploy if
+    approved") is not silently made conditional.
+    """
+
+    scope = _negation_scope_start(clause, match.start())
+    before = clause[scope: match.start()]
+    after = clause[match.start(): match.start() + 96].split(",", 1)[0]
+    return bool(_CONDITIONAL.search(before) or _CONDITIONAL.search(after))
+
+
 def _negation_scope_start(clause: str, position: int) -> int:
     """The index where the negation scope governing ``position`` begins.
 
@@ -370,7 +469,6 @@ def classify_effects(body: str) -> dict[str, str]:
     for category, pattern in _EFFECT_PATTERNS:
         best = "ABSENT"
         for clause in clauses:
-            qualifies = bool(_QUALIFIED.search(clause))
             for match in pattern.finditer(clause):
                 prefix = clause[: match.start()]
                 # Negation is scoped to the sub-clause that carries the effect,
@@ -379,16 +477,24 @@ def classify_effects(body: str) -> dict[str, str]:
                 scope = _negation_scope_start(clause, match.start())
                 scoped = clause[scope: match.start()]
                 forbids = bool(_NEG_START.search(scoped) or _NEG_ANY.search(scoped))
-                imperative = not scoped.strip()
                 window = prefix[-_REQUEST_WINDOW:]
                 if forbids or _NEG_LOCAL.search(prefix):
                     verdict = "NEGATED"
-                elif imperative or _REQUEST.search(window):
+                elif (_conditional_context(clause, match)
+                      or _qualified_reference(clause, match)
+                      or _claim_context(clause, match)):
+                    # A conditional reservation, a compound reference or a bare
+                    # claim is not an asked-for action. It is a mention even when
+                    # a weak quantifier ("one") or a nominal clause opener would
+                    # otherwise look like framing. An explicit strong request
+                    # verb still outranks it ("please merge the merge commit").
+                    verdict = ("REQUESTED"
+                               if _REQUEST_STRONG.search(window)
+                               else "MENTIONED")
+                elif not scoped.strip() or _REQUEST.search(window):
                     # A directive verb/framing outranks a compound reference, so
                     # "publish a new release" is a request, never a mention.
                     verdict = "REQUESTED"
-                elif qualifies:
-                    verdict = "MENTIONED"
                 else:
                     verdict = "AMBIGUOUS"
                 if order.index(verdict) > order.index(best):
