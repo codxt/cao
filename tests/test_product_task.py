@@ -45,6 +45,9 @@ class FakeDriver:
         self.calls: list[tuple] = []
         self.workspaces: list[dict] = []
         self.prompt_exc: Exception | None = None
+        self.prompt_state: str | None = "working"
+        self.prompt_activity = True
+        self.prompt_activity_present = True
         self.wait_state = "done"
         self.read_text = "agent output"
         self.agent_present = False
@@ -116,10 +119,16 @@ class FakeDriver:
         return {"agent_pane_id": pane_id, "agent_workspace_id": pane.get("workspace_id")}
 
     def agent_prompt(self, target, text, *, timeout_ms=None, wait=False):
-        self._note("agent_prompt", target, text)
+        self._note("agent_prompt", target, text, wait=wait, timeout_ms=timeout_ms)
         if self.prompt_exc is not None:
             raise self.prompt_exc
-        return {"agent_pane_id": "w1:p1", "agent_workspace_id": "w1"}
+        result = {"agent_pane_id": "w1:p1", "agent_workspace_id": "w1"}
+        if wait:
+            if self.prompt_activity_present:
+                result["activity_observed"] = self.prompt_activity
+            if self.prompt_state is not None:
+                result["observed_state"] = self.prompt_state
+        return result
 
     def agent_read(self, target, *, lines=200, source="recent"):
         self._note("agent_read", target)
@@ -292,6 +301,12 @@ class ReadFlowTests(TaskCase):
         self.assertEqual(payload["prompt_state"], "accepted")
         self.assertEqual(payload["claim"]["mode"], "READ")
         self.assertEqual(driver.names().count("agent_prompt"), 1)
+        prompt = next(call for call in driver.calls if call[0] == "agent_prompt")
+        self.assertTrue(prompt[2]["wait"])
+        self.assertEqual(
+            prompt[2]["timeout_ms"],
+            product_config.task_defaults(self.config).prompt_timeout_ms,
+        )
         self.assertEqual(driver.names().count("workspace_create"), 1)
         conn = registry.connect(db=self.db)
         self.addCleanup(conn.close)
@@ -416,6 +431,9 @@ class ReadFlowTests(TaskCase):
         )
         self.assertEqual(first["status"], "unknown")
         self.assertEqual(first["prompt_state"], "ambiguous")
+        record = product_state.read_task(task_id, self.env)
+        self.assertTrue(record["checkpoint"]["prompt_issued"])
+        self.assertEqual(record["checkpoint"]["prompt_ack"], "ambiguous")
         driver.prompt_exc = None
         second = product_task.run_task(
             driver=driver,
@@ -428,7 +446,75 @@ class ReadFlowTests(TaskCase):
             wait_ms=0,
         )
         self.assertEqual(second["status"], "unknown")
+        # The issued checkpoint short-circuits the send: a stalled/timeout
+        # prompt is never replayed and never mints a second Registry claim.
         self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(len(self.claim_rows()), 1)
+
+    def test_unobserved_prompt_activity_is_ambiguous_and_never_replayed(self) -> None:
+        driver = FakeDriver()
+        driver.prompt_activity = False  # explicit report of no observed activity
+        task_id = product_task.task_id_for(str(self.repo), "Review this repository")
+        args = dict(
+            driver=driver,
+            repo=str(self.repo),
+            prompt="Review this repository",
+            task_id=task_id,
+            config=self.config,
+            env=self.env,
+            registry_db=self.db,
+            wait_ms=0,
+        )
+        first = product_task.run_task(**args)
+        self.assertEqual(first["status"], "unknown")
+        self.assertEqual(first["prompt_state"], "ambiguous")
+        record = product_state.read_task(task_id, self.env)
+        self.assertTrue(record["checkpoint"]["prompt_issued"])
+        self.assertEqual(record["checkpoint"]["prompt_ack"], "ambiguous")
+        self.assertEqual(record["checkpoint"]["prompt_error"],
+                         "PROMPT_ACTIVITY_UNOBSERVED")
+        self.assertEqual(len(self.claim_rows()), 1)
+        # Even once the runtime would report activity, the already-issued
+        # prompt is resumed without a second send or a replacement claim.
+        driver.prompt_activity = True
+        second = product_task.run_task(**args)
+        self.assertEqual(second["status"], "unknown")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(len(self.claim_rows()), 1)
+
+    def test_missing_prompt_activity_key_is_ambiguous_and_never_replayed(self) -> None:
+        driver = FakeDriver()
+        # The injected driver returns a successful acknowledgement with no
+        # activity marker at all: absence is not acceptance.
+        driver.prompt_activity_present = False
+        task_id = product_task.task_id_for(str(self.repo), "Review this repository")
+        args = dict(
+            driver=driver,
+            repo=str(self.repo),
+            prompt="Review this repository",
+            task_id=task_id,
+            config=self.config,
+            env=self.env,
+            registry_db=self.db,
+            wait_ms=0,
+        )
+        first = product_task.run_task(**args)
+        self.assertEqual(first["status"], "unknown")
+        self.assertEqual(first["prompt_state"], "ambiguous")
+        record = product_state.read_task(task_id, self.env)
+        self.assertTrue(record["checkpoint"]["prompt_issued"])
+        self.assertEqual(record["checkpoint"]["prompt_ack"], "ambiguous")
+        self.assertEqual(record["checkpoint"]["prompt_error"],
+                         "PROMPT_ACTIVITY_UNOBSERVED")
+        self.assertEqual(record["checkpoint"]["stage"], "prompt")
+        self.assertEqual(len(self.claim_rows()), 1)
+        # The issued checkpoint again short-circuits the send: no second
+        # prompt and no replacement claim, even now that the marker appears.
+        driver.prompt_activity_present = True
+        second = product_task.run_task(**args)
+        self.assertEqual(second["status"], "unknown")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(len(self.claim_rows()), 1)
 
     def test_start_recovery_does_not_duplicate_a_started_agent(self) -> None:
         task_id = product_task.task_id_for(str(self.repo), "Review this repository")
@@ -834,8 +920,11 @@ class CompletionAndStopTests(TaskCase):
             wait_ms=1000,
         )
         self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["prompt_state"], "accepted")
         self.assertEqual(payload["claim"]["outcome"], "complete")
         self.assertEqual(len(payload["claim"]["released_head"]), 40)
+        prompt = next(call for call in driver.calls if call[0] == "agent_prompt")
+        self.assertTrue(prompt[2]["wait"])
         conn = registry.connect(db=self.db)
         self.addCleanup(conn.close)
         row = conn.execute(

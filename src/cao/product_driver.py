@@ -33,6 +33,7 @@ __all__ = [
     "MAX_TIMEOUT_MS",
     "READ_SOURCES",
     "WAIT_STATES",
+    "PROMPT_ACTIVITY_STATES",
     "Runner",
     "RuntimeDriver",
     "DriverError",
@@ -52,6 +53,11 @@ MAX_TIMEOUT_MS = 300_000
 READ_SOURCES = ("visible", "recent", "recent-unwrapped", "detection")
 #: Lifecycle states the runtime documents for a wait.
 WAIT_STATES = ("idle", "working", "blocked", "done", "unknown")
+#: States that prove the runtime observed the submitted prompt. ``idle`` is
+#: deliberately excluded: a terminal can acknowledge a prompt while the model
+#: never consumed it, which is exactly the unconfirmed write this driver must
+#: not mistake for execution.
+PROMPT_ACTIVITY_STATES = ("working", "blocked", "done")
 
 #: The closed set of error codes this driver recognizes as a genuine
 #: not-found answer. Every other value, whatever its shape, is a protocol
@@ -488,15 +494,36 @@ class RuntimeDriver:
         text = _require_text(text, "prompt text")
         command = ["agent", "prompt", target, text]
         if wait:
+            # A bare ``agent_prompted`` only proves the terminal accepted the
+            # write, not that the runtime consumed the prompt. Ask the runtime
+            # to wait for native observable activity instead, bounded by the
+            # caller's timeout.
             command.append("--wait")
+            for state in PROMPT_ACTIVITY_STATES:
+                command += ["--until", state]
             if timeout_ms is not None:
                 command += ["--timeout", str(_bounded_timeout_ms(timeout_ms, timeout_ms))]
         result = _read_envelope(self._runner(command), ("agent_prompted",))
         agent = _require_mapping(result, "agent")
-        return {
+        acknowledged = {
             "agent_pane_id": _require_str(agent, "pane_id", "agent pane id"),
             "agent_workspace_id": agent.get("workspace_id"),
         }
+        if not wait:
+            return acknowledged
+        # With ``--wait`` the runtime returns only after it observed one of the
+        # requested activity states, so a reported allowed state is the activity
+        # proof. Anything else -- an explicit idle/unknown state or no state at
+        # all -- is refused instead of being rounded up: a bare acknowledgement
+        # proves only that the terminal accepted the write.
+        state = wait_state(result)
+        if state not in PROMPT_ACTIVITY_STATES:
+            raise DriverProtocolError(
+                "runtime reported no prompt activity after a bounded wait"
+            )
+        acknowledged["observed_state"] = state
+        acknowledged["activity_observed"] = True
+        return acknowledged
 
     def agent_read(self, target: str, *, lines: int = 200, source: str = "recent") -> str:
         lines = _bounded_lines(lines)

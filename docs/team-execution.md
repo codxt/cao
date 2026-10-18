@@ -208,6 +208,17 @@ CAO_TEAM_RESULT: on a standalone line only after successful work. Legacy
 checkpointed prompts that explicitly required reversal continue to be checked
 against their original contract.
 
+A new task's first prompt is submitted with the managed runtime's native
+bounded wait: `agent prompt --wait` with explicit `--until working`, `--until
+blocked` and `--until done`, bounded by `task.prompt_timeout_ms`. A bare
+`agent_prompted` acknowledgement only proves that the terminal accepted a
+write; it does not prove the runtime consumed the prompt. CAO records the
+prompt as accepted only after the driver reports observed activity. A stall,
+timeout, or acknowledgement without observed activity leaves the durable
+`prompt_issued` checkpoint and the original claim in place, records the prompt
+as ambiguous and the task `UNKNOWN`, and never re-sends the prompt, injects an
+automatic Enter, or creates a second Registry claim.
+
 The receipt proves that a post-prompt response was observed; it is not a
 security signature, approval, guarantee of correctness, or proof that tests
 passed. Repository, Registry, scope, commit, review, human approval, and

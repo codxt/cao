@@ -135,7 +135,13 @@ class OccupancyDriver:
 
     def agent_prompt(self, target, text, *, timeout_ms=None, wait=False):
         self.calls.append("agent_prompt")
-        return {"agent_pane_id": "w1:p1", "agent_workspace_id": None}
+        acknowledged = {"agent_pane_id": "w1:p1", "agent_workspace_id": None}
+        if wait:
+            # The product refuses a bare acknowledgement: a bounded wait must
+            # carry the native activity proof the runtime observed.
+            acknowledged["activity_observed"] = True
+            acknowledged["observed_state"] = "working"
+        return acknowledged
 
     def agent_read(self, target, *, lines=200, source="recent"):
         return "output"

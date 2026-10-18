@@ -639,13 +639,33 @@ def _prompt_once(
     checkpoint.update(prompt_issued=True, prompt_ack="pending", stage="prompt")
     _checkpoint(record, checkpoint, env, clock)
     try:
-        driver.agent_prompt(
+        result = driver.agent_prompt(
             checkpoint["agent_name"],
             record["prompt"],
             timeout_ms=defaults.prompt_timeout_ms,
+            wait=True,
         )
     except product_driver.DriverError as exc:
         checkpoint.update(prompt_ack="ambiguous", prompt_error=getattr(exc, "code", None))
+        _checkpoint(record, checkpoint, env, clock)
+        return checkpoint
+    # A runtime that could not observe prompt activity must never be recorded
+    # as accepted, even if it returned a successful write acknowledgement. The
+    # production driver raises when the bounded wait is contradicted, and only
+    # reports activity after a successful native wait; an injected result is
+    # accepted only when it positively carries the activity marker and a state
+    # the driver itself treats as proof. A missing marker or state is ambiguous,
+    # not silent acceptance. The issued checkpoint and claim are retained.
+    observed = result.get("activity_observed") if isinstance(result, Mapping) else None
+    state = result.get("observed_state") if isinstance(result, Mapping) else None
+    if (not isinstance(result, Mapping)
+            or observed is not True
+            or state not in product_driver.PROMPT_ACTIVITY_STATES):
+        checkpoint.update(
+            prompt_ack="ambiguous",
+            prompt_error="PROMPT_ACTIVITY_UNOBSERVED",
+            stage="prompt",
+        )
         _checkpoint(record, checkpoint, env, clock)
         return checkpoint
     checkpoint.update(prompt_ack="accepted", prompt_error=None, stage="prompted")
