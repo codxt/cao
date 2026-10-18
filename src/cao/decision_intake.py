@@ -62,19 +62,23 @@ Load-bearing rules
 * **Default off.** Both entry points take ``enabled = False`` and return an
   explicit ``HELD`` before touching any evidence.
 
-THE KNOWN BRIDGE LIMITATION (reported, never papered over)
-----------------------------------------------------------
-B2a accepts the externally verified terminal receipt only as a **single bounded
-token** (letters, digits and ``_.:@-``, no space) that is also the terminal
-line of the output, while the authoritative native CAO team terminal receipt
-for the exact task is a **two-token line** (a fixed result prefix, one space,
-the task nonce). The two grammars cannot be reconciled inside this batch:
-editing ``decision_stage`` is out of scope and inventing, appending or rewriting
-a receipt would fabricate proof. The verified native receipt is therefore handed
-to B2a unchanged; B2a fails closed with its stable ``receipt_unverifiable``
-code, and this module returns that code together with an explicit
-:data:`MISSING_RECEIPT_INTERFACE` naming precisely the interface that is
-missing. No plan is validated on trust and no envelope ever carries authority.
+THE NATIVE RECEIPT BRIDGE (closed in Batch B2c)
+-----------------------------------------------
+B2a originally accepted the externally verified terminal receipt only as a
+**single bounded token**, while the authoritative native CAO team terminal
+receipt for the exact task is a **two-token line** (the fixed
+``CAO_TEAM_RESULT:`` prefix, one ASCII space, 16 lowercase hex). Batch B2c
+closes that gap in :mod:`cao.decision_stage`, which now admits exactly that
+native two-token grammar *alongside* the original legacy single token. The
+verified native receipt is still derived independently from the exact bound
+execution id and the original task prompt and still has to be the unique
+terminal line of the authoritative output; nothing here invents, appends or
+rewrites a receipt. A stable ``receipt_unverifiable`` therefore now means only
+that the externally supplied receipt is not the exact verified native or
+legacy token; it never names a missing bridge. The receipt remains **source
+evidence, never authority** -- a well-formed receipt never grants, dispatches
+or widens a plan, and no tagged plan is accepted without its own verified
+receipt proof.
 
 Separation and scope
 --------------------
@@ -115,19 +119,23 @@ ALIAS_HEX = 40
 #: Bounded reason text; anything longer is truncated rather than propagated.
 MAX_REASON = 500
 
-#: The exact missing interface the stable receipt hold hands back.
+#: Retained for public API stability. Batch B2c closed the receipt interface that
+#: this constant used to name: :mod:`cao.decision_stage` now admits the exact
+#: native CAO team two-token receipt (``CAO_TEAM_RESULT:``, one ASCII space, 16
+#: lowercase hex) alongside the original legacy single token. No envelope reports
+#: a missing native bridge any more; a stable ``receipt_unverifiable`` now means
+#: only that the externally supplied receipt is not the exact verified native or
+#: legacy token, and no tagged plan is accepted without its own verified receipt
+#: proof.
 MISSING_RECEIPT_INTERFACE = (
-    "decision_stage.validate_result requires the externally verified terminal "
-    "receipt to be one bounded single token (letters, digits and _.:@- only, "
-    "no space) that is also the terminal line of the output, while the "
-    "authoritative native CAO team terminal receipt verified for this exact "
-    "task is a two-token line (a fixed result prefix, one space, the task "
-    "nonce). Bridging the two grammars needs exactly one of: (1) a separately "
-    "reviewed receipt-token projection added to src/cao/decision_stage.py, or "
-    "(2) a governed native receipt contract that emits a single bounded token. "
-    "Neither exists in Batch B2b, so the independently verified native proof "
-    "is handed back held: no receipt is invented, appended or rewritten, and "
-    "no tagged plan is accepted without its own verified receipt proof."
+    "decision_stage.validate_result now admits the exact native CAO team "
+    "two-token terminal receipt (CAO_TEAM_RESULT:, one ASCII space, 16 lowercase "
+    "hex) alongside the original legacy single-token grammar, so the receipt "
+    "grammar bridge is no longer missing. A stable receipt_unverifiable now "
+    "means only that the externally supplied receipt is not the exact verified "
+    "native or legacy token; no interface is reported missing, no receipt is "
+    "invented, appended or rewritten, and no tagged plan is accepted without its "
+    "own verified receipt proof."
 )
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1035,11 +1043,9 @@ def validate_result(
             f"the read-only native result evidence could not be established "
             f"({type(exc).__name__})",
         )
-    missing = (
-        MISSING_RECEIPT_INTERFACE
-        if stage.get("status") == "HELD" and stage.get("code") == "receipt_unverifiable"
-        else None
-    )
+    # Batch B2c admits the exact native two-token receipt in decision_stage, so a
+    # stable receipt_unverifiable is no longer a missing bridge. The envelope key
+    # is retained for schema stability and is always None.
     return _envelope(
         stage["status"],
         stage["code"],
@@ -1055,5 +1061,5 @@ def validate_result(
         source=ctx["source_view"],
         binding=ctx["binding"],
         stage=stage,
-        missing_interface=missing,
+        missing_interface=None,
     )

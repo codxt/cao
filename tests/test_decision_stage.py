@@ -13,10 +13,12 @@ prompt and no processing; an unqualified route, an unqualified data class,
 non-zero retention, stale or mismatched evidence, title/body/path/credential
 smuggling, a non-enumerated or non-synthetic submission id and a missing,
 denied or failing standing authorization all hold the prompt; the result path
-fails closed on a missing, unknown, duplicated, non-terminal or uncheckable
-receipt and on absent task/submission binding; spoofed, stale, duplicate,
-oversized, unbalanced and malformed output is refused; exactly one tagged
-block is extracted; prompt echoes and prompt injection are inert; mixed
+accepts exactly the original bounded legacy receipt token and the exact native
+CAO team two-token receipt and otherwise fails closed on a missing, unknown,
+malformed, wrong, uppercase-hex, non-terminal, duplicated, echoed or
+uncheckable receipt and on absent task/submission binding; spoofed, stale,
+duplicate, oversized, unbalanced and malformed output is refused; exactly one
+tagged block is extracted; prompt echoes and prompt injection are inert; mixed
 READ/WRITE/RESERVED requests pass through the existing validator unchanged;
 and the stage has zero side effects.
 """
@@ -59,6 +61,9 @@ SUBMISSION = "synthetic-read-001"
 SUBMISSIONS = [SUBMISSION]
 TASK = "task-0001"
 RECEIPT = "receipt-" + "9" * 32
+#: The exact native CAO team two-token receipt: prefix, one ASCII space, 16
+#: lowercase hex. Synthetic; no real nonce appears.
+NATIVE_RECEIPT = "CAO_TEAM_RESULT: 0123456789abcdef"
 AUTH = lambda: True  # noqa: E731 - a fixed synthetic predicate fixture
 
 
@@ -596,6 +601,122 @@ class ResultTests(unittest.TestCase):
         self.assertFalse(result["dispatch"])
 
 
+class NativeReceiptTests(unittest.TestCase):
+    """Batch B2c: exactly the native two-token receipt is also admitted.
+
+    The native CAO team receipt is externally verified source evidence, never
+    authority: a well-formed native receipt never grants, dispatches or widens a
+    plan, and the WRITE/RESERVED holds and the independent-source proof
+    requirement are unchanged.
+    """
+
+    def test_native_read_block_with_exact_native_receipt_is_proposed(self) -> None:
+        result = run_result(
+            output_for(plan(), receipt=NATIVE_RECEIPT), receipt=NATIVE_RECEIPT
+        )
+        self.assertEqual(result["status"], "PROPOSED")
+        self.assertIsNone(result["code"])
+        self.assertEqual(result["action_class"], "READ")
+        self.assertEqual(result["authority"], "none")
+        self.assertFalse(result["dispatch"])
+        self.assertEqual(result["effects"], [])
+        self.assertTrue(result["advisory_only"])
+
+    def test_legacy_single_token_receipt_is_still_accepted(self) -> None:
+        result = run_result(output_for(plan(), receipt=RECEIPT), receipt=RECEIPT)
+        self.assertEqual(result["status"], "PROPOSED")
+        self.assertIsNone(result["code"])
+        self.assertEqual(result["authority"], "none")
+
+    def test_native_receipt_with_capital_hex_holds(self) -> None:
+        forged = "CAO_TEAM_RESULT: 0123456789ABCDEF"
+        result = run_result(output_for(plan(), receipt=forged), receipt=forged)
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "receipt_unverifiable")
+
+    def test_native_receipt_with_wrong_length_holds(self) -> None:
+        for forged in (
+            "CAO_TEAM_RESULT: 0123456789abcde",     # 15 hex
+            "CAO_TEAM_RESULT: 0123456789abcdef0",   # 17 hex
+            "CAO_TEAM_RESULT: 0123456789abcdef extra",
+            "CAO_TEAM_RESULT:  0123456789abcdef",   # two spaces
+        ):
+            with self.subTest(forged=forged):
+                result = run_result(
+                    output_for(plan(), receipt=forged), receipt=forged
+                )
+                self.assertEqual(result["status"], "HELD")
+                self.assertEqual(result["code"], "receipt_unverifiable")
+
+    def test_other_multiword_token_holds(self) -> None:
+        forged = "OTHER_RESULT: 0123456789abcdef"
+        result = run_result(output_for(plan(), receipt=forged), receipt=forged)
+        self.assertEqual(result["code"], "receipt_unverifiable")
+
+    def test_native_receipt_missing_from_output_holds(self) -> None:
+        result = run_result(
+            output_for(plan(), receipt=None), receipt=NATIVE_RECEIPT
+        )
+        self.assertEqual(result["code"], "receipt_missing")
+
+    def test_native_receipt_duplicated_holds(self) -> None:
+        doubled = output_for(plan(), receipt=NATIVE_RECEIPT) + f"{NATIVE_RECEIPT}\n"
+        result = run_result(doubled, receipt=NATIVE_RECEIPT)
+        self.assertEqual(result["code"], "receipt_duplicate")
+
+    def test_native_receipt_echoed_inside_the_block_is_refused(self) -> None:
+        echoed = (
+            f'{dst.OPEN_TAG} submission="{SUBMISSION}" task="{TASK}">\n'
+            f"{NATIVE_RECEIPT}\n"
+            f"{json.dumps(plan())}\n"
+            f"{dst.CLOSE_TAG}\n{NATIVE_RECEIPT}\n"
+        )
+        result = run_result(echoed, receipt=NATIVE_RECEIPT)
+        self.assertEqual(result["code"], "receipt_duplicate")
+
+    def test_native_receipt_not_terminal_holds(self) -> None:
+        text = output_for(plan(), receipt=NATIVE_RECEIPT) + "trailing prose\n"
+        result = run_result(text, receipt=NATIVE_RECEIPT)
+        self.assertEqual(result["code"], "receipt_not_terminal")
+
+    def test_native_receipt_is_not_authority_for_write_or_reserved(self) -> None:
+        write = run_result(
+            output_for(write_plan(), receipt=NATIVE_RECEIPT),
+            receipt=NATIVE_RECEIPT,
+        )
+        self.assertEqual(write["status"], "HELD")
+        self.assertEqual(write["code"], "write_held_for_authorization")
+        self.assertFalse(write["dispatch"])
+        reserved = run_result(
+            output_for(reserved_plan(), receipt=NATIVE_RECEIPT),
+            receipt=NATIVE_RECEIPT,
+        )
+        self.assertEqual(reserved["status"], "HELD")
+        self.assertEqual(reserved["code"], "reserved_effect_held")
+        self.assertFalse(reserved["dispatch"])
+
+    def test_native_receipt_does_not_replace_the_source_proof(self) -> None:
+        result = run_result(
+            output_for(plan(), receipt=NATIVE_RECEIPT),
+            receipt=NATIVE_RECEIPT,
+            source_known=None,
+        )
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "source_check_unavailable")
+
+    def test_native_receipt_is_still_bound_to_task_and_submission(self) -> None:
+        wrong_task = run_result(
+            output_for(plan(), receipt=NATIVE_RECEIPT, task="task-0002"),
+            receipt=NATIVE_RECEIPT,
+        )
+        self.assertEqual(wrong_task["code"], "task_binding_mismatch")
+        wrong_submission = run_result(
+            output_for(plan(), receipt=NATIVE_RECEIPT, submission="synthetic-other"),
+            receipt=NATIVE_RECEIPT,
+        )
+        self.assertEqual(wrong_submission["code"], "submission_mismatch")
+
+
 class InjectionTests(unittest.TestCase):
     def test_hostile_prose_around_the_block_is_inert(self) -> None:
         hostile = (
@@ -646,6 +767,8 @@ class ExpectedOutcomeTests(unittest.TestCase):
         ("prior completion", lambda: run_result(output_for(plan()), completed_work={"verdict": "ALREADY_COMPLETE", "refs": [LOCATION]}), "HELD", "already_complete"),
         ("write plan held for authorization", lambda: run_result(output_for(write_plan())), "HELD", "write_held_for_authorization"),
         ("reserved effect preserved", lambda: run_result(output_for(reserved_plan())), "HELD", "reserved_effect_held"),
+        ("native two-token receipt read result", lambda: run_result(output_for(plan(), receipt=NATIVE_RECEIPT), receipt=NATIVE_RECEIPT), "PROPOSED", None),
+        ("native receipt with capital hex refused", lambda: run_result(output_for(plan(), receipt="CAO_TEAM_RESULT: 0123456789ABCDEF"), receipt="CAO_TEAM_RESULT: 0123456789ABCDEF"), "HELD", "receipt_unverifiable"),
     ]
 
     def test_explicitly_judged_expected_outcomes(self) -> None:
