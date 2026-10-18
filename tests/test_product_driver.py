@@ -183,6 +183,95 @@ class AgentTests(unittest.TestCase):
         driver = RuntimeDriver(runner=runner)
         out = driver.agent_prompt("cao1", "Review this")
         self.assertEqual(out["agent_pane_id"], "w1:p1")
+        self.assertEqual(runner.calls, [["agent", "prompt", "cao1", "Review this"]])
+
+    def test_agent_prompt_wait_requests_bounded_native_activity(self) -> None:
+        argv = (
+            "agent",
+            "prompt",
+            "cao1",
+            "Review this",
+            "--wait",
+            "--until",
+            "working",
+            "--until",
+            "blocked",
+            "--until",
+            "done",
+            "--timeout",
+            "5000",
+        )
+        runner = FakeRunner(
+            {
+                argv: envelope(
+                    "agent_prompted",
+                    agent={"pane_id": "w1:p1", "workspace_id": "w1"},
+                    matched_state="working",
+                )
+            }
+        )
+        driver = RuntimeDriver(runner=runner)
+        out = driver.agent_prompt("cao1", "Review this", timeout_ms=5000, wait=True)
+        self.assertEqual(runner.calls, [list(argv)])
+        self.assertTrue(out["activity_observed"])
+        self.assertEqual(out["observed_state"], "working")
+
+    def test_agent_prompt_wait_without_a_state_is_a_native_observation(self) -> None:
+        # A successful bounded wait is the runtime's own activity proof, so a
+        # plain acknowledgement with no explicit state is accepted.
+        argv = (
+            "agent",
+            "prompt",
+            "cao1",
+            "Review this",
+            "--wait",
+            "--until",
+            "working",
+            "--until",
+            "blocked",
+            "--until",
+            "done",
+        )
+        runner = FakeRunner(
+            {
+                argv: envelope(
+                    "agent_prompted",
+                    agent={"pane_id": "w1:p1", "workspace_id": "w1"},
+                )
+            }
+        )
+        driver = RuntimeDriver(runner=runner)
+        out = driver.agent_prompt("cao1", "Review this", wait=True)
+        self.assertTrue(out["activity_observed"])
+        self.assertIsNone(out["observed_state"])
+        self.assertEqual(runner.calls, [list(argv)])
+
+    def test_agent_prompt_wait_rejects_a_contradictory_idle_state(self) -> None:
+        argv = (
+            "agent",
+            "prompt",
+            "cao1",
+            "Review this",
+            "--wait",
+            "--until",
+            "working",
+            "--until",
+            "blocked",
+            "--until",
+            "done",
+        )
+        runner = FakeRunner(
+            {
+                argv: envelope(
+                    "agent_prompted",
+                    agent={"pane_id": "w1:p1", "workspace_id": "w1"},
+                    matched_state="idle",
+                )
+            }
+        )
+        driver = RuntimeDriver(runner=runner)
+        with self.assertRaises(product_driver.DriverProtocolError):
+            driver.agent_prompt("cao1", "Review this", wait=True)
 
     def test_agent_wait_extracts_a_state(self) -> None:
         runner = FakeRunner(
