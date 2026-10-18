@@ -47,6 +47,7 @@ class FakeDriver:
         self.prompt_exc: Exception | None = None
         self.prompt_state: str | None = "working"
         self.prompt_activity = True
+        self.prompt_activity_present = True
         self.wait_state = "done"
         self.read_text = "agent output"
         self.agent_present = False
@@ -123,7 +124,8 @@ class FakeDriver:
             raise self.prompt_exc
         result = {"agent_pane_id": "w1:p1", "agent_workspace_id": "w1"}
         if wait:
-            result["activity_observed"] = self.prompt_activity
+            if self.prompt_activity_present:
+                result["activity_observed"] = self.prompt_activity
             if self.prompt_state is not None:
                 result["observed_state"] = self.prompt_state
         return result
@@ -475,6 +477,40 @@ class ReadFlowTests(TaskCase):
         # Even once the runtime would report activity, the already-issued
         # prompt is resumed without a second send or a replacement claim.
         driver.prompt_activity = True
+        second = product_task.run_task(**args)
+        self.assertEqual(second["status"], "unknown")
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+        self.assertEqual(len(self.claim_rows()), 1)
+
+    def test_missing_prompt_activity_key_is_ambiguous_and_never_replayed(self) -> None:
+        driver = FakeDriver()
+        # The injected driver returns a successful acknowledgement with no
+        # activity marker at all: absence is not acceptance.
+        driver.prompt_activity_present = False
+        task_id = product_task.task_id_for(str(self.repo), "Review this repository")
+        args = dict(
+            driver=driver,
+            repo=str(self.repo),
+            prompt="Review this repository",
+            task_id=task_id,
+            config=self.config,
+            env=self.env,
+            registry_db=self.db,
+            wait_ms=0,
+        )
+        first = product_task.run_task(**args)
+        self.assertEqual(first["status"], "unknown")
+        self.assertEqual(first["prompt_state"], "ambiguous")
+        record = product_state.read_task(task_id, self.env)
+        self.assertTrue(record["checkpoint"]["prompt_issued"])
+        self.assertEqual(record["checkpoint"]["prompt_ack"], "ambiguous")
+        self.assertEqual(record["checkpoint"]["prompt_error"],
+                         "PROMPT_ACTIVITY_UNOBSERVED")
+        self.assertEqual(record["checkpoint"]["stage"], "prompt")
+        self.assertEqual(len(self.claim_rows()), 1)
+        # The issued checkpoint again short-circuits the send: no second
+        # prompt and no replacement claim, even now that the marker appears.
+        driver.prompt_activity_present = True
         second = product_task.run_task(**args)
         self.assertEqual(second["status"], "unknown")
         self.assertEqual(driver.names().count("agent_prompt"), 1)

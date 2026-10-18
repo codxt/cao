@@ -652,11 +652,15 @@ def _prompt_once(
     # A runtime that could not observe prompt activity must never be recorded
     # as accepted, even if it returned a successful write acknowledgement. The
     # production driver raises when the bounded wait is contradicted, and only
-    # reports activity after a successful native wait; an explicit negative
-    # report from any driver is rejected here as well. The issued checkpoint
-    # and claim are retained.
+    # reports activity after a successful native wait; an injected result is
+    # accepted only when it positively carries the activity marker and a state
+    # the driver itself treats as proof. A missing marker or state is ambiguous,
+    # not silent acceptance. The issued checkpoint and claim are retained.
     observed = result.get("activity_observed") if isinstance(result, Mapping) else None
-    if isinstance(result, Mapping) and "activity_observed" in result and observed is not True:
+    state = result.get("observed_state") if isinstance(result, Mapping) else None
+    if (not isinstance(result, Mapping)
+            or observed is not True
+            or state not in product_driver.PROMPT_ACTIVITY_STATES):
         checkpoint.update(
             prompt_ack="ambiguous",
             prompt_error="PROMPT_ACTIVITY_UNOBSERVED",

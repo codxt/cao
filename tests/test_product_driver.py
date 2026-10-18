@@ -216,9 +216,11 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(out["activity_observed"])
         self.assertEqual(out["observed_state"], "working")
 
-    def test_agent_prompt_wait_without_a_state_is_a_native_observation(self) -> None:
-        # A successful bounded wait is the runtime's own activity proof, so a
-        # plain acknowledgement with no explicit state is accepted.
+    def test_agent_prompt_wait_without_a_state_is_a_protocol_error(self) -> None:
+        # A bare acknowledgement only proves the terminal accepted the write.
+        # With no reported activity state there is no proof the runtime
+        # consumed the prompt, so the driver must refuse rather than synthesise
+        # an observation.
         argv = (
             "agent",
             "prompt",
@@ -241,9 +243,8 @@ class AgentTests(unittest.TestCase):
             }
         )
         driver = RuntimeDriver(runner=runner)
-        out = driver.agent_prompt("cao1", "Review this", wait=True)
-        self.assertTrue(out["activity_observed"])
-        self.assertIsNone(out["observed_state"])
+        with self.assertRaises(product_driver.DriverProtocolError):
+            driver.agent_prompt("cao1", "Review this", wait=True)
         self.assertEqual(runner.calls, [list(argv)])
 
     def test_agent_prompt_wait_rejects_a_contradictory_idle_state(self) -> None:

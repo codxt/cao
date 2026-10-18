@@ -512,11 +512,12 @@ class RuntimeDriver:
         if not wait:
             return acknowledged
         # With ``--wait`` the runtime returns only after it observed one of the
-        # requested activity states, so a successful acknowledgement is itself
-        # the activity proof. A response that reports the opposite -- an
-        # explicit idle/unknown state -- is refused instead of being rounded up.
+        # requested activity states, so a reported allowed state is the activity
+        # proof. Anything else -- an explicit idle/unknown state or no state at
+        # all -- is refused instead of being rounded up: a bare acknowledgement
+        # proves only that the terminal accepted the write.
         state = wait_state(result)
-        if state in WAIT_STATES and state not in PROMPT_ACTIVITY_STATES:
+        if state not in PROMPT_ACTIVITY_STATES:
             raise DriverProtocolError(
                 "runtime reported no prompt activity after a bounded wait"
             )
