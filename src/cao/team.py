@@ -415,21 +415,20 @@ def _phase_mode(task: Mapping[str, Any], phase: str) -> str:
 def _verify_model_policy(config: product_config.ProductConfig | None,
                          spec: Mapping[str, Any], *,
                          bound: Mapping[str, Any] | None = None) -> None:
-    """Deny any NEW dispatch whose resolved route the model allowlist forbids.
+    """Deny any NEW dispatch whose resolved route the dispatch policy forbids.
 
-    Called on plan, initialization, start and every new dispatch intent. An
-    absent or unconfigured allowlist preserves existing behavior. Only routes
-    that have not started are gated: an already-issued execution keeps its exact
-    identity, prompt and claim and is still reconciled and released. Every
-    refusal is explicit; there is no silent fallback. A caller that already
-    resolved the boundary passes it in so one decision costs one resolution.
+    Called on plan, initialization, start and every new dispatch intent. The
+    OpenCode ``mini``-harness qualification is unconditional; a configured
+    allowlist adds the route/permission decision. Only routes that have not
+    started are gated: an already-issued execution keeps its exact identity,
+    prompt and claim and is still reconciled and released. Every refusal is
+    explicit; there is no silent fallback. A caller that already resolved the
+    boundary passes it in so one decision costs one resolution.
     """
 
     if config is None:
         return
     policy = product_config.team_model_policy(config)
-    if policy is None:
-        return
     try:
         bound = (bound if bound is not None
                  else _dispatchable_routes(config, spec))

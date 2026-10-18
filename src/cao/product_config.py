@@ -482,7 +482,9 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     OpenCode launch opens the interactive TUI at its own default model, so it is
     refused (``TEAM_ROUTE_TUI_UNQUALIFIED``) here, before any Registry claim or
     pane effect; this applies to a role model, an inherited provider and an
-    ``agent_profile`` alike.
+    ``agent_profile`` alike, and it holds even when the optional allowlist is
+    absent. Non-OpenCode routes keep the unconfigured legacy behavior exactly
+    until an operator supplies an allowlist.
 
     ``mode`` is the declared task mode (``read``/``write``) when the caller
     knows it. Native Codex WRITE is permitted only for the two pinned model
@@ -497,17 +499,35 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     technically verifiable.
     """
 
-    if policy is None:
-        return None
+    if not isinstance(route, Mapping):
+        return None if policy is None else "TEAM_MODEL_UNRESOLVED"
     status, model = route_model(route)
-    if status != "resolved" or model is None:
-        return "TEAM_MODEL_UNRESOLVED"
     provider = route.get("provider")
     cli = (provider.get("cli")
            if isinstance(provider, Mapping) else None)
-    identity = _canonical_route_identity(model, cli)
-    prefix = identity.split("/", 1)[0]
-    required = _TEAM_ROUTE_RUNTIME.get(prefix)
+    kind_token = safe_route_token(route.get("agent_kind"))
+    cli_token = safe_route_token(cli)
+    identity = (_canonical_route_identity(model, cli)
+                if model is not None else None)
+    prefix = identity.split("/", 1)[0] if identity is not None else None
+    required = _TEAM_ROUTE_RUNTIME.get(prefix) if prefix is not None else None
+    opencode_bound = (
+        kind_token == _OPENCODE_RUNTIME
+        or cli_token == _OPENCODE_RUNTIME
+        or (required is not None and required[0] == _OPENCODE_RUNTIME))
+    if policy is None:
+        # The mini-harness requirement qualifies the launch itself, so it is
+        # independent of the optional allowlist: an absent allowlist never
+        # permits a bare OpenCode TUI or an implicit model. Non-OpenCode routes
+        # keep the unconfigured legacy behavior exactly.
+        if not opencode_bound:
+            return None
+        harness = _opencode_harness_error(route.get("agent_args"))
+        if status != "resolved" or model is None:
+            return "TEAM_MODEL_UNRESOLVED"
+        return harness
+    if status != "resolved" or model is None:
+        return "TEAM_MODEL_UNRESOLVED"
     # A route whose canonical identity binds a known runtime is matched ONLY as
     # that exact canonical identity, so a bare or foreign alias can never stand
     # in for it. Routes for other provider prefixes keep the generic behavior
@@ -517,8 +537,8 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     if not permitted:
         return "TEAM_MODEL_NOT_ALLOWED"
     if required is not None:
-        if (safe_route_token(route.get("agent_kind")) != required[0]
-                or safe_route_token(cli) != required[1]):
+        if (kind_token != required[0]
+                or cli_token != required[1]):
             return "TEAM_ROUTE_IDENTITY_MISMATCH"
     # Compare on the base route, case-folded: a bounded ``#effort`` variant and
     # a non-canonical spelling never change the upstream provider, so neither
@@ -534,8 +554,6 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     # prefix or through its resolved agent kind / provider CLI, so a
     # foreign-prefixed model id (which would otherwise take the generic path)
     # still counts as Codex.
-    kind_token = safe_route_token(route.get("agent_kind"))
-    cli_token = safe_route_token(cli)
     codex_bound = (prefix == _CODEX_RUNTIME
                    or kind_token == _CODEX_RUNTIME
                    or cli_token == _CODEX_RUNTIME)
@@ -572,8 +590,7 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     # through its identity prefix, its resolved agent kind or its provider CLI
     # is refused unless it selects that harness; the native Codex handling above
     # is untouched.
-    if (kind_token == _OPENCODE_RUNTIME or cli_token == _OPENCODE_RUNTIME
-            or (required is not None and required[0] == _OPENCODE_RUNTIME)):
+    if opencode_bound:
         harness = _opencode_harness_error(route.get("agent_args"))
         if harness is not None:
             return harness

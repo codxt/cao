@@ -507,18 +507,19 @@ class TeamOpenCodeMiniHarnessTests(unittest.TestCase):
                     "XDG_CONFIG_HOME": str(self.root / "config")}
 
     def configure(self, profile_args, *, kind="opencode", allowlist=None,
-                  route=None):
+                  route=None, omit_allowlist=False):
         route = route or self.ROUTE
         self.raw = {
             "schema": product_config.SCHEMA,
             "provider": {"cli": "opencode", "id": "local", "model": self.ROUTE},
             "team_approval": {"mode": "chat"},
             "registry_db": str(self.root / "shared.sqlite3"),
-            "team_model_allowlist": allowlist or [route],
             "agent_profiles": {
                 "reader": {"agent_kind": kind, "read_args": list(profile_args)},
             },
         }
+        if not omit_allowlist:
+            self.raw["team_model_allowlist"] = allowlist or [route]
         product_config.write_config(self.raw, product_config.config_path(self.env))
         self.config = product_config.validate_config(self.raw)
 
@@ -576,6 +577,69 @@ class TeamOpenCodeMiniHarnessTests(unittest.TestCase):
         self.assertEqual(record["status"], "PAUSED")
         bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
         self.assertIs(bound["allowed"]["read"]["work"], True)
+
+    def test_absent_allowlist_refuses_a_bare_or_agent_opencode_profile(self):
+        # The harness qualification applies to a NEW team dispatch even when
+        # the operator never configured an allowlist, and the refusal happens
+        # before any team state or Registry claim is written.
+        for args, reason in (
+                ([], "TEAM_MODEL_UNRESOLVED"),
+                (["--model", self.ROUTE], "TEAM_ROUTE_TUI_UNQUALIFIED"),
+                (["mini", "--agent", "build", "--model", self.ROUTE],
+                 "TEAM_ROUTE_TUI_UNQUALIFIED"),
+                (["mini", "--model", self.ROUTE, "--print"],
+                 "TEAM_ROUTE_TUI_UNQUALIFIED")):
+            with self.subTest(args=args):
+                self.configure(args, omit_allowlist=True)
+                with self.assertRaises(team.TeamAdmissionError) as caught:
+                    team.initialize(self.spec("no-allowlist-tui"), env=self.env,
+                                    config=self.config, approved=True)
+                self.assertIn(reason, str(caught.exception))
+                self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_absent_allowlist_refuses_a_missing_or_ambiguous_model(self):
+        for args in (["mini"], ["mini", "--model"],
+                     ["mini", "--model", self.ROUTE,
+                      "--model", self.ROUTE],
+                     ["mini", "--model", "not a safe token"]):
+            with self.subTest(args=args):
+                self.configure(args, omit_allowlist=True)
+                with self.assertRaises(team.TeamAdmissionError) as caught:
+                    team.initialize(self.spec("no-allowlist-model"),
+                                    env=self.env, config=self.config,
+                                    approved=True)
+                self.assertIn("TEAM_MODEL_UNRESOLVED", str(caught.exception))
+                self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_absent_allowlist_admits_a_valid_mini_profile(self):
+        self.configure(["mini", "--standalone", "--model", self.ROUTE],
+                       omit_allowlist=True)
+        spec = self.spec("no-allowlist-mini")
+        record = team.initialize(spec, env=self.env, config=self.config,
+                                 approved=True)
+        self.assertEqual(record["status"], "PAUSED")
+        bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
+        self.assertIs(bound["allowed"]["read"]["work"], True)
+        self.assertEqual(
+            product_config.route_model(bound["routes"]["read"]["work"]),
+            ("resolved", self.ROUTE))
+
+    def test_absent_allowlist_does_not_gate_a_native_codex_profile(self):
+        self.configure(["--model", "gpt-6.1-sol"], kind="codex",
+                       route="codex/gpt-6.1-sol", omit_allowlist=True)
+        spec = self.spec("no-allowlist-codex")
+        record = team.initialize(spec, env=self.env, config=self.config,
+                                 approved=True)
+        self.assertEqual(record["status"], "PAUSED")
+        bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
+        self.assertIs(bound["allowed"]["read"]["work"], True)
+
+    def test_plan_reports_the_opencode_denial_without_an_allowlist(self):
+        self.configure([], omit_allowlist=True)
+        bound = team._dispatchable_routes(self.config,
+                                          team.validate_spec(
+                                              self.spec("no-allowlist-plan")))
+        self.assertIs(bound["allowed"]["read"]["work"], False)
 
 
 if __name__ == "__main__":

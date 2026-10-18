@@ -453,7 +453,9 @@ class ChatTeamTests(unittest.TestCase):
         self.spec["roles"]["reviewer"] = {
             "instruction": "Inspect source", "agent_profile": "read"}
         self.raw["agent_profiles"] = {"read": {"agent_kind": "opencode",
-                                               "read_args": ["mini"]}}
+                                               "read_args": [
+                                                   "mini", "--model",
+                                                   "opencode/default"]}}
         self.configure()
         self.admit(approved=True)
         team.set_desired("alpha", "running", env=self.env)
