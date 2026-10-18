@@ -601,6 +601,78 @@ class InstalledCompatibilityTests(unittest.TestCase):
         self.assertEqual(outcome.state, "INCOMPATIBLE")
         self.assertEqual(outcome.observed_version, "0.9.3-rc1")
 
+    def test_old_pin_in_new_runtime_diagnostic_does_not_bypass_attestation(self) -> None:
+        asset = self._asset()
+        external = self._external()
+        calls = []
+
+        def runner(argv):
+            calls.append(tuple(argv[1:]))
+            if tuple(argv[1:]) == ("--version",):
+                return bootstrap.CommandResult(0, "tool 0.9.5\nold build 0.9.3\n")
+            if tuple(argv[1:]) == ("status", "server"):
+                return bootstrap.CommandResult(
+                    0, "status: running\nendpoint_compatible: yes\n"
+                )
+            return bootstrap.CommandResult(127, "")
+
+        outcome = self._ensure(asset, external, runner)
+        self.assertEqual(outcome.state, "INCOMPATIBLE")
+        self.assertEqual(outcome.observed_version, "0.9.5")
+        self.assertIn(("status", "server"), calls)
+        self.assertEqual(external.read_bytes(), b"system-binary")
+
+    def test_diagnostic_old_pin_does_not_block_valid_new_runtime(self) -> None:
+        asset = self._asset()
+        external = self._external()
+
+        def runner(argv):
+            if tuple(argv[1:]) == ("--version",):
+                return bootstrap.CommandResult(0, "tool 0.9.5\nold build 0.9.3\n")
+            if tuple(argv[1:]) == ("status", "server"):
+                return bootstrap.CommandResult(0, SERVER_OK)
+            return bootstrap.CommandResult(127, "")
+
+        outcome = self._ensure(asset, external, runner)
+        self.assertEqual(outcome.state, "ADOPTED")
+        self.assertEqual(outcome.observed_version, "0.9.5")
+
+    def test_foreign_runtime_cannot_claim_exact_pinned_version(self) -> None:
+        asset = self._asset()
+        external = self._external()
+
+        def runner(argv):
+            if tuple(argv[1:]) == ("--version",):
+                return bootstrap.CommandResult(0, "foreign-cli 0.9.3")
+            raise AssertionError("foreign runtime must not receive a server probe")
+
+        outcome = self._ensure(asset, external, runner)
+        self.assertEqual(outcome.state, "INCOMPATIBLE")
+        self.assertEqual(external.read_bytes(), b"system-binary")
+
+    def test_managed_newer_runtime_with_old_pin_diagnostic_is_not_pinned(self) -> None:
+        asset = self._asset()
+        managed_path = Path(self.managed_dir) / asset.name
+        managed_path.parent.mkdir()
+        managed_path.write_bytes(b"existing-managed-runtime")
+
+        def runner(argv):
+            if tuple(argv[1:]) == ("--version",):
+                return bootstrap.CommandResult(0, "tool 0.9.5\nold build 0.9.3\n")
+            if tuple(argv[1:]) == ("status", "server"):
+                return bootstrap.CommandResult(
+                    0, "status: running\nendpoint_compatible: yes\n"
+                )
+            return bootstrap.CommandResult(127, "")
+
+        outcome = bootstrap.ensure(
+            asset, install_dir=self.managed_dir, policy="verify",
+            runner=runner, which=lambda name: None
+        )
+        self.assertEqual(outcome.state, "INCOMPATIBLE")
+        self.assertEqual(outcome.observed_version, "0.9.5")
+        self.assertEqual(managed_path.read_bytes(), b"existing-managed-runtime")
+
     def test_matching_pinned_version_is_adopted_without_probing_the_server(self) -> None:
         asset = self._asset(version="0.9.3")
         external = self._external()
