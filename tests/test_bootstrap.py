@@ -732,6 +732,18 @@ class ManagedRuntimeCompatibilityTests(BootstrapCase):
         self.assertIsNone(payload["sections"]["runtime"]["version"])
         self.assertEqual(payload["sections"]["runtime"]["pinned_version"], "0.9.3")
 
+    def test_old_pin_in_new_runtime_diagnostics_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(
+            _attested_runner(
+                runtime_version="0.9.5\nold build 0.9.3",
+                server="status: running\nendpoint_compatible: yes\n"
+            )
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "NOT_READY")
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+
     def test_missing_private_protocol_is_not_ready(self) -> None:
         self._config()
         payload, code = self._doctor(

@@ -393,7 +393,8 @@ between cases.
   Expected: `run` → exit `3`, `"code": "PRODUCT_TASK_UNAVAILABLE"`; `doctor` →
   exit `3`, `"status": "NOT_READY"`.
 
-- **Incompatible runtime version.** With a non-pinned runtime earlier on `PATH`,
+- **Incompatible runtime protocol.** With a runtime that fails identity or
+  live private-protocol attestation earlier on `PATH`,
   `./setup.sh --adopt-existing` must refuse to adopt rather than use it:
 
   ```sh
@@ -401,7 +402,9 @@ between cases.
   ```
 
   Expected: `"state": "INCOMPATIBLE"`, `status: NOT_READY`. It never replaces or
-  stops the existing binary.
+  stops the existing binary. A runtime with a version different from the
+  configured download asset is accepted when identity and live protocol
+  compatibility are positively verified.
 
 - **Duplicate task id.** Reuse an id with different content:
 
