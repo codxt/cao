@@ -45,7 +45,7 @@ def codex_error(pol, args, mode, kind="codex", cli="codex"):
         route(kind, cli, None, args), pol, mode=mode)
 
 
-class CodexReadOnlyRouteTests(unittest.TestCase):
+class CodexModeRouteTests(unittest.TestCase):
     def test_native_argv_model_resolves_to_the_canonical_identity(self):
         # Medium and High share the model and differ only by the bounded CLI
         # reasoning-effort switch; both resolve the same base identity.
@@ -56,12 +56,11 @@ class CodexReadOnlyRouteTests(unittest.TestCase):
             with self.subTest(effort=effort):
                 self.assertIsNone(codex_error(pol, args, "read"))
 
-    def test_write_and_unknown_mode_are_refused_closed(self):
+    def test_unqualified_write_and_unknown_mode_are_refused_closed(self):
         pol = policy([CODEX_IDENTITY])
         self.assertEqual(
             codex_error(pol, ["--model", CODEX_MODEL], "write"),
-            "TEAM_ROUTE_READ_ONLY")
-        # An unknown mode is never assumed to be READ.
+            "TEAM_ROUTE_WRITE_UNQUALIFIED")
         self.assertEqual(
             codex_error(pol, ["--model", CODEX_MODEL], None),
             "TEAM_ROUTE_READ_ONLY")
@@ -89,10 +88,9 @@ class CodexReadOnlyRouteTests(unittest.TestCase):
                 pol, mode="read"),
             "TEAM_ROUTE_IDENTITY_MISMATCH")
 
-    def test_codex_runtime_is_read_only_regardless_of_model_prefix(self):
-        # A Codex-bound execution is READ-only even when its exact model id
-        # carries a foreign prefix (which otherwise takes the generic path):
-        # the gate keys off the resolved runtime, not only the identity string.
+    def test_foreign_prefix_does_not_grant_codex_write(self):
+        # A foreign-prefixed Codex-bound model stays READ-only even when
+        # operator allowlisting includes that foreign identity.
         pol = policy(["openai/gpt-6.1-sol"])
         self.assertEqual(
             product_config.model_policy_error(
@@ -160,6 +158,41 @@ class CodexReadOnlyRouteTests(unittest.TestCase):
         for args, expected in cases:
             with self.subTest(args=args):
                 self.assertEqual(codex_error(pol, args, "read"), expected)
+
+    def test_exact_qualified_native_write_profiles(self):
+        for model in ("gpt-6.1-sol", "gpt-6-luna"):
+            pol = policy(["codex/" + model])
+            for effort in ("medium", "high"):
+                args = ["--model", model, "-c", "model_reasoning_effort=" + effort,
+                        "--sandbox", "workspace-write", "-c",
+                        "approval_policy=on-request"]
+                with self.subTest(model=model, effort=effort):
+                    self.assertIsNone(codex_error(pol, args, "write"))
+
+    def test_codex_write_rejects_loose_alias_and_privilege_escalation(self):
+        pol = policy([CODEX_IDENTITY, "codex/gpt-6-luna",
+                      "codex/gpt-6-luna-plus"])
+        exact = ["--model", CODEX_MODEL, "-c", "model_reasoning_effort=high",
+                 "--sandbox", "workspace-write", "-c",
+                 "approval_policy=on-request"]
+        cases = [
+            (["--model", CODEX_MODEL], "TEAM_ROUTE_WRITE_UNQUALIFIED"),
+            (exact[:-1] + ["approval_policy=never"], "TEAM_ROUTE_WRITE_UNQUALIFIED"),
+            (exact[:5] + ["danger-full-access"] + exact[6:],
+             "TEAM_ROUTE_WRITE_UNQUALIFIED"),
+            (exact + ["--full-auto"], "TEAM_ROUTE_WRITE_UNQUALIFIED"),
+            (exact[:3] + ["model_reasoning_effort=max"] + exact[4:],
+             "TEAM_ROUTE_WRITE_UNQUALIFIED"),
+            (exact[:1] + [CODEX_MODEL + "#high"] + exact[2:],
+             "TEAM_ROUTE_READ_ONLY"),
+            (exact[:1] + ["gpt-6-luna-plus"] + exact[2:],
+             "TEAM_ROUTE_READ_ONLY"),
+        ]
+        for args, reason in cases:
+            with self.subTest(args=args):
+                self.assertEqual(codex_error(pol, args, "write"), reason)
+        # Model identity and sandbox alone cannot grant WRITE.
+        self.assertEqual(codex_error(pol, exact, None), "TEAM_ROUTE_READ_ONLY")
 
 
 class NonZdrRouteTests(unittest.TestCase):
@@ -398,12 +431,12 @@ class TeamCodexRoutingTests(unittest.TestCase):
                          ("resolved", CODEX_MODEL))
         self.assertIs(bound["allowed"]["read"]["work"], True)
 
-    def test_codex_write_role_is_refused_before_any_effect(self):
+    def test_codex_write_requires_exact_mode_specific_args(self):
         spec = self.write_spec("codex-write")
         with self.assertRaises(team.TeamAdmissionError) as caught:
             team.initialize(spec, env=self.env, config=self.config,
                             approved=True)
-        self.assertIn("TEAM_ROUTE_READ_ONLY", str(caught.exception))
+        self.assertIn("TEAM_ROUTE_WRITE_UNQUALIFIED", str(caught.exception))
         self.assertEqual(team.list_teams(env=self.env), [])
         bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
         self.assertIs(bound["allowed"]["impl"]["work"], False)
