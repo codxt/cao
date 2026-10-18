@@ -71,7 +71,7 @@ class CodexModeRouteTests(unittest.TestCase):
         pol = policy([CODEX_IDENTITY])
         self.assertEqual(
             codex_error(pol, ["--model", CODEX_MODEL + "#high"], "write"),
-            "TEAM_ROUTE_WRITE_UNQUALIFIED")
+            "TEAM_ROUTE_READ_ONLY")
 
     def test_foreign_alias_never_stands_in_for_the_identity(self):
         pol = policy([CODEX_IDENTITY])
@@ -184,7 +184,7 @@ class CodexModeRouteTests(unittest.TestCase):
             (exact[:3] + ["model_reasoning_effort=max"] + exact[4:],
              "TEAM_ROUTE_WRITE_UNQUALIFIED"),
             (exact[:1] + [CODEX_MODEL + "#high"] + exact[2:],
-             "TEAM_ROUTE_WRITE_UNQUALIFIED"),
+             "TEAM_ROUTE_READ_ONLY"),
             (exact[:1] + ["gpt-6-luna-plus"] + exact[2:],
              "TEAM_ROUTE_READ_ONLY"),
         ]
