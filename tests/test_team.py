@@ -1472,6 +1472,54 @@ class TeamTests(unittest.TestCase):
                       dispatched[0]["prompt"])
         self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["head"], A)
 
+    def test_review_phase_malformed_verdict_allows_one_explicit_retry(self):
+        """A durable review receipt with no parsable verdict is retryable.
+
+        REVIEW_VERDICT_UNVERIFIED means the review attempt stopped with its
+        exact completion receipt but no single APPROVED/CHANGES_REQUESTED for
+        the accepted HEAD. Once the original attempt is verified stopped and its
+        READ claim abandon-released, the review phase admits exactly one bounded
+        READ retry on the same accepted revision.
+        """
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+
+        def fake(**kwargs):
+            if kwargs["phase"] == "review":
+                return {"status": "unknown",
+                        "error": {"code": "REVIEW_VERDICT_UNVERIFIED"}}
+            return self.done()
+
+        self.tick(fake)
+        failed = self.tick(fake)
+        self.assertEqual(failed["tasks"]["a"]["phase"], "review")
+        self.assertEqual(failed["tasks"]["a"]["status"], "unknown")
+        self.assertEqual(failed["tasks"]["a"]["error"], "REVIEW_VERDICT_UNVERIFIED")
+        old_id = failed["tasks"]["a"]["execution_id"]
+        self.assertEqual(old_id, team._execution_id("squad", "a", "review", 0))
+        team.set_desired("squad", "paused", env=self.env)
+        retried = self.retry_review_once("a", old_id)
+        self.assertEqual(retried["tasks"]["a"]["status"], "pending")
+        self.assertEqual(retried["tasks"]["a"]["retry_no"], 1)
+        # The same accepted HEAD, handoff and findings are retained.
+        record = team._required("squad", self.env)["slots"]["a"]
+        self.assertEqual(record["phase"], "review")
+        self.assertEqual(record["head"], A)
+        self.assertEqual(record["output"], "completed")
+        self.assertIsNone(record["execution_id"])
+        # One retry only.
+        with self.assertRaises(team.TeamError):
+            self.retry_review_once("a", old_id)
+        dispatched = []
+        team.set_desired("squad", "running", env=self.env)
+        self.tick(lambda **kw: (dispatched.append(kw) or {"status": "running"}))
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["phase"], "review")
+        self.assertEqual(dispatched[0]["execution_id"],
+                         team._execution_id("squad", "a", "review", 0, 1))
+        self.assertNotEqual(dispatched[0]["execution_id"], old_id)
+        self.assertIn("Review the actual repository against Git HEAD " + A,
+                      dispatched[0]["prompt"])
+
     def test_review_phase_retry_after_a_correction_reviews_the_same_accepted_head(self):
         self.init(self.spec([task("a", self.paths[0], reviewer="reviewer",
                                   corrections=1)]))
@@ -1639,6 +1687,50 @@ class TeamTests(unittest.TestCase):
                     mock.patch("cao.registry.connect_readonly", return_value=database):
                 with self.assertRaises(team.TeamError):
                     team.retry_read("squad", "a", env=self.env)
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
+                         "unknown")
+        self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["retry_no"], 0)
+
+    def test_malformed_verdict_retry_refuses_non_review_or_unreleased_claim(self):
+        """The malformed-verdict retry is scoped to a verified stopped review.
+
+        A work-phase READ carrying REVIEW_VERDICT_UNVERIFIED is never retryable,
+        and a review attempt with that error is still refused unless the original
+        task is stopped with an exactly closed pane and an abandon-released
+        READ claim in the shared Registry.
+        """
+        self.init(self.spec([task("w", self.paths[0], mode="read")],
+                            team_id="workteam"))
+        self.tick(lambda **kw: {"status": "unknown",
+                                "error": {"code": "REVIEW_VERDICT_UNVERIFIED"}},
+                  team_id="workteam")
+        work = team.status("workteam", env=self.env)["tasks"]["w"]
+        self.assertEqual(work["phase"], "work")
+        self.assertEqual(work["error"], "REVIEW_VERDICT_UNVERIFIED")
+        team.set_desired("workteam", "paused", env=self.env)
+        with self.assertRaises(team.TeamError):
+            team.retry_read("workteam", "w", env=self.env)
+
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+
+        def fake(**kwargs):
+            if kwargs["phase"] == "review":
+                return {"status": "unknown",
+                        "error": {"code": "REVIEW_VERDICT_UNVERIFIED"}}
+            return self.done()
+
+        self.tick(fake)
+        failed = self.tick(fake)
+        old_id = failed["tasks"]["a"]["execution_id"]
+        self.assertEqual(failed["tasks"]["a"]["error"], "REVIEW_VERDICT_UNVERIFIED")
+        team.set_desired("squad", "paused", env=self.env)
+        # An unreleased claim never substitutes for the stop/pane/Registry gates
+        # the newly eligible error code still requires.
+        stale = {**self.review_retry_refusal(old_id),
+                 "claim": {"claim_id": 42, "status": "RESUMED", "released": False}}
+        with mock.patch("cao.product_state.read_task", return_value=stale):
+            with self.assertRaises(team.TeamError):
+                team.retry_read("squad", "a", env=self.env)
         self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["status"],
                          "unknown")
         self.assertEqual(team.status("squad", env=self.env)["tasks"]["a"]["retry_no"], 0)

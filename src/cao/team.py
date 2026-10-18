@@ -752,8 +752,15 @@ def retry_read(team_id: str, task_id: str, *,
                 # pane handback are verified below before anything is admitted.
                 or (slot["phase"] == "work" and task["mode"] != "read")
                 or slot["status"] != "unknown"
-                or slot.get("error") not in (
+                # A malformed review verdict (the review receipt is durable and
+                # exact, but no single APPROVED/CHANGES_REQUESTED for this
+                # accepted HEAD can be parsed) is retryable as a READ review
+                # only; an identical error on a work attempt is never retryable
+                # and every other stop/pane/Registry/HEAD/retry gate still holds.
+                or not (slot.get("error") in (
                     "TEAM_RESULT_UNVERIFIED", "TEAM_DURABLE_RESULT_UNVERIFIED")
+                    or (slot["phase"] == "review"
+                        and slot.get("error") == "REVIEW_VERDICT_UNVERIFIED"))
                 or slot.get("retry_no", 0) != 0
                 or not slot.get("execution_id")):
             raise TeamError("retry requires a paused UNKNOWN READ with a bad receipt")
