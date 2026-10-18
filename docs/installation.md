@@ -55,6 +55,18 @@ cd cao
 | `--no-download` | Verify only; fetch and install nothing. |
 | `--force` | Rewrite the managed fields in the configuration. |
 
+The configured `managed.version` and SHA-256 identify a **reproducible
+download asset**, not an exact-version requirement for an already installed
+runtime. `doctor`, `--adopt-existing` and `--no-download` can use a newer
+installed runtime, including an existing CAO-managed copy, without changing
+the configuration or downloading anything. A differently versioned executable
+must report its own runtime identity and version, and its live server must
+explicitly affirm running status, endpoint compatibility and private-protocol
+compatibility. Missing, malformed or negative evidence stays `NOT_READY`.
+Doctor reports the observed `runtime.version` separately from
+`runtime.pinned_version`. Explicit `--download` continues to use the pinned,
+checksum-verified artifact; runtime adoption never performs an upgrade.
+
 Setting `CAO_PYTHON` selects the interpreter used for the bootstrap step.
 
 ## The managed runtime protocol
