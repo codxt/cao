@@ -1881,6 +1881,32 @@ class ObservationRetentionTests(TaskCase):
             f"line {index:04d} of the analysis\n" for index in range(lines)
         ) + tail
 
+    def test_durable_capture_requests_unwrapped_source(self):
+        """A post-prompt read must not soft-wrap an exact SHA verdict line.
+
+        The durable read asks the runtime for the unwrapped window so a
+        verdict line wider than the pane survives verbatim in the durable
+        observation instead of being broken across soft-wrap lines.
+        """
+        line = "CAO_REVIEWED_HEAD: " + "a" * 40  # exactly 59 characters
+        self.assertEqual(len(line), 59)
+
+        class RecordingSourceDriver(FakeDriver):
+            def agent_read(self, target, *, lines=200, source="recent"):
+                self._note("agent_read", target, source)
+                return self.read_text
+
+        driver = RecordingSourceDriver()
+        driver.read_text = line + "\n"
+        record = self.record()
+        product_task._observe(driver, record, self.env, None, self.defaults,
+                              terminal=True)
+        sources = [call[1][1] for call in driver.calls
+                   if call[0] == "agent_read"]
+        self.assertEqual(sources, ["recent-unwrapped"])
+        self.assertIn(line, record["output"])
+        self.assertIn(line, record["output_observations"][-1]["output"])
+
     def test_later_shorter_receipt_is_retained_alongside_the_longer_window(self):
         long_read = self.scrollback(lines=40)
         short_read = "analysis complete\n" + self.RECEIPT + "\n"
