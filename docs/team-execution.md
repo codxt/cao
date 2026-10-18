@@ -40,12 +40,17 @@ native `--model` token resolves to the canonical allowlist identity
 `agent_kind`/`provider.cli` `codex` is `codex/example-model`), the resolved agent
 kind and provider CLI must both be `codex`, and exactly one unambiguous
 `--model` is required. A repeated, flag-trapped, divergent or unlisted
-selection is unresolved and refused. A Codex route is READ-only: any dispatch
-bound to the Codex runtime — by its `codex/` identity or by its resolved agent
-kind / provider CLI — reached for a WRITE task is refused
-(`TEAM_ROUTE_READ_ONLY`) and is never escalated into a writer, and Medium/High
-effort variants differ only by the bounded `-c model_reasoning_effort=…`
-switch, so they share the base identity.
+selection is unresolved and refused. Native Codex WRITE is permitted only for the exact `codex/gpt-6.1-sol` and
+`codex/gpt-6-luna` identities when the task explicitly declares WRITE, the
+separate operator-local profile supplies precisely `--model <id> -c
+model_reasoning_effort=<medium|high> --sandbox workspace-write -c
+approval_policy=on-request` and CAO acquires its normal scoped Work Registry
+WRITE claim. All other Codex WRITE requests or weak/unsafe launch arguments
+remain refused (`TEAM_ROUTE_READ_ONLY` or `TEAM_ROUTE_WRITE_UNQUALIFIED`);
+READ profiles do not grant WRITE. An allowlist entry is not itself a grant.
+Publication, deployment, credentials, destructive actions and canonical
+acceptance remain separately governed. Medium/High variants share a base
+identity; unqualified model substitutions never occur.
 
 A defensive, model-specific READ-only gate additionally covers the exact
 Step-5 Preview Free base model id (`opencode/step-5-preview-free`), reached

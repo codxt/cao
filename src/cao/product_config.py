@@ -367,12 +367,13 @@ _TEAM_ROUTE_RUNTIME = {
     "codex": ("codex", "codex"),
 }
 
-#: Runtime identities whose allowlisted routes are authorized for READ only.
-#: A Codex profile is a read-only reader/reviewer in this policy: a WRITE
-#: dispatch bound to the Codex runtime — by its canonical identity prefix or by
-#: its resolved agent kind / provider CLI — is refused even when its model id is
-#: allowlisted, so the read-only role can never be escalated into a writer.
-_READ_ONLY_ROUTE_RUNTIMES = frozenset({"codex"})
+#: Native Codex WRITE is qualified only for these exact manager/worker models.
+#: The install's model allowlist and explicit mode-specific launch arguments
+#: remain separate necessary gates; model identity alone is never a grant.
+_CODEX_WRITE_MODELS = frozenset({"codex/gpt-6.1-sol", "codex/gpt-6-luna"})
+_CODEX_RUNTIME = "codex"
+_CODEX_WRITE_EFFORT = frozenset({"medium", "high"})
+
 
 #: Route identities the canonical owner policy restricts to privacy-qualified
 #: READ. The Step-5 Preview Free route may read its own bounded checkout but
@@ -449,10 +450,10 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     pass on an allowed-looking model id.
 
     ``mode`` is the declared task mode (``read``/``write``) when the caller
-    knows it. A route bound to a read-only runtime (Codex) — through its
-    canonical identity prefix or through its resolved agent kind / provider CLI
-    — is refused unless the mode is exactly READ; an unknown mode is refused
-    rather than assumed safe. A route the canonical owner policy restricts to
+    knows it. Native Codex WRITE is permitted only for the two pinned model
+    identities and exact mode-specific safe arguments; all other Codex WRITE
+    routes, missing modes, ambiguous flags and unsafe sandboxes fail closed.
+    A route the canonical owner policy restricts to
     privacy-qualified READ (the Step-5 Preview Free base model id, matched
     through its canonical identity, any provider prefix or a bounded
     ``#effort`` variant) is likewise refused unless the mode is exactly READ. A
@@ -500,9 +501,9 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     # still counts as Codex.
     kind_token = safe_route_token(route.get("agent_kind"))
     cli_token = safe_route_token(cli)
-    codex_bound = (prefix in _READ_ONLY_ROUTE_RUNTIMES
-                   or kind_token in _READ_ONLY_ROUTE_RUNTIMES
-                   or cli_token in _READ_ONLY_ROUTE_RUNTIMES)
+    codex_bound = (prefix == _CODEX_RUNTIME
+                   or kind_token == _CODEX_RUNTIME
+                   or cli_token == _CODEX_RUNTIME)
     # A Codex route must name its model through exactly one unambiguous native
     # ``--model`` argument. A model that appears only in the provider entry
     # would launch Codex with no explicit selection, letting its implicit
@@ -511,15 +512,27 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
         _, mentions, trap = _argv_model(route.get("agent_args"))
         if mentions != 1 or trap:
             return "TEAM_MODEL_UNRESOLVED"
-    # A route the canonical owner policy restricts to privacy-qualified READ is
-    # refused unless the mode is exactly READ, so the reader can never be
-    # escalated into a writer. The restriction follows the base model id
-    # (case-folded, behind any provider prefix and any bounded ``#effort``
-    # variant), so an alias or a foreign prefix cannot restore write access.
-    if ((codex_bound
-            or base_identity in _READ_ONLY_ROUTE_MODELS_FOLDED
-            or base_model_id in _READ_ONLY_MODEL_IDS_FOLDED)
-            and _route_mode(mode) != "read"):
+    # Native WRITE needs both exact canonical Codex runtime identity and one
+    # mode-specific workspace/approval envelope. A loose allowlist match is not
+    # enough: reject arbitrary --model aliases, unknown options, and broad flags.
+    if codex_bound and _route_mode(mode) != "read":
+        if _route_mode(mode) != "write" or identity not in _CODEX_WRITE_MODELS:
+            return "TEAM_ROUTE_READ_ONLY"
+        args = route.get("agent_args")
+        if type(args) is not list:
+            return "TEAM_ROUTE_WRITE_UNQUALIFIED"
+        # Do not accept a provider-prefixed/effort-suffixed model argument;
+        # this WRITE capability is narrower than ordinary route resolution.
+        expected_prefix = ["--model", identity.split("/", 1)[1], "-c"]
+        if (len(args) != 8 or args[:3] != expected_prefix
+                or args[3] not in ("model_reasoning_effort=medium",
+                                   "model_reasoning_effort=high")
+                or args[4:] != ["--sandbox", "workspace-write", "-c",
+                                 "approval_policy=on-request"]):
+            return "TEAM_ROUTE_WRITE_UNQUALIFIED"
+        return None
+    if (base_identity in _READ_ONLY_ROUTE_MODELS_FOLDED
+            or base_model_id in _READ_ONLY_MODEL_IDS_FOLDED) and _route_mode(mode) != "read":
         return "TEAM_ROUTE_READ_ONLY"
     return None
 
