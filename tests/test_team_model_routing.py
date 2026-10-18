@@ -486,5 +486,97 @@ class TeamCodexRoutingTests(unittest.TestCase):
         self.assertIs(bound["allowed"]["impl"]["review"], True)
 
 
+class TeamOpenCodeMiniHarnessTests(unittest.TestCase):
+    """An OpenCode route must launch ``mini`` or be refused before any effect.
+
+    A role model, an inherited provider and an ``agent_profile`` alike are
+    governed by the same harness requirement: an OpenCode launch that omits
+    ``mini`` or its explicit model, or carries an unknown option, opens the
+    interactive TUI at its own default model, so it is refused at
+    initialization with zero team, Registry claim or pane effect. Native Codex
+    profiles keep their existing behavior.
+    """
+
+    ROUTE = "opencode-go/glm-5.3-flash"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.env = {"XDG_STATE_HOME": str(self.root / "state"),
+                    "XDG_CONFIG_HOME": str(self.root / "config")}
+
+    def configure(self, profile_args, *, kind="opencode", allowlist=None,
+                  route=None):
+        route = route or self.ROUTE
+        self.raw = {
+            "schema": product_config.SCHEMA,
+            "provider": {"cli": "opencode", "id": "local", "model": self.ROUTE},
+            "team_approval": {"mode": "chat"},
+            "registry_db": str(self.root / "shared.sqlite3"),
+            "team_model_allowlist": allowlist or [route],
+            "agent_profiles": {
+                "reader": {"agent_kind": kind, "read_args": list(profile_args)},
+            },
+        }
+        product_config.write_config(self.raw, product_config.config_path(self.env))
+        self.config = product_config.validate_config(self.raw)
+
+    def spec(self, team_id):
+        return {"schema": team.SPEC_SCHEMA, "team_id": team_id,
+                "initiative": "i-" + team_id,
+                "roles": {"reviewer": {"instruction": "Inspect source",
+                                       "agent_profile": "reader"}},
+                "tasks": [{"id": "read", "role": "reviewer",
+                           "repo": str(self.root / "repo"), "mode": "read",
+                           "prompt": "Review exact source"}],
+                "max_parallel": 1, "max_writers": 0}
+
+    def test_non_mini_profile_is_refused_before_any_effect(self):
+        for args in (["--model", self.ROUTE],
+                     ["--standalone", "--model", self.ROUTE],
+                     ["mini", "--model", self.ROUTE, "--print"]):
+            with self.subTest(args=args):
+                self.configure(args)
+                with self.assertRaises(team.TeamAdmissionError) as caught:
+                    team.initialize(self.spec("opencode-tui"), env=self.env,
+                                    config=self.config, approved=True)
+                self.assertIn("TEAM_ROUTE_TUI_UNQUALIFIED",
+                              str(caught.exception))
+                self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_profile_missing_model_is_unresolved_before_any_effect(self):
+        self.configure(["mini"], allowlist=[self.ROUTE])
+        with self.assertRaises(team.TeamAdmissionError) as caught:
+            team.initialize(self.spec("opencode-nomodel"), env=self.env,
+                            config=self.config, approved=True)
+        self.assertIn("TEAM_MODEL_UNRESOLVED", str(caught.exception))
+        self.assertEqual(team.list_teams(env=self.env), [])
+
+    def test_valid_mini_profile_is_admitted_and_bound(self):
+        self.configure(["mini", "--standalone", "--model", self.ROUTE])
+        spec = self.spec("opencode-mini")
+        record = team.initialize(spec, env=self.env, config=self.config,
+                                 approved=True)
+        self.assertEqual(record["status"], "PAUSED")
+        bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
+        self.assertIs(bound["allowed"]["read"]["work"], True)
+        work = bound["routes"]["read"]["work"]
+        self.assertEqual(work["agent_kind"], "opencode")
+        self.assertEqual(product_config.route_model(work), ("resolved", self.ROUTE))
+
+    def test_native_codex_profile_is_not_subject_to_the_mini_harness(self):
+        # A Codex profile names its model natively and never ``mini``; the
+        # OpenCode harness gate must not leak into the Codex path.
+        self.configure(["--model", "gpt-6.1-sol"], kind="codex",
+                       allowlist=["codex/gpt-6.1-sol"], route="codex/gpt-6.1-sol")
+        spec = self.spec("codex-native")
+        record = team.initialize(spec, env=self.env, config=self.config,
+                                 approved=True)
+        self.assertEqual(record["status"], "PAUSED")
+        bound = team._dispatchable_routes(self.config, team.validate_spec(spec))
+        self.assertIs(bound["allowed"]["read"]["work"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

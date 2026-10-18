@@ -34,6 +34,17 @@ foreign, spoofed or missing agent kind or provider CLI is refused
 (`TEAM_ROUTE_IDENTITY_MISMATCH`) instead of dispatching on another runtime,
 even when the provider model and the verified argv `--model` look allowed.
 
+An OpenCode route must launch CAO's non-interactive `mini` harness naming
+exactly one explicit, safe `--model`, with the optional `--standalone` switch
+CAO itself emits. A bare OpenCode launch — a role model, an inherited provider
+or an `agent_profile` whose arguments omit `mini` or the model, or carry an
+unknown option — would open the interactive TUI at its own default model, so it
+is refused (`TEAM_ROUTE_TUI_UNQUALIFIED`, or `TEAM_MODEL_UNRESOLVED` for a
+missing, divergent or ambiguous model) before any Registry claim or pane
+effect. The explicit model is always the selection the harness passes, and no
+unqualified or silent default is ever substituted. Native Codex routes and their
+existing READ/WRITE handling are unchanged.
+
 A listed `codex/` model id binds a Codex agent-profile route the same way: a
 native `--model` token resolves to the canonical allowlist identity
 `<provider>/<model>` (for example a native `--model example-model` under
@@ -564,8 +575,10 @@ fields, unsafe argument strings, unsupported modes, or collisions between a
 role's inline OpenCode model and a profile fail closed. Reviewer tasks always
 resolve `read_args`; a read profile never inherits `write_args`.
 Current inline OpenCode model routing and no-profile team behavior remain
-unchanged. Profile names, launch arguments and backend choices are operator
-configuration, not tenant state or operator identity proofs.
+unchanged, and an OpenCode profile is still subject to the `mini`-harness
+requirement above when a `team_model_allowlist` is configured. Profile names,
+launch arguments and backend choices are operator configuration, not tenant
+state or operator identity proofs.
 
 The existing CAO daemon, Herdr adapter, Work Registry, task identities,
 review receipts, and independent repository/release authorization remain
