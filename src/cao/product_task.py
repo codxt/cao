@@ -697,7 +697,7 @@ def _observe(
         return None
     try:
         text = driver.agent_read(
-            agent_name, lines=defaults.read_lines, source="recent"
+            agent_name, lines=defaults.read_lines, source="recent-unwrapped"
         )
     except product_driver.DriverError as exc:
         record["observation"] = {"status": "UNKNOWN", "reason": getattr(exc, "code", None)}
