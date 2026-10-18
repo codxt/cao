@@ -53,6 +53,7 @@ __all__ = [
     "PLAN_SCHEMA",
     "STATUS_SCHEMA",
     "ELIGIBILITY_SCHEMA",
+    "DECISION_PROJECTION_SCHEMA",
     "EFFECT_CATEGORIES",
     "EFFECT_VERDICTS",
     "ELIGIBILITY_VERDICTS",
@@ -69,6 +70,7 @@ __all__ = [
     "plan_id_for",
     "handoff_plan",
     "handoff_status",
+    "decision_projection",
     "recover_plan",
     "linked_state",
     "list_plans",
@@ -84,6 +86,8 @@ PLAN_SCHEMA = "cao.intake.handoff.plan.v1"
 STATUS_SCHEMA = "cao.intake.handoff.status.v1"
 #: The independent source-attested eligibility result.
 ELIGIBILITY_SCHEMA = "cao.intake.eligibility.v1"
+#: The read-only B6 evidence projection the Batch B2b decision stage consumes.
+DECISION_PROJECTION_SCHEMA = "cao.intake.handoff.decision.v1"
 
 #: The reserved consequential-effect categories B6 distinguishes. A *mention*
 #: of one of these is not automatically a request; an explicit request, or an
@@ -1629,3 +1633,169 @@ def handoff_status(
         "derived_at": utc_now(clock),
         "uncertainties": [_NOTE_NOT_AUTHORITY, _NOTE_READ_ONLY_PLAN],
     }
+
+
+# ---------------------------------------------------------------------------
+# Read-only decision-stage projection (Batch B2b, default off)
+# ---------------------------------------------------------------------------
+
+
+def decision_projection(
+    submission_id: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    repo: str | None = None,
+    source_ref: str | None = None,
+    clock: Any = None,
+    enabled: bool = False,
+) -> dict[str, Any]:
+    """Derive one read-only B6 evidence projection for the decision stage.
+
+    This is a **projection, not a handoff**: it composes the existing readers
+    (the original admission, the B3 advisory, the bounded source probe, the
+    configured qualification, the derived immutable ids and the validated link
+    state) into one document for :mod:`cao.decision_intake`, and it starts,
+    authorizes, persists and dispatches nothing. ``handoff_plan`` and the
+    dispatch path are untouched and this function never reaches them.
+
+    The default ``enabled = False`` reports an explicit ``HELD`` without
+    reading any evidence. Once enabled the status is ``UNKNOWN`` when an input
+    could not be established (a missing or unreadable admission, configuration
+    or team state), ``HELD`` when the evidence is established but does not
+    qualify (an ineligible request, an unusable source or an ambiguous audit)
+    and ``DERIVED`` when every read-only fact resolved; ``authority`` stays
+    ``none`` and ``dispatch`` stays ``False`` in every case.
+    """
+
+    base: dict[str, Any] = {
+        "schema": DECISION_PROJECTION_SCHEMA,
+        "status": "HELD",
+        "code": None,
+        "reason": None,
+        "submission_id": None,
+        "item_id": None,
+        "plan_id": None,
+        "eligibility": None,
+        "source": None,
+        "qualification": None,
+        "binding": None,
+        "audit": None,
+        "authority": "none",
+        "dispatch": False,
+        "advisory": True,
+        "deterministic": True,
+        "effects": [],
+        "egress": "none",
+    }
+
+    def project(status: str, code: str | None, reason: str | None,
+                **extra: Any) -> dict[str, Any]:
+        result = dict(base)
+        result.update(status=status, code=code, reason=reason, **extra)
+        return result
+
+    if not enabled:
+        return project(
+            "HELD",
+            "projection_disabled",
+            "the decision projection is disabled by default; no B6 evidence "
+            "is derived and the deterministic path stands",
+        )
+
+    try:
+        sid = _record_id(submission_id, "submission id")
+        if repo is not None:
+            _bounded_str(repo, "repo", 4096, allow_empty=False)
+        if source_ref is not None and not (
+            git.valid_commit_id(source_ref) or git.valid_short_ref(source_ref)
+        ):
+            return project(
+                "HELD", "source_ref_invalid",
+                "source ref must be a commit id or a valid ref name",
+            )
+    except HandoffInvalid as exc:
+        return project("HELD", "submission_id_invalid", str(exc))
+
+    try:
+        eligibility = derive_eligibility(sid, env=env, clock=clock)
+        source = _source_evidence(repo, source_ref)
+        qualification = _qualification(_load_config(env))
+    except HandoffUnavailable as exc:
+        return project("UNKNOWN", "evidence_unavailable", str(exc))
+    except HandoffError as exc:
+        return project(
+            "UNKNOWN", "evidence_unusable",
+            f"the read-only handoff evidence is present but not usable "
+            f"({type(exc).__name__})",
+        )
+
+    ids = _derived_ids(sid)
+    binding = _binding(eligibility, source, qualification, ids)
+    try:
+        audit = linked_state(sid, env)
+    except HandoffError as exc:
+        return project(
+            "UNKNOWN", "team_state_unreadable",
+            f"the linked team evidence is present but not usable "
+            f"({type(exc).__name__})",
+        )
+    payload: dict[str, Any] = dict(
+        submission_id=sid,
+        item_id=eligibility["item_id"],
+        plan_id=plan_id_for(binding),
+        eligibility={
+            "verdict": eligibility["verdict"],
+            "fingerprint": eligibility["fingerprint"],
+            "holds": list(eligibility["holds"]),
+            "effects": dict(eligibility["effects"]),
+        },
+        source=dict(source),
+        qualification=dict(qualification),
+        binding=binding,
+        audit={
+            "verdict": audit["verdict"],
+            "team_id": audit.get("team_id"),
+            "reason": audit.get("reason"),
+        },
+    )
+
+    if eligibility["verdict"] != "ELIGIBLE_READ":
+        holds = payload["eligibility"]["holds"]
+        first = holds[0] if holds else {
+            "code": "eligibility_not_read",
+            "reason": "no eligibility evidence could be derived",
+        }
+        return project("HELD", str(first["code"]), str(first["reason"]), **payload)
+
+    verdict = source.get("verdict")
+    if verdict == "UNAVAILABLE":
+        return project(
+            "UNKNOWN", "source_unavailable",
+            str(source.get("reason") or "no repository path was supplied"),
+            **payload,
+        )
+    if verdict != "SUPPORTED":
+        return project(
+            "UNKNOWN", "source_unknown",
+            str(source.get("reason") or "the bound source could not be read"),
+            **payload,
+        )
+    if not source.get("head"):
+        return project(
+            "HELD", "source_head_binding",
+            "the request binds no exact source HEAD", **payload,
+        )
+    if source.get("stale") is True:
+        return project(
+            "HELD", "source_stale",
+            "the resolved source commit predates the evidence cutoff",
+            **payload,
+        )
+    if audit["verdict"] == "REFUSED":
+        return project(
+            "HELD", "audit_ambiguous",
+            str(audit.get("reason") or "competing READ audits claim this "
+                                       "submission"),
+            **payload,
+        )
+    return project("DERIVED", None, None, **payload)

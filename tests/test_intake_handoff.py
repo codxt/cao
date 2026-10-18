@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from cao import intake, intake_handoff, intake_resolution, intake_triage
+from cao import intake, intake_handoff, intake_queue, intake_resolution
+from cao import intake_triage
 from cao import team
 
 _HAVE_GIT = shutil.which("git") is not None
@@ -849,6 +850,160 @@ class CliTests(HandoffCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(payload["plan"]["submission_id"], sid)
+
+
+class DecisionProjectionTests(HandoffCase):
+    """The opt-in B6 evidence projection for the B2b decision stage.
+
+    It is a read-only projection: default off, explicit HELD/UNKNOWN, no plan,
+    no team, no intent and no grant, and the existing ``handoff_plan`` /
+    ``handoff_status`` contract is left exactly as it was.
+    """
+
+    def test_default_disabled_reports_held_and_reads_nothing(self) -> None:
+        projection = intake_handoff.decision_projection("0" * 64, env=self.env)
+        self.assertEqual(projection["schema"],
+                         intake_handoff.DECISION_PROJECTION_SCHEMA)
+        self.assertEqual(projection["status"], "HELD")
+        self.assertEqual(projection["code"], "projection_disabled")
+        self.assertIsNone(projection["binding"])
+        self.assertIsNone(projection["eligibility"])
+        self.assertEqual(projection["authority"], "none")
+        self.assertFalse(projection["dispatch"])
+        self.assertEqual(projection["effects"], [])
+        self.assertEqual(projection["egress"], "none")
+
+    @unittest.skipUnless(_HAVE_GIT, "git is required")
+    def test_eligible_read_projects_the_bound_evidence(self) -> None:
+        sid = self.admitted("projection-read")
+        repo = self.read_scope()
+        projection = intake_handoff.decision_projection(
+            sid, env=self.env, repo=repo, source_ref="main", enabled=True
+        )
+        self.assertEqual(projection["status"], "DERIVED")
+        self.assertIsNone(projection["code"])
+        self.assertEqual(projection["submission_id"], sid)
+        self.assertEqual(projection["item_id"], "projection-read")
+        self.assertEqual(len(projection["plan_id"]), 64)
+        self.assertEqual(projection["eligibility"]["verdict"], "ELIGIBLE_READ")
+        self.assertEqual(projection["source"]["verdict"], "SUPPORTED")
+        self.assertEqual(projection["source"]["head"],
+                         run_git(Path(repo), "rev-parse", "HEAD").strip())
+        binding = projection["binding"]
+        self.assertEqual(binding["submission_id"], sid)
+        self.assertEqual(binding["team_id"], "intake-read-" + sid[:16])
+        self.assertEqual(binding["task_id"], "read-" + sid[:12])
+        self.assertTrue(binding["read_only"])
+        self.assertEqual(binding["source"]["repo"], os.path.realpath(repo))
+        self.assertEqual(projection["audit"]["verdict"], "UNAVAILABLE")
+        self.assertEqual(projection["authority"], "none")
+        self.assertFalse(projection["dispatch"])
+
+    @unittest.skipUnless(_HAVE_GIT, "git is required")
+    def test_projection_creates_no_plan_team_intent_or_state(self) -> None:
+        sid = self.admitted("projection-effects")
+        repo = self.read_scope()
+        before = self.files_under(Path(self.env["XDG_STATE_HOME"]))
+        projection = intake_handoff.decision_projection(
+            sid, env=self.env, repo=repo, enabled=True
+        )
+        self.assertEqual(projection["status"], "DERIVED")
+        after = self.files_under(Path(self.env["XDG_STATE_HOME"]))
+        self.assertEqual(before, after)
+        self.assertFalse(Path(intake_handoff.plan_dir(self.env)).exists())
+        self.assertEqual(team.list_teams(env=self.env), [])
+        self.assertEqual(intake_queue.list_intents(self.env), [])
+
+    def test_ineligible_request_is_held_with_its_first_hold(self) -> None:
+        sid = self.admitted("projection-mixed", (
+            "Read-only audit of the source, then one squash merge of PR 7."))
+        projection = intake_handoff.decision_projection(
+            sid, env=self.env, enabled=True
+        )
+        self.assertEqual(projection["status"], "HELD")
+        self.assertEqual(projection["code"], "mixed_effect_and_read_request")
+        self.assertEqual(projection["eligibility"]["verdict"], "HOLD")
+
+    def test_missing_admission_is_explicitly_unknown(self) -> None:
+        projection = intake_handoff.decision_projection(
+            "0" * 64, env=self.env, enabled=True
+        )
+        self.assertEqual(projection["status"], "UNKNOWN")
+        self.assertEqual(projection["code"], "evidence_unavailable")
+
+    def test_bounded_input_is_refused(self) -> None:
+        sid = self.admitted("projection-bad-id")
+        for value, code in (("not-an-id", "submission_id_invalid"),):
+            projection = intake_handoff.decision_projection(
+                value, env=self.env, enabled=True
+            )
+            self.assertEqual(projection["status"], "HELD")
+            self.assertEqual(projection["code"], code)
+        projection = intake_handoff.decision_projection(
+            sid, env=self.env, source_ref="main; rm -rf /", enabled=True
+        )
+        self.assertEqual(projection["status"], "HELD")
+        self.assertEqual(projection["code"], "source_ref_invalid")
+
+    def test_missing_or_unreadable_source_is_unknown(self) -> None:
+        sid = self.admitted("projection-source")
+        absent = intake_handoff.decision_projection(
+            sid, env=self.env, enabled=True
+        )
+        self.assertEqual(absent["status"], "UNKNOWN")
+        self.assertEqual(absent["code"], "source_unavailable")
+
+        empty = self.root / "projection-empty"
+        empty.mkdir()
+        unknown = intake_handoff.decision_projection(
+            sid, env=self.env, repo=str(empty), enabled=True
+        )
+        self.assertEqual(unknown["status"], "UNKNOWN")
+        self.assertEqual(unknown["code"], "source_unknown")
+        # The binding is still derived from the admission and reported truthfully
+        # alongside the unproven source, never as a finished success.
+        self.assertEqual(unknown["submission_id"], sid)
+        self.assertEqual(unknown["source"]["verdict"], "UNKNOWN")
+
+    def test_missing_source_advisory_is_held(self) -> None:
+        sid = self.submit("projection-no-packet",
+                          _read_request("projection-no-packet"))
+        projection = intake_handoff.decision_projection(
+            sid, env=self.env, enabled=True
+        )
+        self.assertEqual(projection["status"], "HELD")
+        self.assertEqual(projection["code"], "no_source_attested_triage")
+
+    @unittest.skipUnless(_HAVE_GIT, "git is required")
+    def test_projection_is_idempotent(self) -> None:
+        sid = self.admitted("projection-twice")
+        repo = self.read_scope()
+        first = intake_handoff.decision_projection(
+            sid, env=self.env, repo=repo, enabled=True
+        )
+        second = intake_handoff.decision_projection(
+            sid, env=self.env, repo=repo, enabled=True
+        )
+        self.assertEqual(first, second)
+
+    def test_existing_handoff_contract_is_unchanged(self) -> None:
+        sid = self.admitted("projection-baseline")
+        result = self.plan(sid, dry_run=True)
+        self.assertEqual(result["schema"], intake_handoff.RESULT_SCHEMA)
+        self.assertEqual(result["status"], "PLAN_ONLY")
+        self.assertFalse(result["persisted"])
+        plan = result["plan"]
+        self.assertEqual(plan["schema"], intake_handoff.PLAN_SCHEMA)
+        self.assertEqual(plan["status"], "PLAN_ONLY")
+        self.assertEqual(plan["authority"], "none")
+        self.assertFalse(plan["dispatch"])
+        for key in ("binding", "eligibility", "checkpoint", "grant", "refusals",
+                    "missing", "plan_digest"):
+            self.assertIn(key, plan)
+        status = intake_handoff.handoff_status(sid, env=self.env)
+        self.assertEqual(status["schema"], intake_handoff.STATUS_SCHEMA)
+        self.assertEqual(status["status"], "PLAN_ONLY")
+        self.assertFalse(Path(intake_handoff.plan_dir(self.env)).exists())
 
 
 if __name__ == "__main__":
