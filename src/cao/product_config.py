@@ -372,7 +372,6 @@ _TEAM_ROUTE_RUNTIME = {
 #: remain separate necessary gates; model identity alone is never a grant.
 _CODEX_WRITE_MODELS = frozenset({"codex/gpt-6.1-sol", "codex/gpt-6-luna"})
 _CODEX_RUNTIME = "codex"
-_CODEX_WRITE_EFFORT = frozenset({"medium", "high"})
 
 
 #: Route identities the canonical owner policy restricts to privacy-qualified
