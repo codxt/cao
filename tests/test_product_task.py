@@ -2485,7 +2485,7 @@ class DirectCodexAndNonZdrModeTests(TaskCase):
         self.assertEqual(payload["status"], "running")
         self.assertEqual(driver.names().count("agent_start"), 1)
 
-    def test_write_codex_route_is_refused_with_zero_effects(self):
+    def test_unqualified_codex_write_route_has_zero_effects(self):
         driver = FakeDriver()
         payload = product_task.run_task(
             driver=driver, repo=str(self.repo), prompt="Edit a.txt",
@@ -2493,7 +2493,7 @@ class DirectCodexAndNonZdrModeTests(TaskCase):
             config=self.codex_config(), env=self.env, registry_db=self.db,
             wait_ms=0)
         self.assertEqual(payload["status"], "refused")
-        self.assertEqual(payload["refusal"]["errors"], ["TEAM_ROUTE_READ_ONLY"])
+        self.assertEqual(payload["refusal"]["errors"], ["TEAM_ROUTE_WRITE_UNQUALIFIED"])
         self.assertEqual(driver.names(), [])
         self.assertEqual(self.claim_rows(), [])
 
