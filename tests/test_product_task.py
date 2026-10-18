@@ -2354,6 +2354,117 @@ class TeamModelPolicyTests(TaskCase):
         self.assertEqual(driver.names().count("agent_prompt"), 1)
 
 
+class OpenCodeMiniWithoutAllowlistTests(TaskCase):
+    """The mini-harness gate also covers direct NEW tasks with no allowlist.
+
+    An absent ``team_model_allowlist`` must never let a direct OpenCode task
+    launch the bare interactive TUI or an implicit model. Every refusal below
+    happens before any Registry claim, workspace, pane or agent effect, while a
+    valid explicit mini harness and a non-OpenCode route keep their behavior.
+    """
+
+    def make_config(self, provider_model=None, args=None, cli="opencode"):
+        provider = {"cli": cli}
+        if provider_model is not None:
+            provider["model"] = provider_model
+        payload = {"schema": product_config.SCHEMA, "provider": provider}
+        if args is not None:
+            payload["task"] = {"agent_args": list(args)}
+        return product_config.validate_config(payload)
+
+    def dispatch(self, config, task_id):
+        driver = FakeDriver()
+        payload = product_task.run_task(
+            driver=driver, repo=str(self.repo), task_id=task_id,
+            prompt="Review this repository", config=config, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        return driver, payload
+
+    def assert_refused(self, driver, payload, reason):
+        self.assertEqual(payload["status"], "refused")
+        self.assertEqual(payload["refusal"]["stage"], "model_policy")
+        self.assertEqual(payload["refusal"]["errors"], [reason])
+        self.assertEqual(driver.names(), [])
+        self.assertIsNone(payload["claim"])
+        self.assertIsNone(payload["workspace"])
+        self.assertIsNone(payload["pane_id"])
+        self.assertIsNone(payload["agent"])
+        self.assertEqual(self.claim_rows(), [])
+
+    def test_bare_or_unknown_opencode_launch_is_refused_with_zero_effects(self):
+        for index, args in enumerate((
+                [], ["--model", "m"], ["--standalone", "--model", "m"],
+                ["mini", "--model", "m", "--print"],
+                ["mini", "--agent", "build", "--model", "m"])):
+            with self.subTest(args=args):
+                driver, payload = self.dispatch(
+                    self.make_config(args=args), f"mini-tui-{index}")
+                # A bare launch with no model at all is unresolved; an explicit
+                # model on a non-mini/unknown argv is the TUI refusal.
+                reason = ("TEAM_MODEL_UNRESOLVED" if not args
+                          else "TEAM_ROUTE_TUI_UNQUALIFIED")
+                self.assert_refused(driver, payload, reason)
+
+    def test_missing_duplicate_or_unsafe_model_is_refused_with_zero_effects(self):
+        for index, args in enumerate((
+                ["mini"], ["mini", "--model"],
+                ["mini", "--model="],
+                ["mini", "--model", "m", "--model", "m"],
+                ["mini", "--model", "not a safe token"])):
+            with self.subTest(args=args):
+                driver, payload = self.dispatch(
+                    self.make_config(args=args), f"mini-model-{index}")
+                self.assert_refused(driver, payload, "TEAM_MODEL_UNRESOLVED")
+
+    def test_explicit_mini_harness_without_allowlist_dispatches(self):
+        for index, args in enumerate((
+                ["mini", "--model", "m"],
+                ["mini", "--standalone", "--model", "m"])):
+            with self.subTest(args=args):
+                driver, payload = self.dispatch(
+                    self.make_config(args=args), f"mini-valid-{index}")
+                self.assertEqual(payload["status"], "running")
+                self.assertEqual(driver.names().count("agent_start"), 1)
+                self.assertEqual(driver.names().count("agent_prompt"), 1)
+                start = next(call for call in driver.calls
+                             if call[0] == "agent_start")
+                self.assertEqual(start[1][3], tuple(args))
+
+    def test_non_opencode_route_without_allowlist_is_unaffected(self):
+        for index, (kind, cli) in enumerate(
+                (("claude", "claude"), ("codex", "codex"))):
+            with self.subTest(kind=kind):
+                args = ["--model", "sonnet" if kind == "claude"
+                        else "gpt-6.1-sol"]
+                driver, payload = self.dispatch(
+                    self.make_config(cli=cli, args=args), f"non-opencode-{index}")
+                self.assertEqual(payload["status"], "running")
+                self.assertEqual(driver.names().count("agent_start"), 1)
+                start = next(call for call in driver.calls
+                             if call[0] == "agent_start")
+                self.assertEqual(start[1][1], kind)
+
+    def test_issued_claim_and_prompt_are_resumed_without_re_gating(self):
+        valid = self.make_config(args=["mini", "--model", "m"])
+        driver = FakeDriver()
+        first = product_task.run_task(
+            driver=driver, repo=str(self.repo), task_id="mini-resume",
+            prompt="Review this repository", config=valid, env=self.env,
+            registry_db=self.db, wait_ms=0)
+        self.assertEqual(first["status"], "running")
+        # The same execution is later observed under an invalid bare route.
+        # Its original claim and prompt are already issued, so it resumes
+        # exactly: no second start, no second prompt, no replacement claim.
+        again = product_task.run_task(
+            driver=driver, repo=str(self.repo), task_id="mini-resume",
+            prompt="Review this repository", config=self.make_config(),
+            env=self.env, registry_db=self.db, wait_ms=0)
+        self.assertEqual(again["status"], "running")
+        self.assertEqual(again["claim"]["claim_id"], first["claim"]["claim_id"])
+        self.assertEqual(driver.names().count("agent_start"), 1)
+        self.assertEqual(driver.names().count("agent_prompt"), 1)
+
+
 class TeamRouteIdentityTests(TaskCase):
     """An allowlisted OpenCode model id binds the actual OpenCode runtime.
 

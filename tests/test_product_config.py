@@ -81,5 +81,137 @@ class TeamRoutePolicyScopeTests(unittest.TestCase):
         self.assertFalse(policy.permits("example-provider/other-model"))
 
 
+class OpenCodeMiniHarnessTests(unittest.TestCase):
+    """Every OpenCode route must launch the non-interactive ``mini`` harness.
+
+    A bare OpenCode launch (a role model, an inherited provider or an
+    ``agent_profile`` whose arguments omit ``mini`` or the model, or carry an
+    unknown option) would open the interactive TUI at its own default model, so
+    it is refused before any Registry claim or pane effect. Native Codex
+    behavior is untouched.
+    """
+
+    ROUTE = "opencode-go/glm-5.3-flash"
+
+    def policy(self, routes):
+        return product_config.team_model_policy(product_config.validate_config({
+            "schema": product_config.SCHEMA,
+            "team_model_allowlist": list(routes),
+        }))
+
+    def route(self, args, *, kind="opencode", cli="opencode", model=None):
+        return {"agent_kind": kind, "agent_args": list(args),
+                "provider": {"cli": cli, "model": model}}
+
+    def test_non_mini_launch_is_refused_closed(self) -> None:
+        pol = self.policy([self.ROUTE])
+        for args in (["--model", self.ROUTE],
+                     ["--standalone", "--model", self.ROUTE],
+                     []):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    product_config.model_policy_error(
+                        self.route(args, model=self.ROUTE), pol, mode="read"),
+                    "TEAM_ROUTE_TUI_UNQUALIFIED")
+
+    def test_missing_or_ambiguous_model_stays_unresolved(self) -> None:
+        pol = self.policy([self.ROUTE])
+        for args in (["mini"],
+                     ["mini", "--model"],
+                     ["mini", "--model=" + self.ROUTE],
+                     ["mini", "--model", self.ROUTE, "--model", self.ROUTE]):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    product_config.model_policy_error(
+                        self.route(args), pol, mode="read"),
+                    "TEAM_MODEL_UNRESOLVED")
+
+    def test_unknown_or_unsafe_options_are_refused(self) -> None:
+        pol = self.policy([self.ROUTE])
+        for args in (["mini", "--model", self.ROUTE, "--print"],
+                     ["mini", "--model", self.ROUTE,
+                      "--dangerously-bypass-approvals-and-sandbox"],
+                     ["mini", "--standalone", "--standalone",
+                      "--model", self.ROUTE]):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    product_config.model_policy_error(
+                        self.route(args), pol, mode="read"),
+                    "TEAM_ROUTE_TUI_UNQUALIFIED")
+
+    def test_valid_mini_harness_is_admitted(self) -> None:
+        pol = self.policy([self.ROUTE])
+        for args in (["mini", "--model", self.ROUTE],
+                     ["mini", "--standalone", "--model", self.ROUTE]):
+            with self.subTest(args=args):
+                self.assertIsNone(product_config.model_policy_error(
+                    self.route(args), pol, mode="read"))
+
+    def test_provider_only_model_is_refused_because_no_argv_selects_it(self) -> None:
+        # The model must reach the actual process: a route that names it only in
+        # the provider entry would launch the default TUI selection.
+        pol = self.policy([self.ROUTE])
+        self.assertEqual(
+            product_config.model_policy_error(
+                self.route([], model=self.ROUTE), pol, mode="read"),
+            "TEAM_ROUTE_TUI_UNQUALIFIED")
+
+    def test_codex_route_is_not_subject_to_the_mini_harness(self) -> None:
+        pol = self.policy(["codex/gpt-6.1-sol"])
+        self.assertIsNone(product_config.model_policy_error(
+            self.route(["--model", "gpt-6.1-sol"], kind="codex", cli="codex"),
+            pol, mode="read"))
+
+    def test_absent_allowlist_still_refuses_a_bare_opencode_launch(self) -> None:
+        # The mini-harness qualification is not part of the optional allowlist:
+        # with no allowlist at all, a bare TUI, an implicit provider-only
+        # selection, an unknown option or an unqualified --agent is refused.
+        for args in ([], ["--model", self.ROUTE],
+                     ["--standalone", "--model", self.ROUTE],
+                     ["mini", "--model", self.ROUTE, "--print"],
+                     ["mini", "--agent", "build", "--model", self.ROUTE]):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    product_config.model_policy_error(
+                        self.route(args, model=self.ROUTE), None, mode="read"),
+                    "TEAM_ROUTE_TUI_UNQUALIFIED")
+
+    def test_absent_allowlist_still_refuses_a_missing_or_unsafe_model(self) -> None:
+        cases = (
+            (["mini"], None),
+            (["mini", "--model"], None),
+            (["mini", "--model=" + self.ROUTE], None),
+            (["mini", "--model", self.ROUTE, "--model", self.ROUTE], None),
+            (["mini", "--model", "not a safe token"], None),
+            (["mini", "--model", "opencode/other"], self.ROUTE),
+        )
+        for args, model in cases:
+            with self.subTest(args=args, model=model):
+                self.assertEqual(
+                    product_config.model_policy_error(
+                        self.route(args, model=model), None, mode="read"),
+                    "TEAM_MODEL_UNRESOLVED")
+
+    def test_absent_allowlist_admits_the_explicit_mini_harness(self) -> None:
+        for args in (["mini", "--model", self.ROUTE],
+                     ["mini", "--standalone", "--model", self.ROUTE]):
+            with self.subTest(args=args):
+                # The model may be selected by the provider entry, the verified
+                # argv, or both consistently; no allowlist entry is invented.
+                for model in (None, self.ROUTE):
+                    self.assertIsNone(product_config.model_policy_error(
+                        self.route(args, model=model), None, mode="read"))
+
+    def test_absent_allowlist_leaves_non_opencode_routes_unchanged(self) -> None:
+        for kind, cli, args in (
+                ("codex", "codex", ["--model", "gpt-6.1-sol"]),
+                ("codex", "codex", []),
+                ("claude", "claude", ["--model", "sonnet"]),
+                ("claude", "claude", [])):
+            with self.subTest(kind=kind, args=args):
+                self.assertIsNone(product_config.model_policy_error(
+                    self.route(args, kind=kind, cli=cli), None, mode="read"))
+
+
 if __name__ == "__main__":
     unittest.main()

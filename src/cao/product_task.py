@@ -753,21 +753,21 @@ def _model_policy_refusal(
     defaults: product_config.TaskDefaults,
     mode: Any = None,
 ) -> str | None:
-    """The model-allowlist refusal reason for this task's NEW dispatch route.
+    """The dispatch-policy refusal reason for this task's NEW dispatch route.
 
     The route is read only from the configured provider entry and this task's
-    own verified argv, never from an untrusted prompt. An absent allowlist is
-    the operator's opt-out and permits everything; a configured one denies an
-    unresolved or unlisted selection with no silent fallback. The resolved
-    agent kind and provider CLI are supplied so an allowlisted OpenCode model
-    id also binds the actual OpenCode runtime identity, and ``mode`` carries
-    this task's declared READ/WRITE mode so a read-only runtime reached for a
-    WRITE task — or a non-zero-data-retention provider at all — is refused.
+    own verified argv, never from an untrusted prompt. The OpenCode
+    ``mini``-harness qualification is unconditional, so an absent allowlist
+    never permits a bare or implicit OpenCode launch; a configured allowlist
+    additionally denies an unresolved or unlisted selection with no silent
+    fallback. The resolved agent kind and provider CLI are supplied so an
+    allowlisted OpenCode model id also binds the actual OpenCode runtime
+    identity, and ``mode`` carries this task's declared READ/WRITE mode so a
+    read-only runtime reached for a WRITE task — or a non-zero-data-retention
+    provider at all — is refused.
     """
 
     policy = product_config.team_model_policy(config)
-    if policy is None:
-        return None
     provider = config.provider if config is not None else None
     return product_config.model_policy_error(
         {"agent_kind": defaults.agent_kind,

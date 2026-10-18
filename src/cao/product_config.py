@@ -314,6 +314,31 @@ def _argv_model(arguments: Any) -> tuple[str | None, int, bool]:
     return value, mentions, trap
 
 
+def _opencode_harness_error(arguments: Any) -> str | None:
+    """Refuse an OpenCode route that would launch the full interactive TUI.
+
+    The only OpenCode launch CAO qualifies is its non-interactive ``mini``
+    harness naming exactly one explicit, safe ``--model``, alongside the
+    optional ``--standalone`` switch CAO's own dispatch emits. A bare OpenCode
+    launch (no ``mini``) opens the interactive TUI at its own default model, and
+    any unknown option is an unqualified launch, so both are refused before any
+    Registry claim or pane effect: a prompt acknowledgement then never stands in
+    for a running task.
+    """
+
+    value, mentions, trap = _argv_model(arguments)
+    if (type(arguments) is not list or not arguments
+            or arguments[0] != "mini" or mentions != 1 or trap
+            or value is None):
+        return "TEAM_ROUTE_TUI_UNQUALIFIED"
+    rest = arguments[1:]
+    if rest[:1] == ["--standalone"]:
+        rest = rest[1:]
+    if len(rest) != 2 or rest[0] != "--model":
+        return "TEAM_ROUTE_TUI_UNQUALIFIED"
+    return None
+
+
 def effective_route_model(provider_model: Any, value: Any,
                           mentions: int, trap: bool) -> str | None:
     """The one model the provider entry and the verified argv agree on, else None.
@@ -372,6 +397,10 @@ _TEAM_ROUTE_RUNTIME = {
 #: remain separate necessary gates; model identity alone is never a grant.
 _CODEX_WRITE_MODELS = frozenset({"codex/gpt-6.1-sol", "codex/gpt-6-luna"})
 _CODEX_RUNTIME = "codex"
+#: The OpenCode runtime kind. An OpenCode route must launch CAO's non-interactive
+#: ``mini`` harness, never the full interactive TUI, so this kind binds the
+#: harness requirement even for a foreign-prefixed model id.
+_OPENCODE_RUNTIME = "opencode"
 
 
 #: Route identities the canonical owner policy restricts to privacy-qualified
@@ -448,6 +477,15 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     both be the actual authorized runtime, so a spoofed foreign CLI can never
     pass on an allowed-looking model id.
 
+    An OpenCode route must launch CAO's non-interactive ``mini`` harness with
+    exactly one explicit, safe ``--model`` and no unknown option. A bare
+    OpenCode launch opens the interactive TUI at its own default model, so it is
+    refused (``TEAM_ROUTE_TUI_UNQUALIFIED``) here, before any Registry claim or
+    pane effect; this applies to a role model, an inherited provider and an
+    ``agent_profile`` alike, and it holds even when the optional allowlist is
+    absent. Non-OpenCode routes keep the unconfigured legacy behavior exactly
+    until an operator supplies an allowlist.
+
     ``mode`` is the declared task mode (``read``/``write``) when the caller
     knows it. Native Codex WRITE is permitted only for the two pinned model
     identities and exact mode-specific safe arguments; all other Codex WRITE
@@ -461,17 +499,35 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     technically verifiable.
     """
 
-    if policy is None:
-        return None
+    if not isinstance(route, Mapping):
+        return None if policy is None else "TEAM_MODEL_UNRESOLVED"
     status, model = route_model(route)
-    if status != "resolved" or model is None:
-        return "TEAM_MODEL_UNRESOLVED"
     provider = route.get("provider")
     cli = (provider.get("cli")
            if isinstance(provider, Mapping) else None)
-    identity = _canonical_route_identity(model, cli)
-    prefix = identity.split("/", 1)[0]
-    required = _TEAM_ROUTE_RUNTIME.get(prefix)
+    kind_token = safe_route_token(route.get("agent_kind"))
+    cli_token = safe_route_token(cli)
+    identity = (_canonical_route_identity(model, cli)
+                if model is not None else None)
+    prefix = identity.split("/", 1)[0] if identity is not None else None
+    required = _TEAM_ROUTE_RUNTIME.get(prefix) if prefix is not None else None
+    opencode_bound = (
+        kind_token == _OPENCODE_RUNTIME
+        or cli_token == _OPENCODE_RUNTIME
+        or (required is not None and required[0] == _OPENCODE_RUNTIME))
+    if policy is None:
+        # The mini-harness requirement qualifies the launch itself, so it is
+        # independent of the optional allowlist: an absent allowlist never
+        # permits a bare OpenCode TUI or an implicit model. Non-OpenCode routes
+        # keep the unconfigured legacy behavior exactly.
+        if not opencode_bound:
+            return None
+        harness = _opencode_harness_error(route.get("agent_args"))
+        if status != "resolved" or model is None:
+            return "TEAM_MODEL_UNRESOLVED"
+        return harness
+    if status != "resolved" or model is None:
+        return "TEAM_MODEL_UNRESOLVED"
     # A route whose canonical identity binds a known runtime is matched ONLY as
     # that exact canonical identity, so a bare or foreign alias can never stand
     # in for it. Routes for other provider prefixes keep the generic behavior
@@ -481,8 +537,8 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     if not permitted:
         return "TEAM_MODEL_NOT_ALLOWED"
     if required is not None:
-        if (safe_route_token(route.get("agent_kind")) != required[0]
-                or safe_route_token(cli) != required[1]):
+        if (kind_token != required[0]
+                or cli_token != required[1]):
             return "TEAM_ROUTE_IDENTITY_MISMATCH"
     # Compare on the base route, case-folded: a bounded ``#effort`` variant and
     # a non-canonical spelling never change the upstream provider, so neither
@@ -498,8 +554,6 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
     # prefix or through its resolved agent kind / provider CLI, so a
     # foreign-prefixed model id (which would otherwise take the generic path)
     # still counts as Codex.
-    kind_token = safe_route_token(route.get("agent_kind"))
-    cli_token = safe_route_token(cli)
     codex_bound = (prefix == _CODEX_RUNTIME
                    or kind_token == _CODEX_RUNTIME
                    or cli_token == _CODEX_RUNTIME)
@@ -530,6 +584,16 @@ def model_policy_error(route: Any, policy: TeamModelPolicy | None, *,
                                  "approval_policy=on-request"]):
             return "TEAM_ROUTE_WRITE_UNQUALIFIED"
         return None
+    # An OpenCode route must launch CAO's non-interactive ``mini`` harness with
+    # exactly one explicit, safe model. A bare OpenCode launch opens the
+    # interactive TUI at its own default model, so a route that names OpenCode
+    # through its identity prefix, its resolved agent kind or its provider CLI
+    # is refused unless it selects that harness; the native Codex handling above
+    # is untouched.
+    if opencode_bound:
+        harness = _opencode_harness_error(route.get("agent_args"))
+        if harness is not None:
+            return harness
     if (base_identity in _READ_ONLY_ROUTE_MODELS_FOLDED
             or base_model_id in _READ_ONLY_MODEL_IDS_FOLDED) and _route_mode(mode) != "read":
         return "TEAM_ROUTE_READ_ONLY"

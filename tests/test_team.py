@@ -1668,7 +1668,10 @@ class TeamTests(unittest.TestCase):
         result = team.tick("squad", config=incompatible, driver=None, env=self.env,
                            execute=lambda **kw: self.fail("must not start"),
                            writer_snapshot=lambda _: (0, set()))
-        self.assertEqual(result["tasks"]["a"]["status"], "unknown")
+        # The inconsistent route is now refused at the routing admission gate
+        # before any execution identity exists; it is never substituted.
+        self.assertEqual(result["tasks"]["a"]["status"], "pending")
+        self.assertEqual(result["tasks"]["a"]["error"], "TEAM_ADMISSION_CHANGED")
 
     def test_reviewer_role_must_be_distinct(self):
         invalid = task("a", self.paths[0], reviewer="developer")

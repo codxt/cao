@@ -24,7 +24,9 @@ quota, and it holds the task `UNAVAILABLE` for an operator decision instead.
 When `team_model_allowlist` is configured, every NEW dispatch is additionally
 refused with zero Registry claim rows and no workspace or agent effect before
 the first effect; an already-claimed worker keeps its exact identity and is
-never re-gated.
+never re-gated. Independently of any allowlist, every NEW OpenCode dispatch
+must pass the `mini`-harness qualification below: absence of the allowlist
+never permits a bare TUI or an implicit model.
 
 A listed `opencode/` or `opencode-go/` model id binds the dispatch route
 identity, not just the model string. A model id alone never proves OpenCode
@@ -33,6 +35,20 @@ the actual OpenCode agent kind and provider CLI; a resolved route with a
 foreign, spoofed or missing agent kind or provider CLI is refused
 (`TEAM_ROUTE_IDENTITY_MISMATCH`) instead of dispatching on another runtime,
 even when the provider model and the verified argv `--model` look allowed.
+
+An OpenCode route must launch CAO's non-interactive `mini` harness naming
+exactly one explicit, safe `--model`, with the optional `--standalone` switch
+CAO itself emits. No `--agent` (or any other option) is separately qualified in
+this build, so it is refused explicitly rather than admitted through an invented
+allowlist. A bare OpenCode launch — a role model, an inherited provider or an
+`agent_profile` whose arguments omit `mini` or the model, or carry an unknown
+option — would open the interactive TUI at its own default model, so it is
+refused (`TEAM_ROUTE_TUI_UNQUALIFIED`, or `TEAM_MODEL_UNRESOLVED` for a missing,
+divergent or ambiguous model) before any Registry claim or pane effect. This
+qualification holds whether or not `team_model_allowlist` is configured, for
+both team and direct product tasks. The explicit model is always the selection
+the harness passes, and no unqualified or silent default is ever substituted.
+Native Codex routes and their existing READ/WRITE handling are unchanged.
 
 A listed `codex/` model id binds a Codex agent-profile route the same way: a
 native `--model` token resolves to the canonical allowlist identity
@@ -564,8 +580,10 @@ fields, unsafe argument strings, unsupported modes, or collisions between a
 role's inline OpenCode model and a profile fail closed. Reviewer tasks always
 resolve `read_args`; a read profile never inherits `write_args`.
 Current inline OpenCode model routing and no-profile team behavior remain
-unchanged. Profile names, launch arguments and backend choices are operator
-configuration, not tenant state or operator identity proofs.
+unchanged, and an OpenCode profile is subject to the `mini`-harness
+requirement above whether or not a `team_model_allowlist` is configured.
+Profile names, launch arguments and backend choices are operator configuration,
+not tenant state or operator identity proofs.
 
 The existing CAO daemon, Herdr adapter, Work Registry, task identities,
 review receipts, and independent repository/release authorization remain
@@ -596,11 +614,12 @@ resolved work/review route each task would dispatch — the agent kind, the
 provider CLI/id and the effective model — and, in chat mode, the exact
 `spec_sha256` and `routes_sha256` that a following `cao team init --approved`
 would save, so an operator can confirm the digests before approving. Each route
-also reports `model_allowed`: the verdict the configured `team_model_allowlist`
-would apply at dispatch (truthful `true` when no allowlist is configured),
-including the OpenCode route-identity binding so a foreign or spoofed agent
-kind or provider CLI reads as denied on the plan exactly as it refuses at
-dispatch. Roles
+also reports `model_allowed`: the verdict the configured `team_model_allowlist` and the
+unconditional OpenCode harness qualification would apply at dispatch (a
+non-OpenCode route with no allowlist is truthfully `true`, while an unqualified
+OpenCode route reads `false` even without an allowlist), including the OpenCode
+route-identity binding so a foreign or spoofed agent kind or provider CLI reads
+as denied on the plan exactly as it refuses at dispatch. Roles
 are shown only by their safe declared selection (an inline model or an
 `agent_profile`); raw role instructions, raw argument vectors, prompts,
 environment and configured document text are never emitted. The provider
