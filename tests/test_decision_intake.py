@@ -661,8 +661,9 @@ class PromptTests(DecisionCase):
 
     def test_projection_is_idempotent(self) -> None:
         sid = self.admitted()
-        first = self.prepare(sid)
-        second = self.prepare(sid)
+        grant = self.grant_document()
+        first = self.prepare(sid, grant=grant)
+        second = self.prepare(sid, grant=grant)
         self.assertEqual(first, second)
         self.assertEqual(first["status"], "PROPOSED")
 
