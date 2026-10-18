@@ -196,9 +196,13 @@ def _main(argv):
             if pane_id is None:
                 return _fail("agent_not_found")
             pane = state["panes"].get(pane_id, {})
-            return _out("agent_prompted",
-                        agent={"pane_id": pane_id,
-                               "workspace_id": pane.get("workspace_id")})
+            fields = {"agent": {"pane_id": pane_id,
+                                "workspace_id": pane.get("workspace_id")}}
+            if "--wait" in argv:
+                # With ``--wait`` the runtime reports the native activity state
+                # it observed; the product refuses a bare acknowledgement.
+                fields["matched_state"] = "working"
+            return _out("agent_prompted", **fields)
         if action == "read":
             sys.stdout.write("fake agent output for %s\n" % argv[2])
             return 0
