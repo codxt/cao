@@ -39,7 +39,8 @@ from unittest import mock
 
 from cao import (decision_agent as da, decision_execution, decision_intake,
                  decision_stage, intake, intake_authority, intake_handoff,
-                 intake_triage, product_config, product_task, registry, team)
+                 intake_queue, intake_triage, product_config, product_task,
+                 registry, team)
 
 _HAVE_GIT = shutil.which("git") is not None
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -110,6 +111,7 @@ class ExecutionCase(unittest.TestCase):
                 "schema": product_config.SCHEMA,
                 "provider": {"cli": "opencode", "model": "example/model"},
                 "team_approval": {"mode": "chat"},
+                "team_model_allowlist": [ROUTE],
             },
             product_config.config_path(self.env),
         )
@@ -432,6 +434,13 @@ class GateTests(ExecutionCase):
         self.assertEqual(result["code"], "standing_grant_refused")
         self.assertEqual(self.teams(), [])
 
+    def test_revoked_protected_grant_is_refused(self) -> None:
+        sid = self.admitted()
+        result = self.start(sid, grant=self.grant_document(revoked=True))
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "standing_grant_refused")
+        self.assertEqual(self.teams(), [])
+
     def test_nonzero_retention_route_holds(self) -> None:
         sid = self.admitted()
         result = self.start(sid, route_qualification=self.qualify(retention="standard"))
@@ -668,6 +677,149 @@ class ForeignAndDriftTests(ExecutionCase):
         self.assertEqual(result["code"], "not_read_only")
 
 
+class NativePromptTests(ExecutionCase):
+    """The exact verified B2a/B2b tagged decision-plan prompt reaches the worker."""
+
+    def test_worker_prompt_carries_the_exact_tagged_decision_plan(self) -> None:
+        sid = self.admitted(body=READ_REQUEST + f" Note: {BODY_TOKEN}.")
+        started = self.started_team(sid)
+        record = team._read(started["team_id"], self.env)
+        task = record["spec"]["tasks"][0]
+        prompt = task["prompt"]
+        ref = self.ref_for(sid)
+        for fragment in (
+            "location=" + ref["location"],
+            "digest=" + ref["digest"],
+            "head=" + ref["head"],
+            "cutoff=",
+            "owner=" + ref["scope"]["owner"],
+            "repository=" + ref["scope"]["repository"],
+            "data_class=" + ref["scope"]["data_class"],
+            da.PLAN_SCHEMA,
+            f'<cao-plan-result submission="{started["alias"]}" '
+            f'task="{started["task_id"]}">',
+            decision_stage.CLOSE_TAG,
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, prompt)
+        # The manifest carries the exact prompt the verified B2b stage built.
+        with self.protected():
+            stage_prompt = decision_intake.prepare_read_prompt(
+                sid, env=self.env, repo=self.repo_real, source_ref="main",
+                route_qualification=self.qualify(), enabled=True)["prompt"]
+        self.assertEqual(stage_prompt, prompt)
+        # The assembled worker prompt asks for the tagged plan block before the
+        # native terminal receipt instruction, and never carries private data.
+        slot = record["slots"][started["task_id"]]
+        assembled = team._prompt(task, record["spec"], slot, record["slots"])
+        self.assertIn("<cao-plan-result", assembled)
+        self.assertIn("CAO_TEAM_RESULT:", assembled)
+        self.assertLess(assembled.index("<cao-plan-result"),
+                        assembled.index("CAO_TEAM_RESULT:"))
+        for private in (sid, TITLE, BODY_TOKEN, ITEM_ID, self.repo_real):
+            with self.subTest(private=private):
+                self.assertNotIn(private, assembled)
+
+
+class AuthoritySeamTests(ExecutionCase):
+    """Authority is the protected adapter only; a caller dictionary is refused."""
+
+    def test_caller_supplied_grant_mapping_is_refused_and_creates_no_team(self) -> None:
+        sid = self.admitted()
+        result = intake_handoff.handoff_plan(
+            sid, repo=self.repo_real, source_ref="main", env=self.env,
+            operator_authority={"authenticated": True,
+                                "grant": {"read_only": True}},
+            citation=self.alias_for(sid))
+        self.assertEqual(result["status"], "REFUSED")
+        self.assertEqual(self.teams(), [])
+
+
+class QuotaTests(ExecutionCase):
+    """One shared, durable B8 quota covers the B2d and B6/B7 routes alike."""
+
+    def _envelope(self) -> dict:
+        return self.grant_document(max_dispatches=1)
+
+    def _adapter(self, envelope: dict):
+        return intake_authority.OperatorAuthority(
+            intake_authority.validate_grant(envelope), env=self.env)
+
+    def test_shared_quota_refuses_the_second_alias_and_id_citing_dispatch(self) -> None:
+        first = self.start(self.admitted(), grant=self._envelope())
+        self.assertEqual(first["status"], decision_execution.STARTED)
+        self.assertEqual(len(self.teams()), 1)
+        second = self.start(self.admitted(), grant=self._envelope())
+        self.assertEqual(second["status"], "HELD")
+        self.assertEqual(second["code"], "dispatch_refused")
+        self.assertEqual(len(self.teams()), 1)
+        # A B6/B7 dispatch through the identical protected adapter is refused by
+        # the same shared quota: the alias-citing team is counted for it.
+        third = intake_handoff.handoff_plan(
+            self.admitted(), repo=self.repo_real, source_ref="main",
+            env=self.env, operator_authority=self._adapter(self._envelope()))
+        self.assertEqual(third["status"], "REFUSED")
+        self.assertEqual(len(self.teams()), 1)
+
+    def test_incomplete_quota_evidence_holds(self) -> None:
+        with mock.patch.object(
+            intake_authority, "consumption",
+            return_value={"verdict": "UNKNOWN", "consumed": 0, "teams": [],
+                          "claims": [], "reason": "unreadable"}):
+            result = self.start(self.admitted(), grant=self._envelope())
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(self.teams(), [])
+
+    def test_a_held_queue_lock_refuses_the_admission(self) -> None:
+        import fcntl
+        sid = self.admitted()
+        started = self.started_team(sid)
+        other = self.admitted()
+        directory = intake_queue.queue_dir(self.env)
+        intake_queue._ensure_private_dir(directory)
+        lock_fd = os.open(os.path.join(directory, ".lock"),
+                          os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.start(other)
+            self.assertEqual(blocked["status"], "HELD")
+            self.assertEqual(blocked["code"], "dispatch_busy")
+        finally:
+            os.close(lock_fd)
+        self.assertEqual(len(self.teams()), 1)
+        self.assertEqual(started["team_id"], self.teams()[0]["team_id"])
+        self.assertEqual(self.start(other)["status"], decision_execution.STARTED)
+
+    def test_concurrent_dispatches_never_oversubscribe_the_quota(self) -> None:
+        import threading
+        envelope = self._envelope()
+        sids = [self.admitted(), self.admitted()]
+        results: dict[int, dict] = {}
+        barrier = threading.Barrier(2)
+
+        def run(index: int) -> None:
+            barrier.wait()
+            try:
+                results[index] = decision_execution.start_read_team(
+                    sids[index], env=self.env, repo=self.repo_real,
+                    source_ref="main", route_qualification=self.qualify(),
+                    enabled=True)
+            except Exception as exc:  # noqa: BLE001 - recorded, not raised
+                results[index] = {"status": "ERROR", "code": type(exc).__name__}
+
+        with self.protected(envelope):
+            threads = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        started = [r for r in results.values()
+                   if r.get("status") == decision_execution.STARTED]
+        self.assertEqual(len(started), 1, msg=f"results: {results}")
+        self.assertEqual(len(self.teams()), 1)
+
+
 class ModuleShapeTests(unittest.TestCase):
     """The module is opt-in, stdlib-only, egress-free and no second executor."""
 
@@ -701,12 +853,13 @@ class ModuleShapeTests(unittest.TestCase):
             "product_task.run", "state.write", "open_private_dir(",
             "write_private_record(", "os.makedirs", "os.chmod",
             "intake_queue.enqueue(", "intake_queue.tick(",
-            "handoff_plan(", "product_daemon", "threading",
+            "product_daemon", "threading",
             "asyncio", "Timer", "while True",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
-        self.assertIn("intake_handoff.dispatch_read_plan(", source)
+        self.assertIn("intake_handoff.handoff_plan(", source)
+        self.assertIn("intake_queue._queue_lock(", source)
 
     def test_imports_are_stdlib_and_cao_only(self) -> None:
         tree_ = ast.parse(self.source())

@@ -456,6 +456,59 @@ class ConsumptionTests(AuthorityDispatchCase):
             result = intake_authority.consumption(env=self.env, envelope=envelope)
         self.assertEqual(result["verdict"], "UNKNOWN")
 
+    def test_consumption_counts_an_alias_citing_dispatched_team(self) -> None:
+        # Batch B2d dispatches the same governed READ audit with an alias-only
+        # prompt (no raw admission id). The shared quota must still count it, and
+        # the attribution comes from the durable handoff-plan binding, never from
+        # the (absent) id in the prompt.
+        sid = self.admitted("auth-alias")
+        envelope = self.envelope()
+        citation = "synthetic-" + "a" * 40
+        dispatched = intake_handoff.handoff_plan(
+            sid, repo=self.repo_real, source_ref="main", env=self.env,
+            operator_authority=self.adapter(envelope), citation=citation)
+        self.assertEqual(dispatched["status"], "ADMITTED")
+        prompt = team._read("intake-read-" + sid[:16], self.env)["spec"][
+            "tasks"][0]["prompt"]
+        self.assertNotIn(sid, prompt)
+        self.assertIn(citation, prompt)
+        after = intake_authority.consumption(env=self.env, envelope=envelope)
+        self.assertEqual(after["verdict"], "SUPPORTED")
+        self.assertEqual(after["consumed"], 1)
+        self.assertIn("intake-read-" + sid[:16], after["teams"])
+
+    def test_consumption_is_unknown_when_an_alias_binding_is_unreadable(self) -> None:
+        sid = self.admitted("auth-alias-partial")
+        envelope = self.envelope()
+        intake_handoff.handoff_plan(
+            sid, repo=self.repo_real, source_ref="main", env=self.env,
+            operator_authority=self.adapter(envelope),
+            citation="synthetic-" + "b" * 40)
+        with mock.patch.object(intake_handoff, "plan_submission_for_team",
+                               side_effect=Exception("boom")):
+            result = intake_authority.consumption(env=self.env, envelope=envelope)
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertIn("durable handoff-plan", result["reason"])
+
+    def test_consumption_is_unknown_for_an_alias_team_without_a_plan(self) -> None:
+        # The concrete undercount vector: an alias-citing READ team with no
+        # durable handoff-plan binding must never be rounded down to uncounted.
+        sid = self.admitted("auth-alias-noplan")
+        envelope = self.envelope()
+        citation = "synthetic-" + "c" * 40
+        manifest = intake_handoff._manifest(
+            self.plan(sid),
+            {"role": "reader", "model": "opencode-go/deepseek-v4.1-flash",
+             "repo": self.repo_real, "paths": ["a.txt"]},
+            citation=citation)
+        team.initialize(manifest, env=self.env)
+        prompt = team._read(manifest["team_id"], self.env)["spec"]["tasks"][0][
+            "prompt"]
+        self.assertIn(citation, prompt)
+        result = intake_authority.consumption(env=self.env, envelope=envelope)
+        self.assertEqual(result["verdict"], "UNKNOWN")
+        self.assertIn("durable handoff-plan", result["reason"])
+
 
 class ConsumptionCardinalityTests(unittest.TestCase):
     """Every team record is inspected; an overlarge store fails closed."""

@@ -507,13 +507,20 @@ def validate_grant(document: Any) -> dict[str, Any]:
 
 
 def _covered_submission(
-    team_id: str, spec: Mapping[str, Any], envelope: Mapping[str, Any]
+    team_id: str, spec: Mapping[str, Any], envelope: Mapping[str, Any],
+    env: Mapping[str, str] | None = None,
 ) -> str | None:
     """The submission a B6-derived READ audit team id and manifest cover.
 
     The team id ``intake-read-<submission[:16]>`` and the immutable manifest
     prompt's full submission id must agree, so a team can only be attributed to
     the submission it actually audits. A foreign or forged team is never counted.
+
+    A Batch B2d team cites only the one-way ``synthetic-`` alias in its prompt
+    (the privacy-preserving form of the same governed READ audit), so when the
+    raw admission id is absent the team is attributed from the governor's own
+    durable handoff-plan binding instead -- never from a caller field and never
+    by guessing.
     """
 
     tasks = spec.get("tasks")
@@ -530,11 +537,40 @@ def _covered_submission(
             if "intake-read-" + token[:16] == team_id:
                 found = token
     if found is None:
+        found = _alias_covered_submission(team_id, tasks, env)
+    if found is None:
         return None
     submissions = envelope.get("submissions")
     if submissions is not None and found not in submissions:
         return None
     return found
+
+
+def _alias_covered_submission(
+    team_id: str, tasks: list[Any], env: Mapping[str, str] | None
+) -> str | None:
+    """The submission of an alias-citing READ team, from durable evidence.
+
+    Only a manifest that cites a bounded ``synthetic-`` alias is eligible, and
+    its submission is then resolved from the persisted handoff-plan binding. A
+    missing or malformed binding raises so consumption fails closed rather than
+    undercounting the shared quota.
+    """
+
+    cited = any(
+        re.search(r"synthetic-[0-9a-f]{40}", str(task.get("prompt") or ""))
+        for task in tasks if isinstance(task, Mapping)
+    )
+    if not cited:
+        return None
+    resolved = intake_handoff.plan_submission_for_team(team_id, env)
+    if resolved is None:
+        # The only path that creates an alias-citing READ team also persists its
+        # durable handoff-plan binding; a team without one is partial evidence,
+        # so consumption fails closed instead of undercounting the shared quota.
+        raise intake_handoff.HandoffStateError(
+            "an alias-citing READ team carries no durable handoff-plan binding")
+    return resolved
 
 
 def consumption(
@@ -584,7 +620,12 @@ def consumption(
         if not isinstance(spec, Mapping):
             return {**base, "verdict": "UNKNOWN",
                     "reason": "a bound CAO team has no immutable manifest"}
-        if _covered_submission(team_id, spec, envelope) is not None:
+        try:
+            covered = _covered_submission(team_id, spec, envelope, env)
+        except Exception:  # noqa: BLE001 - a partial read is never a fresh quota
+            return {**base, "verdict": "UNKNOWN",
+                    "reason": "a durable handoff-plan binding could not be read"}
+        if covered is not None:
             counted.append(team_id)
 
     claims: list[dict[str, Any]] = []

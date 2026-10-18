@@ -3,13 +3,15 @@
 This is the narrow **adapter** between the already-landed Batches and the
 existing CAO execution path. It adds no executor, timer, scheduler, loop, claim,
 queue or manager of its own: it verifies the native READ intent and the
-protected B8 standing grant through :mod:`cao.decision_intake`, asks the B2b
-stage for the bounded pseudonymous alias prompt, hands exactly one alias-citing
-READ manifest to the **existing** CAO team owner API through
-:func:`cao.intake_handoff.dispatch_read_plan`, and lets the existing daemon
-reconcile the team. The post-prompt terminal receipt, the released READ Registry
-claim and the tagged result are then validated by the existing B2b/B2c native
-``decision_intake.validate_result``.
+protected B8 standing grant through :mod:`cao.decision_intake`, re-reads the
+**same** protected standing authority through its in-process adapter, asks the
+B2b stage for the bounded pseudonymous alias prompt, and hands exactly one
+alias-citing READ manifest -- carrying that exact tagged decision plan prompt --
+to the **existing** CAO team owner API through the **same** governed B6
+:func:`cao.intake_handoff.handoff_plan` path (serialized under the existing B7
+queue dispatch lock). The existing daemon reconciles the team. The post-prompt
+terminal receipt, the released READ Registry claim and the tagged result are then
+validated by the existing B2b/B2c native ``decision_intake.validate_result``.
 
 Load-bearing rules
 ------------------
@@ -19,9 +21,14 @@ Load-bearing rules
   prompt is created while the stage is disabled.
 * **Trust comes from the protected grant only.** The B8 standing grant is
   re-read, scope-checked, source-checked, model-checked and privacy-qualified by
-  :mod:`cao.decision_intake`; an absent, refused, revoked, expired or
-  wrong-scope grant holds. Nothing here infers trust from provider
-  configuration, a caller flag, manifest text or a model assertion.
+  :mod:`cao.decision_intake`, and is then re-read a second time through the
+  protected in-process adapter, whose plan-digest-bound verdict is the *only*
+  thing that can dispatch. An absent, refused, revoked, expired or wrong-scope
+  grant holds, and nothing here infers trust from provider configuration, a
+  caller dictionary, a flag, a citation, manifest text or a model assertion.
+* **One quota, shared.** A READ execution consumes the same durable B8 quota
+  the B6/B7 route consumes, counted across alias-citing and id-citing teams
+  alike; an exhausted, incomplete or unreadable quota evidence holds.
 * **Privacy comes from qualified evidence, not a model.** The route/data-class
   qualification is independently supplied (zero retention, provider-qualified,
   allowlisted); a missing or non-zero-retention route holds.
@@ -48,9 +55,11 @@ goes through the existing B2b/B6 read-only and governed APIs.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
-from . import decision_agent as da, decision_intake as di, intake_handoff
+from . import (decision_agent as da, decision_intake as di, intake_authority,
+               intake_handoff, intake_queue)
 
 __all__ = [
     "EXECUTION_SCHEMA",
@@ -111,26 +120,6 @@ def _disabled() -> dict:
     )
 
 
-def _grant(ctx: Any) -> dict:
-    """The verified B6-shaped grant of the protected B8 standing envelope.
-
-    The envelope has already been re-read, scope/source/model-checked and
-    privacy-qualified by :mod:`cao.decision_intake`, so this is a translation of
-    verified facts, never a caller-asserted authority.
-    """
-
-    envelope = ctx["grant"]
-    paths = (envelope.get("scope") or {}).get("paths")
-    return {
-        "operator": str(envelope.get("operator") or ""),
-        "owner": str(ctx["owner"]),
-        "role": str(envelope.get("role") or ""),
-        "model": str(envelope.get("model") or ""),
-        "repo": str(ctx["source"]["repo"]),
-        "paths": list(paths or []),
-    }
-
-
 def _hold(kind: str, handoff: dict) -> dict:
     """Map one non-dispatch handoff outcome to a precise advisory hold."""
 
@@ -154,6 +143,34 @@ def _hold(kind: str, handoff: dict) -> dict:
     )
 
 
+def _dispatch(
+    ctx: Mapping[str, Any], prompt: str, authority: Any, *,
+    env: Any, repo: Any, source_ref: Any, clock: Any, dry_run: bool,
+) -> dict:
+    """Hand the one verified READ plan to the existing B6 owner path.
+
+    The dispatch is the **same single governed ``handoff_plan`` path** the B6/B7
+    route uses, behind the **same** in-process operator-authority adapter that
+    re-reads and re-binds the protected B8 grant to the exact derived plan digest
+    at dispatch time. An actual dispatch is serialized under the **existing** B7
+    queue dispatch kernel lock, so a caller cannot race a second READ team or a
+    second quota unit past a concurrent pass; a dry run creates nothing and takes
+    no lock.
+    """
+
+    def governed() -> dict:
+        return intake_handoff.handoff_plan(
+            ctx["sid"], repo=repo, source_ref=source_ref, env=env, clock=clock,
+            operator_authority=authority, citation=ctx["alias"], prompt=prompt,
+            dry_run=dry_run,
+        )
+
+    if dry_run:
+        return governed()
+    with intake_queue._queue_lock(intake_queue.queue_dir(env)):
+        return governed()
+
+
 def start_read_team(
     submission_id: Any,
     *,
@@ -170,11 +187,15 @@ def start_read_team(
     Every gate of :func:`cao.decision_intake.prepare_read_prompt` must hold
     first (native admission, eligible-READ intent, exact source/HEAD,
     independently qualified zero-retention route, protected B8 standing grant,
-    unchanged persisted binding, no prior audit). Then the B2b alias prompt is
-    built and one alias-citing READ manifest is handed to the existing CAO team
-    owner API. ``dry_run`` returns the authorized plan only and creates nothing;
-    the default ``enabled = False`` returns ``HELD`` before any evidence is read.
-    The result is advisory data: it never carries authority.
+    unchanged persisted binding, no prior audit). The **same protected B8
+    standing authority is then re-read through its in-process adapter** and must
+    still fingerprint-match that evidence, before the exact B2b alias prompt is
+    handed, with the exact plan, to the existing CAO team owner API. Authority
+    comes only from that adapter's plan-digest-bound verdict -- never from a
+    caller dictionary, an ``enabled`` flag, a citation, a prompt or a model plan.
+    ``dry_run`` returns the authorized plan only and creates nothing; the default
+    ``enabled = False`` returns ``HELD`` before any evidence is read. The result
+    is advisory data: it never carries authority.
     """
 
     if not enabled:
@@ -194,12 +215,48 @@ def start_read_team(
                 str(prompt.get("reason") or "the alias prompt is held"),
                 detail={"stage": "prepare_read_prompt"},
             )
-        handoff = intake_handoff.dispatch_read_plan(
-            ctx["sid"], grant=_grant(ctx), citation=ctx["alias"], env=env,
-            repo=repo, source_ref=source_ref, dry_run=dry_run, clock=clock,
+        authority = intake_authority.standing_authority(env=env, clock=clock)
+        if authority.get("verdict") != "SUPPORTED" or authority.get(
+                "adapter") is None:
+            return _held(
+                "standing_authority_unavailable",
+                str(authority.get("reason")
+                    or "no protected standing authority resolved"),
+                detail={"authority_code": authority.get("code")},
+            )
+        envelope = authority.get("envelope") or {}
+        if envelope.get("grant_fingerprint") != ctx["grant"].get(
+                "grant_fingerprint"):
+            return _held(
+                "standing_authority_drift",
+                "the protected standing authority changed between the verified "
+                "B2b evidence and the dispatch, so nothing is granted on drifted "
+                "authority",
+            )
+        if str(envelope.get("model") or "").split("#", 1)[0] != ctx["route"]:
+            return _held(
+                "route_not_granted",
+                "the independently qualified route is not the protected standing "
+                "authority's model",
+            )
+        handoff = _dispatch(
+            ctx, prompt["prompt"], authority["adapter"], env=env, repo=repo,
+            source_ref=source_ref, clock=clock, dry_run=dry_run,
         )
     except da.DecisionHeld as held:
         return _held(held.code, held.reason, detail=getattr(held, "detail", None))
+    except intake_queue.QueueBusy:
+        return _held(
+            "dispatch_busy",
+            "another governed dispatch holds the shared B7 queue dispatch lock; "
+            "no second READ team is admitted",
+        )
+    except intake_queue.QueueError as exc:
+        return _held(
+            "queue_unavailable",
+            f"the shared B7 queue dispatch lock is unavailable "
+            f"({type(exc).__name__})",
+        )
     except intake_handoff.HandoffError as exc:
         return _held(
             "handoff_refused",
@@ -221,7 +278,7 @@ def start_read_team(
             "qualification than the verified native evidence",
         )
     if handoff.get("status") not in ("AUTHORIZED", "ADMITTED", "DUPLICATE"):
-        return _hold("dispatch_read_plan", handoff)
+        return _hold("handoff_plan", handoff)
     return _envelope(
         AUTHORIZED if dry_run else STARTED,
         None,

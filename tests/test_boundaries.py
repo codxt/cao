@@ -875,8 +875,9 @@ class DecisionExecutionBoundaryTests(unittest.TestCase):
 
     The adapter verifies the protected B8 grant and the invariant binding, then
     hands exactly one alias-citing READ manifest to the *existing* CAO team owner
-    API through the B6 ``dispatch_read_plan`` path. It must never mutate a team
-    directly, tick/schedule, write a Registry row or open an egress surface.
+    API through the same B6 ``handoff_plan`` path (behind the protected
+    in-process adapter and the B7 queue dispatch lock). It must never mutate a
+    team directly, tick/schedule, write a Registry row or open an egress surface.
     """
 
     def _tree(self) -> ast.AST:
@@ -896,14 +897,14 @@ class DecisionExecutionBoundaryTests(unittest.TestCase):
 
     def test_owner_api_is_reached_only_through_the_b6_dispatch(self) -> None:
         source = (CAO_ROOT / "decision_execution.py").read_text("utf-8")
-        self.assertIn("intake_handoff.dispatch_read_plan(", source)
+        self.assertIn("intake_handoff.handoff_plan(", source)
         for forbidden in (
             "team.initialize(", "team.set_desired(", "team.tick(",
             "team.tick_all(", "registry.connect(", "registry.propose",
             "registry.claim(", "registry.release", "registry.handoff",
             "registry.write_gate", "registry.record_", "product_task.run",
             "state.write", "open_private_dir(", "write_private_record(",
-            "handoff_plan(", "intake_queue.enqueue(", "intake_queue.tick(",
+            "intake_queue.enqueue(", "intake_queue.tick(",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
