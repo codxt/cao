@@ -1006,5 +1006,160 @@ class DecisionProjectionTests(HandoffCase):
         self.assertFalse(Path(intake_handoff.plan_dir(self.env)).exists())
 
 
+class AliasCitationTests(HandoffCase):
+    """B2d: the opt-in pseudonymous citation keeps the admission id out of the
+    model-visible manifest while the exact binding stays provable, and the
+    default manifest is unchanged."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from cao import product_config
+
+        product_config.write_config(
+            {"schema": product_config.SCHEMA,
+             "provider": {"cli": "opencode", "model": "example/model"}},
+            product_config.config_path(self.env),
+        )
+
+    def grant(self, repo: str) -> dict:
+        return {"operator": "operator-one", "owner": "owner-one", "role": "reader",
+                "model": "opencode-go/deepseek-v4-flash#high", "repo": repo,
+                "paths": ["src"]}
+
+    def test_default_manifest_still_cites_the_submission_id(self) -> None:
+        sid = self.admitted("alias-default")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        manifest = intake_handoff._manifest(plan, self.grant(repo))
+        prompt = manifest["tasks"][0]["prompt"]
+        self.assertIn(sid, prompt)
+        self.assertNotIn("synthetic-", prompt)
+        self.assertTrue(intake_handoff._manifest_cites(manifest, sid))
+
+    def test_default_manifest_prompt_is_byte_identical(self) -> None:
+        # The B6/B7 default prompt must remain exactly the pre-correction literal.
+        sid = self.admitted("alias-golden")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        manifest = intake_handoff._manifest(plan, self.grant(repo))
+        expected = (
+            f"Governed CAO Intake READ audit for submission {sid} bound to "
+            f"handoff plan {plan['plan_id']} "
+            f"(digest {intake_handoff._binding_digest(plan)}). Inspect "
+            "the scoped source and report evidence only. Do not merge, deploy, "
+            "publish, release, change credentials or permissions, or delete "
+            "anything. Return a bounded, truthful evidence report."
+        )
+        self.assertEqual(manifest["tasks"][0]["prompt"], expected)
+
+    def test_citation_manifest_carries_no_submission_id(self) -> None:
+        sid = self.admitted("alias-cited")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        citation = "synthetic-" + "a" * 40
+        manifest = intake_handoff._manifest(plan, self.grant(repo),
+                                            citation=citation)
+        prompt = manifest["tasks"][0]["prompt"]
+        self.assertNotIn(sid, prompt)
+        self.assertIn(citation, prompt)
+        # The default (legacy) citation check is unchanged and refuses it; only
+        # the opt-in citation proves the alias manifest.
+        self.assertFalse(intake_handoff._manifest_cites(manifest, sid))
+        self.assertTrue(intake_handoff._manifest_cites(manifest, sid,
+                                                       citation=citation))
+        self.assertFalse(intake_handoff._manifest_cites(
+            manifest, sid, citation="synthetic-" + "b" * 40))
+
+    def test_citation_must_be_a_bounded_alias(self) -> None:
+        sid = self.admitted("alias-invalid")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        for bad in (sid, "synthetic-", "synthetic-" + "a" * 39,
+                    "synthetic-" + "A" * 40, "other-" + "a" * 40):
+            with self.subTest(bad=bad), self.assertRaises(intake_handoff.HandoffInvalid):
+                intake_handoff._manifest(plan, self.grant(repo), citation=bad)
+
+    def test_embedded_prompt_is_carried_verbatim_into_the_alias_team(self) -> None:
+        sid = self.admitted("alias-prompt")
+        repo = os.path.realpath(self.read_scope())
+        citation = "synthetic-" + "c" * 40
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        task_id = plan["binding"]["task_id"]
+        prompt = (
+            "CAO advisory READ review (bounded).\n"
+            f"Submission: {citation}\n"
+            f"Task: {task_id}\n"
+            f'<cao-plan-result submission="{citation}" task="{task_id}">\n'
+            "  {...cao.decision.plan.v1...}\n"
+            "</cao-plan-result>\n"
+        )
+        first = intake_handoff.handoff_plan(
+            sid, repo=repo, source_ref="main", env=self.env,
+            operator_authority=self.authority(sid, plan, repo),
+            citation=citation, prompt=prompt)
+        self.assertEqual(first["status"], "ADMITTED")
+        self.assertTrue(first["persisted"])
+        team_id = first["plan"]["binding"]["team_id"]
+        manifest = team._read(team_id, self.env)["spec"]
+        self.assertEqual(manifest["tasks"][0]["prompt"], prompt)
+        self.assertNotIn(sid, manifest["tasks"][0]["prompt"])
+        self.assertIn(citation, manifest["tasks"][0]["prompt"])
+        self.assertIn("<cao-plan-result", manifest["tasks"][0]["prompt"])
+        # A restart re-derives the same binding and never re-prompts.
+        again = intake_handoff.handoff_plan(
+            sid, repo=repo, source_ref="main", env=self.env,
+            operator_authority=self.authority(sid, plan, repo),
+            citation=citation, prompt=prompt)
+        self.assertEqual(again["status"], "ALREADY_STARTED")
+        self.assertEqual(len(team.list_teams(env=self.env)), 1)
+
+    def test_caller_supplied_grant_mapping_is_refused_and_creates_no_team(self) -> None:
+        # The retired ``dispatch_read_plan`` bypass accepted an arbitrary grant
+        # mapping. No dispatching entry point may treat that caller dictionary as
+        # authority any more: a plain mapping is not an authenticated adapter.
+        sid = self.admitted("alias-forged")
+        repo = os.path.realpath(self.read_scope())
+        citation = "synthetic-" + "d" * 40
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        result = intake_handoff.handoff_plan(
+            sid, repo=repo, source_ref="main", env=self.env,
+            operator_authority=self.grant(repo), citation=citation)
+        self.assertNotIn(result["status"], ("ADMITTED", "AUTHORIZED",
+                                            "DISPATCH_PENDING"))
+        self.assertEqual(result["status"], "REFUSED")
+        self.assertFalse(team.list_teams(env=self.env))
+
+    def test_embedded_prompt_requires_a_bound_citation_and_no_admission_id(self) -> None:
+        sid = self.admitted("alias-badprompt")
+        repo = os.path.realpath(self.read_scope())
+        citation = "synthetic-" + "e" * 40
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        task_id = plan["binding"]["task_id"]
+        good = (
+            f"Submission: {citation}\nTask: {task_id}\n"
+            f'<cao-plan-result submission="{citation}" task="{task_id}">'
+        )
+        for bad in (
+            good.replace(citation, "synthetic-" + "f" * 40),  # uncited
+            good.replace(task_id, "read-" + "0" * 12),        # wrong task
+            good + "\nleak " + sid,                           # admission id
+            "",                                               # empty
+        ):
+            with self.subTest(bad=bad[:24]), self.assertRaises(
+                    intake_handoff.HandoffInvalid):
+                intake_handoff._manifest(plan, self.grant(repo),
+                                         citation=citation, prompt=bad)
+        with self.assertRaises(intake_handoff.HandoffInvalid):
+            intake_handoff.handoff_plan(
+                sid, repo=repo, env=self.env, prompt=good)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -835,7 +835,8 @@ def _native_result(ctx: Mapping[str, Any], env: Any) -> dict:
             "the derived team id resolves to no authoritative CAO team "
             "checkpoint, so no native result exists",
         )
-    hold = intake_queue._bound_read_team_hold(record, binding, sid)
+    hold = intake_queue._bound_read_team_hold(record, binding, sid,
+                                              citation=ctx["alias"])
     if hold is not None:
         raise _Hold(str(hold["code"]), str(hold["reason"]),
                     detail={"gate": "team_manifest"})

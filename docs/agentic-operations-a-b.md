@@ -337,6 +337,68 @@ egress surface of its own.
   refusal counts, no-effect counts (teams/tasks/claims created by a plan = 0),
   and the bounded cost per accepted outcome recorded for the pilot (§8).
 
+### 5.8 Batch B2d — the native model-backed READ execution binding (landed)
+
+`src/cao/decision_execution.py` is the narrow adapter between the landed B2a
+decision stage, the B2b/B2c native binding and the existing CAO execution path.
+It adds **no** executor: it verifies the native READ intent and the protected B8
+standing grant through `cao.decision_intake`, re-reads the **same** protected
+standing authority through its in-process adapter, asks the B2b stage for the
+bounded pseudonymous alias prompt, and hands exactly one READ manifest -- carrying
+that exact tagged decision-plan prompt -- to the existing CAO team owner API
+through the **same** governed B6 `cao.intake_handoff.handoff_plan` path the B6/B7
+route uses. The dispatch is serialized under the **existing** B7 queue dispatch
+kernel lock, and the existing daemon reconciles the team. The post-prompt terminal
+receipt, the released READ Work Registry claim and the tagged result are then
+validated by the existing B2b/B2c `decision_intake.validate_result`.
+
+- **Default off.** `start_read_team` and `validate_read_result` take
+  `enabled = False` and return `HELD` before any evidence is read.
+- **Trust comes only from the protected grant.** An absent, malformed, revoked,
+  expired, out-of-scope or wrong-source/wrong-model B8 grant, or a
+  non-zero-retention or out-of-vocabulary route, holds; trust is never inferred
+  from provider configuration, a caller dictionary, a flag, a citation, manifest
+  text or a model assertion. Authority is the protected in-process adapter's
+  plan-digest-bound verdict only, re-read at dispatch after the B2b evidence.
+- **One shared quota, no new ledger.** A READ dispatch consumes the same durable
+  B8 quota the B6/B7 route consumes. An alias-citing team carries no raw
+  admission id in its prompt, so it is attributed to its submission from the
+  governor's own durable handoff-plan binding; an id-citing team is attributed
+  from its prompt. Either way the same `OperatorAuthority.evaluate`/consumption
+  path counts both, and an incomplete, unreadable or corrupt quota evidence holds
+  rather than resetting the budget.
+- **The exact tagged decision plan reaches the worker.** The immutable
+  `cao.team.v1` task prompt is the exact bounded B2a/B2b prompt: the verified
+  source refs (location, digest, head, cutoff, scope, verdict), the route and
+  data class, and the `<cao-plan-result submission="synthetic-..." task="read-...">
+  ... </cao-plan-result>` instruction before the native `CAO_TEAM_RESULT:` receipt
+  instruction. The default (no opt-in) B6/B7 prompt is byte-identical.
+- **No private data in the model-visible prompt.** The manifest cites the
+  one-way `synthetic-` alias of the verified binding in place of the raw
+  admission id; the private title, body, credential and absolute checkout path
+  are never rendered. The alias, the plan id and the binding digest are the only
+  binding tokens the prompt carries.
+- **No weakening of the B6/B7 gates.** The alias citation and the embedded
+  prompt are explicit opt-in arguments; the default `_manifest` / `_manifest_cites`
+  / `_is_read_manifest_for` / `_bound_read_team_hold` behavior is unchanged, and a
+  manifest that cites only the alias is still refused by the default foreign-team /
+  READ-only / source / approval gates.
+- **No duplicate prompt and no bypass.** A restart, an ambiguous audit or a
+  second start is refused (`ALREADY_STARTED`) rather than re-prompted; the retired
+  public dispatch that accepted an arbitrary caller grant mapping is gone, so a
+  caller dictionary is never authority and creates no team. No shadow team, ledger
+  or scheduler is created.
+- **Boundary check:** `tests/test_boundaries.py` registers
+  `decision_execution.py`, which reaches the owner API only through the B6
+  dispatch path, mutates no team directly, writes no Registry row and opens no
+  egress surface.
+- **Runnable check:** `tests/test_decision_execution.py` (plus the citation
+  cases in `tests/test_intake_handoff.py` and the consumption/quota cases in
+  `tests/test_intake_authority.py`) covers the default-off gate, the authorized
+  plan, the real native READ lifecycle to `PROPOSED` with the exact tagged worker
+  prompt, the shared-quota refusal across both routes, the caller-dictionary
+  refusal, the held queue lock, and every listed hold.
+
 ## 6. Success and failure matrix
 
 | Dimension | Success | Failure (hold) |

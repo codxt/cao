@@ -621,12 +621,16 @@ def _hold(code: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {"decision": HOLD, "status": "HELD", "code": code, "reason": reason, **extra}
 
 
-def _is_read_manifest_for(spec: Any, submission_id: str) -> bool:
+def _is_read_manifest_for(spec: Any, submission_id: str,
+                          *, citation: str | None = None) -> bool:
     """Whether ``spec`` is a fully READ manifest that cites the submission.
 
     Mirrors B6's link validation: every task must be READ with no write scope,
     and the immutable manifest itself (initiative, prompts, role instructions)
     must cite the submission id. A caller-supplied field is never consulted.
+    When an independently verified pseudonymous ``citation`` is supplied, a
+    manifest that cites that one-way binding token is equally proven, so the raw
+    admission id never has to appear in the model-visible prompt.
     """
 
     if not isinstance(spec, Mapping):
@@ -648,7 +652,8 @@ def _is_read_manifest_for(spec: Any, submission_id: str) -> bool:
         for role in roles.values():
             if isinstance(role, Mapping):
                 texts.append(str(role.get("instruction") or ""))
-    return any(submission_id in text for text in texts)
+    tokens = [submission_id] if citation is None else [submission_id, citation]
+    return any(token in text for text in texts for token in tokens)
 
 
 def _approval_evidence(record: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -665,7 +670,8 @@ def _approval_evidence(record: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _team_source_hold(
-    spec: Any, binding: Mapping[str, Any], submission_id: str
+    spec: Any, binding: Mapping[str, Any], submission_id: str,
+    *, citation: str | None = None,
 ) -> dict[str, Any] | None:
     """A bound existing team must be the fully READ, source-bound audit of the intent.
 
@@ -677,7 +683,7 @@ def _team_source_hold(
     the exact ref/HEAD is re-verified separately from the binding.
     """
 
-    if not _is_read_manifest_for(spec, submission_id):
+    if not _is_read_manifest_for(spec, submission_id, citation=citation):
         return _hold("not_read_only",
                      "the bound team manifest is not a fully READ audit of "
                      "this submission and is never started by the queue")
@@ -721,11 +727,13 @@ def _team_admission_hold(record: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _bound_read_team_hold(
-    record: Mapping[str, Any], binding: Mapping[str, Any], submission_id: str
+    record: Mapping[str, Any], binding: Mapping[str, Any], submission_id: str,
+    *, citation: str | None = None,
 ) -> dict[str, Any] | None:
     """The fail-closed linkage check for any existing bound team, or ``None``."""
 
-    return (_team_source_hold(record.get("spec"), binding, submission_id)
+    return (_team_source_hold(record.get("spec"), binding, submission_id,
+                              citation=citation)
             or _team_admission_hold(record))
 
 

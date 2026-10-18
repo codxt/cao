@@ -1047,5 +1047,68 @@ class CliTests(QueueCase):
         self.assertEqual(code, 3)
 
 
+class CitationGateTests(QueueCase):
+    """B2d: the opt-in pseudonymous citation proves an alias manifest without
+    weakening the default foreign-team / READ-only / source gates."""
+
+    CITATION = "synthetic-" + "d" * 40
+
+    def plan_binding(self, sid: str) -> dict:
+        return intake_handoff.handoff_plan(
+            sid, repo=str(self.repo), env=self.env, dry_run=True
+        )["plan"]["binding"]
+
+    def alias_manifest(self, sid: str, *, mode: str = "read",
+                       repo: str | None = None) -> dict:
+        plan = intake_handoff.handoff_plan(
+            sid, repo=str(self.repo), env=self.env, dry_run=True)["plan"]
+        grant = {"role": "reader", "model": "opencode/model",
+                 "repo": repo or str(self.repo), "paths": ["a.txt"]}
+        manifest = intake_handoff._manifest(plan, grant, citation=self.CITATION)
+        if mode == "write":
+            task = manifest["tasks"][0]
+            task["mode"] = "write"
+            task["write_scope"] = ["a.txt"]
+            manifest["max_writers"] = 1
+        return manifest
+
+    def test_default_gate_refuses_an_alias_only_manifest(self) -> None:
+        sid = self.admitted("alias-queue-default")
+        spec = self.alias_manifest(sid)
+        self.assertFalse(intake_queue._is_read_manifest_for(spec, sid))
+        self.assertTrue(intake_queue._is_read_manifest_for(
+            spec, sid, citation=self.CITATION))
+        self.assertIn(self.CITATION, spec["tasks"][0]["prompt"])
+        self.assertNotIn(sid, spec["tasks"][0]["prompt"])
+
+    def test_bound_team_hold_accepts_the_citation_only_when_supplied(self) -> None:
+        sid = self.admitted("alias-queue-bound")
+        self.write_config({"team_approval": {"mode": "chat"}})
+        manifest = self.alias_manifest(sid)
+        config = product_config.load_config(product_config.config_path(self.env))
+        team.initialize(manifest, env=self.env, config=config, approved=True)
+        record = team._read(manifest["team_id"], self.env)
+        binding = self.plan_binding(sid)
+        held = intake_queue._bound_read_team_hold(record, binding, sid)
+        self.assertIsNotNone(held)
+        self.assertEqual(held["code"], "not_read_only")
+        # The opt-in citation clears only the citation gate; the admission and
+        # source gates still apply and both pass here.
+        self.assertIsNone(intake_queue._bound_read_team_hold(
+            record, binding, sid, citation=self.CITATION))
+
+    def test_citation_never_weakens_the_read_only_or_source_gates(self) -> None:
+        sid = self.admitted("alias-queue-write")
+        write = self.alias_manifest(sid, mode="write")
+        self.assertFalse(intake_queue._is_read_manifest_for(
+            write, sid, citation=self.CITATION))
+        cross = self.alias_manifest(sid, repo=str(self.root / "elsewhere"))
+        binding = self.plan_binding(sid)
+        held = intake_queue._team_source_hold(
+            cross, binding, sid, citation=self.CITATION)
+        self.assertIsNotNone(held)
+        self.assertEqual(held["code"], "source_mismatch")
+
+
 if __name__ == "__main__":
     unittest.main()
