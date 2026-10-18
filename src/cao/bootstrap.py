@@ -500,18 +500,24 @@ def _runtime_attested(executable: str, *, runner: Runner) -> bool:
             and fields.get("private_protocol_compatible") == "yes")
 
 
+def _identified_runtime_version(reported: str | None, asset: Asset) -> str | None:
+    """Accept only the runtime's own first-line version, never diagnostics."""
+
+    if not reported or len(reported) > 512:
+        return None
+    first = reported.splitlines()[0].strip().split()
+    if (len(first) < 2 or first[0] != asset.name
+            or _VERSION_TOKEN.fullmatch(first[1]) is None):
+        return None
+    return first[1].removeprefix("v")
+
+
 def _different_version_attested(
     reported: str | None, asset: Asset, executable: str, runner: Runner
 ) -> bool:
     """Independently verify a non-pinned installed executable's identity."""
 
-    if not reported or len(reported) > 512:
-        return False
-    # The first line must identify the runtime and give its actual version,
-    # rather than containing an incidental dotted number in diagnostic text.
-    first = reported.splitlines()[0].strip().split()
-    if (len(first) < 2 or first[0] != asset.name
-            or _VERSION_TOKEN.fullmatch(first[1]) is None):
+    if _identified_runtime_version(reported, asset) is None:
         return False
     return _runtime_attested(executable, runner=runner)
 
@@ -693,7 +699,7 @@ def ensure(
     if managed_present:
         managed_reported = _probe(managed_path, asset, resolved_runner)
         reported = managed_reported
-        pinned = reported is not None and version_matches(reported, asset.version)
+        pinned = _identified_runtime_version(reported, asset) == asset.version
         attested = (
             policy != "managed" and not pinned
             and _different_version_attested(
@@ -724,8 +730,8 @@ def ensure(
     external_reported: str | None = None
     if external and os.path.abspath(external) != managed_path:
         external_reported = _probe(external, asset, resolved_runner)
-        pinned_match = external_reported is not None and version_matches(
-            external_reported, asset.version
+        pinned_match = (
+            _identified_runtime_version(external_reported, asset) == asset.version
         )
         # Short-circuit: a pinned exact match never probes the live server
         # (doctor gates that separately); only a different version must attest.
