@@ -1287,11 +1287,17 @@ def _manifest(
     binding = plan["binding"]
     submission_id = binding["submission_id"]
     citation = _citation(citation, submission_id)
-    reference = citation or submission_id
     if prompt is None:
+        # No citation keeps the exact pre-B2d default (byte-identical for the
+        # B6/B7 route); a verified pseudonymous citation only swaps the
+        # reference phrase, never the rest of the literal.
+        reference = (
+            f"advisory reference {citation}" if citation is not None
+            else f"submission {submission_id}"
+        )
         prompt = (
-            f"Governed CAO Intake READ audit for advisory reference {reference} bound "
-            f"to handoff plan {plan['plan_id']} (digest {_binding_digest(plan)}). Inspect "
+            f"Governed CAO Intake READ audit for {reference} bound to "
+            f"handoff plan {plan['plan_id']} (digest {_binding_digest(plan)}). Inspect "
             "the scoped source and report evidence only. Do not merge, deploy, "
             "publish, release, change credentials or permissions, or delete "
             "anything. Return a bounded, truthful evidence report."

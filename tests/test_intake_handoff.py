@@ -1045,8 +1045,8 @@ class AliasCitationTests(HandoffCase):
             sid, repo=repo, env=self.env, dry_run=True)["plan"]
         manifest = intake_handoff._manifest(plan, self.grant(repo))
         expected = (
-            f"Governed CAO Intake READ audit for advisory reference {sid} bound "
-            f"to handoff plan {plan['plan_id']} "
+            f"Governed CAO Intake READ audit for submission {sid} bound to "
+            f"handoff plan {plan['plan_id']} "
             f"(digest {intake_handoff._binding_digest(plan)}). Inspect "
             "the scoped source and report evidence only. Do not merge, deploy, "
             "publish, release, change credentials or permissions, or delete "
