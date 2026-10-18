@@ -55,6 +55,35 @@ def _ready_runner(server_result=bootstrap.CommandResult(0, SERVER_OK)):
     return runner
 
 
+def _attested_runner(
+    *,
+    runtime_name: str = "rt",
+    runtime_version: str = "0.9.5",
+    version_ok: bool = True,
+    server: str = SERVER_OK,
+):
+    """A runner for a managed runtime whose release differs from the pin.
+
+    The managed binary names itself in its version probe and answers the live
+    server handshake; the provider and credential probes also satisfy doctor.
+    """
+
+    def runner(argv):
+        if argv[0] == "opencode" and tuple(argv[1:]) == ("--version",):
+            return bootstrap.CommandResult(0, "opencode 9\n")
+        if argv[0] == "opencode" and tuple(argv[1:]) == ("auth", "list"):
+            return bootstrap.CommandResult(0, "acct other\n")
+        if tuple(argv[1:]) == ("status", "server"):
+            return bootstrap.CommandResult(0, server)
+        if argv[0].endswith("/rt"):
+            if not version_ok:
+                return bootstrap.CommandResult(1, "", "boom")
+            return bootstrap.CommandResult(0, f"{runtime_name} {runtime_version}\n")
+        return bootstrap.CommandResult(0, "")
+
+    return runner
+
+
 def _sha(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -610,6 +639,127 @@ class ServerReadinessTests(BootstrapCase):
         self.assertEqual(code, bootstrap.EXIT_OK)
         self.assertEqual(payload["sections"]["daemon"]["status"], "UNKNOWN")
         self.assertFalse(payload["readiness"]["unattended"])
+
+
+class ManagedRuntimeCompatibilityTests(BootstrapCase):
+    """Installed/adopted compatibility is separate from install asset identity.
+
+    A newer, attested installed runtime is READY without a pin upgrade, while a
+    foreign identity, a failed version probe, or a refused/absent live protocol
+    stays NOT_READY. Doctor reports the real runtime version and the pinned
+    asset version separately, and never downloads for a verify.
+    """
+
+    def _config(self, *, version: str = "0.9.3") -> None:
+        self.write_config(
+            {
+                "schema": product_config.SCHEMA,
+                "runtime_id": "rt",
+                "provider": {"cli": "opencode", "id": "acct", "model": "m1"},
+                "managed": _spec(b"payload", version=version),
+            }
+        )
+
+    def _doctor(self, runner):
+        return bootstrap.doctor(
+            env=self.env, which=lambda name: f"/fake/{name}", runner=runner
+        )
+
+    def test_newer_attested_runtime_is_ready_and_reports_both_versions(self) -> None:
+        self._config(version="0.9.3")
+        managed = product_state.managed_bin_dir(self.env)
+        payload, code = self._doctor(
+            _attested_runner(runtime_version="0.9.5")
+        )
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["status"], "READY")
+        runtime = payload["sections"]["runtime"]
+        self.assertEqual(runtime["status"], "ADOPTED")
+        self.assertEqual(runtime["version"], "0.9.5")
+        self.assertEqual(runtime["pinned_version"], "0.9.3")
+        # Verify never downloads and creates no managed binary.
+        self.assertFalse(os.path.isdir(managed) and os.listdir(managed))
+
+    def test_unknown_future_version_is_ready_on_attestation(self) -> None:
+        self._config(version="0.9.3")
+        payload, code = self._doctor(_attested_runner(runtime_version="9.9.9"))
+        self.assertEqual(code, bootstrap.EXIT_OK)
+        self.assertEqual(payload["status"], "READY")
+        self.assertEqual(payload["sections"]["runtime"]["version"], "9.9.9")
+
+    def test_foreign_identity_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(_attested_runner(runtime_name="evilcli"))
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "NOT_READY")
+        runtime = payload["sections"]["runtime"]
+        self.assertEqual(runtime["status"], "INCOMPATIBLE")
+        self.assertFalse(payload["gates"]["managed_runtime"])
+
+    def test_failed_version_probe_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(_attested_runner(version_ok=False))
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+        self.assertFalse(payload["gates"]["managed_runtime"])
+
+    def test_server_protocol_refusal_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(
+            _attested_runner(
+                server="status: not running\nendpoint_compatible: yes\n"
+            )
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "NOT_READY")
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+
+    def test_arbitrary_server_output_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(_attested_runner(server="all good\n"))
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "NOT_READY")
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+
+    def test_missing_release_version_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(
+            _attested_runner(runtime_version="")
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["status"], "NOT_READY")
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+        self.assertIsNone(payload["sections"]["runtime"]["version"])
+        self.assertEqual(payload["sections"]["runtime"]["pinned_version"], "0.9.3")
+
+    def test_missing_private_protocol_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(
+            _attested_runner(
+                server="status: running\nendpoint_compatible: yes\n"
+            )
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+        self.assertEqual(payload["sections"]["runtime_server"]["status"], "UNAVAILABLE")
+
+    def test_unqualified_json_envelope_is_not_ready(self) -> None:
+        self._config()
+        payload, code = self._doctor(
+            _attested_runner(server='{"result":{"type":"anything"}}')
+        )
+        self.assertEqual(code, bootstrap.EXIT_UNAVAILABLE)
+        self.assertEqual(payload["sections"]["runtime"]["status"], "INCOMPATIBLE")
+
+    def test_verbose_probe_output_is_not_surfaced_verbatim(self) -> None:
+        self._config()
+        payload, _code = self._doctor(
+            _attested_runner(runtime_version="0.9.5 all-fine")
+        )
+        runtime = payload["sections"]["runtime"]
+        self.assertEqual(runtime["version"], "0.9.5")
+        blob = json.dumps(runtime)
+        self.assertNotIn("all-fine", blob)
 
 
 class SetupScriptTests(BootstrapCase):

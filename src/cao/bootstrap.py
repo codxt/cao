@@ -375,13 +375,21 @@ def build_asset(spec: Mapping[str, Any], key: str) -> Asset:
 
 @dataclass(frozen=True)
 class Outcome:
-    """The result of one :func:`ensure` call."""
+    """The result of one :func:`ensure` call.
+
+    ``version`` is the identity the outcome satisfies: the pinned asset version
+    for a managed copy or a pinned adoption. ``observed_version`` is the actual
+    version the probed binary reported, which may differ when a newer, attested
+    installed binary was adopted. Keeping them separate stops an adopted
+    runtime's release from being confused with the install asset's identity.
+    """
 
     state: str
     path: str | None = None
     version: str | None = None
     sha256: str | None = None
     detail: str | None = None
+    observed_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.state not in _OUTCOMES:
@@ -396,6 +404,7 @@ class Outcome:
             "state": self.state,
             "path": self.path,
             "version": self.version,
+            "observed_version": self.observed_version,
             "sha256": self.sha256,
             "detail": self.detail,
         }
@@ -410,8 +419,101 @@ def version_matches(reported: str, expected: str) -> bool:
 
     if not isinstance(reported, str) or not expected:
         return False
-    pattern = r"(?<![0-9A-Za-z_.])" + re.escape(expected) + r"(?![0-9A-Za-z_.])"
+    # A prerelease/build suffix is part of the version, never an exact pin.
+    pattern = r"(?<![0-9A-Za-z_.+-])" + re.escape(expected) + r"(?![0-9A-Za-z_.+-])"
     return re.search(pattern, reported) is not None
+
+
+#: A bounded, dotted release token; never publish untrusted probe text.
+_VERSION_TOKEN = re.compile(
+    r"(?<![0-9A-Za-z_.])v?([0-9]+(?:\.[0-9]+){1,4})"
+    r"(?:[-+][0-9A-Za-z.-]{1,32})?(?![0-9A-Za-z_.])"
+)
+
+
+def reported_version(probe_stdout: str) -> str | None:
+    """Return only a bounded actual release token, never arbitrary CLI output."""
+
+    if not isinstance(probe_stdout, str) or len(probe_stdout) > 512:
+        return None
+    match = _VERSION_TOKEN.search(probe_stdout)
+    return match.group(0).removeprefix("v") if match else None
+
+
+def _runtime_attested(executable: str, *, runner: Runner) -> bool:
+    """A different installed release must affirm every required live protocol.
+
+    The existing server-readiness parser remains unchanged for pinned releases.
+    An unpinned version receives the stronger proof: a typed server-status
+    envelope (or the runtime's actual plain-text status block), with *explicit*
+    running, endpoint-compatible and private-protocol-compatible answers.
+    Omitted, duplicate or ambiguous required fields fail closed.
+    """
+
+    try:
+        result = runner((executable, *SERVER_PROBE_ARGV))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str) or not 0 < len(stdout) <= 8192:
+        return False
+    text = stdout.strip()
+    if text.startswith("{"):
+        def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            fields: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in fields:
+                    raise ValueError("duplicate runtime status field")
+                fields[key] = value
+            return fields
+
+        try:
+            document = json.loads(text, object_pairs_hook=unique_pairs)
+        except ValueError:
+            return False
+        if not isinstance(document, Mapping) or "error" in document:
+            return False
+        body = document.get("result")
+        if not isinstance(body, Mapping) or body.get("type") != "server_status":
+            return False
+        def explicit_yes(value: Any) -> bool:
+            return value is True or (type(value) is str and value == "yes")
+
+        return (body.get("status") == "running"
+                and explicit_yes(body.get("endpoint_compatible"))
+                and explicit_yes(body.get("private_protocol_compatible")))
+
+    fields: dict[str, str] = {}
+    required = {"status", "endpoint_compatible", "private_protocol_compatible"}
+    for line in text.splitlines():
+        match = _SERVER_STATUS_LINE.match(line.strip())
+        if match is None:
+            continue
+        key = match.group(1)
+        if key in required and key in fields:
+            return False
+        fields[key] = match.group(2).strip()
+    return (fields.get("status") == "running"
+            and fields.get("endpoint_compatible") == "yes"
+            and fields.get("private_protocol_compatible") == "yes")
+
+
+def _different_version_attested(
+    reported: str | None, asset: Asset, executable: str, runner: Runner
+) -> bool:
+    """Independently verify a non-pinned installed executable's identity."""
+
+    if not reported or len(reported) > 512:
+        return False
+    # The first line must identify the runtime and give its actual version,
+    # rather than containing an incidental dotted number in diagnostic text.
+    first = reported.splitlines()[0].strip().split()
+    if (len(first) < 2 or first[0] != asset.name
+            or _VERSION_TOKEN.fullmatch(first[1]) is None):
+        return False
+    return _runtime_attested(executable, runner=runner)
 
 
 def probe_version(
@@ -583,23 +685,53 @@ def ensure(
     install_dir = os.path.abspath(install_dir)
     managed_path = os.path.join(install_dir, asset.name)
 
-    # 1. A managed copy CAO installed earlier.
-    if os.path.isfile(managed_path):
-        reported = _probe(managed_path, asset, resolved_runner)
-        if reported is not None and version_matches(reported, asset.version):
+    # 1. A managed copy CAO installed earlier. Explicit managed reinstallation
+    # still uses the pinned release and SHA; non-installing policy may adopt a
+    # different version only after verifying the same live compatibility gates.
+    managed_present = os.path.isfile(managed_path)
+    managed_reported: str | None = None
+    if managed_present:
+        managed_reported = _probe(managed_path, asset, resolved_runner)
+        reported = managed_reported
+        pinned = reported is not None and version_matches(reported, asset.version)
+        attested = (
+            policy != "managed" and not pinned
+            and _different_version_attested(
+                reported, asset, managed_path, resolved_runner)
+        )
+        if pinned or attested:
             return Outcome(
                 "ALREADY_INSTALLED",
                 managed_path,
                 asset.version,
                 None,
-                "managed copy is already present at the pinned version",
+                ("managed copy is already present at the pinned version"
+                 if pinned else "existing managed runtime independently attests "
+                 "compatible live protocol"),
+                observed_version=reported_version(reported or ""),
             )
 
     # 2. An existing binary elsewhere on PATH.
+    #
+    # Installed/adopted compatibility is separate from install asset identity.
+    # A pinned exact match is compatible as before. A newer (or otherwise
+    # different) installed version is compatible ONLY on a positive, read-only
+    # attestation: it must name the runtime in its version probe AND answer the
+    # live runtime status handshake. Version alone proves nothing, and no
+    # version is accepted merely for exiting zero. The pinned version and its
+    # digest remain authoritative for the managed download path below.
     external = path_lookup(asset.name)
+    external_reported: str | None = None
     if external and os.path.abspath(external) != managed_path:
-        reported = _probe(external, asset, resolved_runner)
-        compatible = reported is not None and version_matches(reported, asset.version)
+        external_reported = _probe(external, asset, resolved_runner)
+        pinned_match = external_reported is not None and version_matches(
+            external_reported, asset.version
+        )
+        # Short-circuit: a pinned exact match never probes the live server
+        # (doctor gates that separately); only a different version must attest.
+        compatible = pinned_match or _different_version_attested(
+            external_reported, asset, external, resolved_runner
+        )
         if compatible and policy in {"auto", "adopt", "verify"}:
             return Outcome(
                 "ADOPTED",
@@ -607,25 +739,30 @@ def ensure(
                 asset.version,
                 None,
                 "adopted the existing compatible binary in place",
+                observed_version=reported_version(external_reported),
             )
         if policy == "adopt":
             return Outcome(
                 "INCOMPATIBLE",
                 external,
-                reported,
+                asset.version,
                 None,
-                "existing binary is not the pinned version; refusing to replace "
-                "or stop it",
+                "existing binary is neither the pinned version nor a live "
+                "attested compatible runtime; refusing to replace or stop it",
+                observed_version=reported_version(external_reported),
             )
 
     # 3. Verify-only policy never fetches.
     if policy == "verify":
         return Outcome(
-            "MISSING" if external is None else "INCOMPATIBLE",
-            external,
+            "MISSING" if external is None and not managed_present
+            else "INCOMPATIBLE",
+            external or (managed_path if managed_present else None),
             None,
             None,
             "no compatible managed dependency is installed and policy is verify",
+            observed_version=reported_version(
+                external_reported or managed_reported or ""),
         )
 
     # 4. Fetch, verify, and atomically install a private managed copy.
@@ -932,7 +1069,12 @@ def _runtime_section(
         "status": outcome.state,
         "reason": outcome.detail,
         "name": asset.name,
-        "version": asset.version,
+        # What doctor actually sees: the runtime the binary reported, which may
+        # be newer than the pinned install asset when it attested compatibility.
+        "version": outcome.observed_version,
+        # The pinned download asset's identity, reported separately so the two
+        # are never confused.
+        "pinned_version": asset.version,
         "path": outcome.path,
     }
 
