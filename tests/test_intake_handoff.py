@@ -1006,5 +1006,95 @@ class DecisionProjectionTests(HandoffCase):
         self.assertFalse(Path(intake_handoff.plan_dir(self.env)).exists())
 
 
+class AliasCitationTests(HandoffCase):
+    """B2d: the opt-in pseudonymous citation keeps the admission id out of the
+    model-visible manifest while the exact binding stays provable, and the
+    default manifest is unchanged."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from cao import product_config
+
+        product_config.write_config(
+            {"schema": product_config.SCHEMA,
+             "provider": {"cli": "opencode", "model": "example/model"}},
+            product_config.config_path(self.env),
+        )
+
+    def grant(self, repo: str) -> dict:
+        return {"operator": "operator-one", "owner": "owner-one", "role": "reader",
+                "model": "opencode-go/deepseek-v4-flash#high", "repo": repo,
+                "paths": ["src"]}
+
+    def test_default_manifest_still_cites_the_submission_id(self) -> None:
+        sid = self.admitted("alias-default")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        manifest = intake_handoff._manifest(plan, self.grant(repo))
+        prompt = manifest["tasks"][0]["prompt"]
+        self.assertIn(sid, prompt)
+        self.assertNotIn("synthetic-", prompt)
+        self.assertTrue(intake_handoff._manifest_cites(manifest, sid))
+
+    def test_citation_manifest_carries_no_submission_id(self) -> None:
+        sid = self.admitted("alias-cited")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        citation = "synthetic-" + "a" * 40
+        manifest = intake_handoff._manifest(plan, self.grant(repo),
+                                            citation=citation)
+        prompt = manifest["tasks"][0]["prompt"]
+        self.assertNotIn(sid, prompt)
+        self.assertIn(citation, prompt)
+        # The default (legacy) citation check is unchanged and refuses it; only
+        # the opt-in citation proves the alias manifest.
+        self.assertFalse(intake_handoff._manifest_cites(manifest, sid))
+        self.assertTrue(intake_handoff._manifest_cites(manifest, sid,
+                                                       citation=citation))
+        self.assertFalse(intake_handoff._manifest_cites(
+            manifest, sid, citation="synthetic-" + "b" * 40))
+
+    def test_citation_must_be_a_bounded_alias(self) -> None:
+        sid = self.admitted("alias-invalid")
+        repo = self.read_scope()
+        plan = intake_handoff.handoff_plan(
+            sid, repo=repo, env=self.env, dry_run=True)["plan"]
+        for bad in (sid, "synthetic-", "synthetic-" + "a" * 39,
+                    "synthetic-" + "A" * 40, "other-" + "a" * 40):
+            with self.subTest(bad=bad), self.assertRaises(intake_handoff.HandoffInvalid):
+                intake_handoff._manifest(plan, self.grant(repo), citation=bad)
+
+    def test_dispatch_read_plan_creates_one_alias_team_and_is_idempotent(self) -> None:
+        sid = self.admitted("alias-dispatch")
+        repo = os.path.realpath(self.read_scope())
+        citation = "synthetic-" + "c" * 40
+        first = intake_handoff.dispatch_read_plan(
+            sid, grant=self.grant(repo), citation=citation, env=self.env,
+            repo=repo, source_ref="main")
+        self.assertEqual(first["status"], "ADMITTED")
+        self.assertTrue(first["persisted"])
+        team_id = first["plan"]["binding"]["team_id"]
+        manifest = team._read(team_id, self.env)["spec"]
+        self.assertNotIn(sid, manifest["tasks"][0]["prompt"])
+        self.assertIn(citation, manifest["tasks"][0]["prompt"])
+        second = intake_handoff.dispatch_read_plan(
+            sid, grant=self.grant(repo), citation=citation, env=self.env,
+            repo=repo, source_ref="main")
+        self.assertEqual(second["status"], "ALREADY_STARTED")
+        self.assertEqual(len(team.list_teams(env=self.env)), 1)
+
+    def test_dispatch_read_plan_without_a_citation_is_refused(self) -> None:
+        sid = self.admitted("alias-nocite")
+        repo = os.path.realpath(self.read_scope())
+        for bad in (None, "", sid):
+            with self.subTest(bad=bad), self.assertRaises(intake_handoff.HandoffInvalid):
+                intake_handoff.dispatch_read_plan(
+                    sid, grant=self.grant(repo), citation=bad, env=self.env,
+                    repo=repo, source_ref="main")
+        self.assertEqual(team.list_teams(env=self.env), [])
+
+
 if __name__ == "__main__":
     unittest.main()

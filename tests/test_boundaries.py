@@ -121,6 +121,18 @@ SEPARATION_RULES = {
         "contracts",
         "cao.contracts",
     ),
+    # B2d is the narrow model-backed READ execution adapter. It reaches the
+    # existing CAO team owner API only through the B6 alias-citing dispatch path
+    # and never the runtime contract, policy or the generic execution entry
+    # points, so it can never become a second executor.
+    "decision_execution.py": (
+        "runtime",
+        "cao.runtime",
+        "policy",
+        "cao.policy",
+        "contracts",
+        "cao.contracts",
+    ),
     # B8 standing authority reads the protected operator grant and the existing
     # work artifacts read-only; it must not reach the runtime contract, policy or
     # the generic execution entry points, and it never writes a ledger.
@@ -856,6 +868,67 @@ class IntakeQueueBoundaryTests(unittest.TestCase):
             "team.tick_all(",
         ):
             self.assertNotIn(forbidden, source)
+
+
+class DecisionExecutionBoundaryTests(unittest.TestCase):
+    """B2d adapter: opt-in, no second executor, no Registry write, no egress.
+
+    The adapter verifies the protected B8 grant and the invariant binding, then
+    hands exactly one alias-citing READ manifest to the *existing* CAO team owner
+    API through the B6 ``dispatch_read_plan`` path. It must never mutate a team
+    directly, tick/schedule, write a Registry row or open an egress surface.
+    """
+
+    def _tree(self) -> ast.AST:
+        return ast.parse((CAO_ROOT / "decision_execution.py").read_text("utf-8"))
+
+    def test_no_direct_team_mutation(self) -> None:
+        offenders: list[str] = []
+        for node in ast.walk(self._tree()):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "team"
+            ):
+                offenders.append(node.func.attr)
+        self.assertEqual(offenders, [])
+
+    def test_owner_api_is_reached_only_through_the_b6_dispatch(self) -> None:
+        source = (CAO_ROOT / "decision_execution.py").read_text("utf-8")
+        self.assertIn("intake_handoff.dispatch_read_plan(", source)
+        for forbidden in (
+            "team.initialize(", "team.set_desired(", "team.tick(",
+            "team.tick_all(", "registry.connect(", "registry.propose",
+            "registry.claim(", "registry.release", "registry.handoff",
+            "registry.write_gate", "registry.record_", "product_task.run",
+            "state.write", "open_private_dir(", "write_private_record(",
+            "handoff_plan(", "intake_queue.enqueue(", "intake_queue.tick(",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_no_egress_shell_or_dynamic_import(self) -> None:
+        imported = _imports(CAO_ROOT / "decision_execution.py")
+        offenders = sorted(m for m in imported if m in EGRESS_MODULES)
+        self.assertEqual(offenders, [])
+        offenders = []
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in {
+                "eval", "exec", "__import__", "compile",
+            }:
+                offenders.append(func.id)
+            if (isinstance(func, ast.Attribute)
+                    and func.attr in {"system", "popen"}
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"):
+                offenders.append(f"os.{func.attr}")
+        self.assertEqual(offenders, [])
+        self.assertNotIn("subprocess",
+                         (CAO_ROOT / "decision_execution.py").read_text("utf-8"))
 
 
 class IntakeAuthorityBoundaryTests(unittest.TestCase):

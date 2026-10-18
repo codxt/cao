@@ -337,6 +337,47 @@ egress surface of its own.
   refusal counts, no-effect counts (teams/tasks/claims created by a plan = 0),
   and the bounded cost per accepted outcome recorded for the pilot (§8).
 
+### 5.8 Batch B2d — the native model-backed READ execution binding (landed)
+
+`src/cao/decision_execution.py` is the narrow adapter between the landed B2a
+decision stage, the B2b/B2c native binding and the existing CAO execution path.
+It adds **no** executor: it verifies the native READ intent and the protected B8
+standing grant through `cao.decision_intake`, asks the B2b stage for the bounded
+pseudonymous alias prompt, hands exactly one READ manifest to the existing CAO
+team owner API through the B6 `cao.intake_handoff.dispatch_read_plan` path, and
+the existing daemon reconciles the team. The post-prompt terminal receipt, the
+released READ Work Registry claim and the tagged result are then validated by
+the existing B2b/B2c `decision_intake.validate_result`.
+
+- **Default off.** `start_read_team` and `validate_read_result` take
+  `enabled = False` and return `HELD` before any evidence is read.
+- **Trust comes only from the protected grant.** An absent, malformed, revoked,
+  expired, out-of-scope or wrong-source/wrong-model B8 grant, or a
+  non-zero-retention or out-of-vocabulary route, holds; trust is never inferred
+  from provider configuration, a caller flag, manifest text or a model
+  assertion.
+- **No private data in the model-visible prompt.** The manifest cites the
+  one-way `synthetic-` alias of the verified binding in place of the raw
+  admission id; the private title, body and every credential are never rendered.
+  The alias, the plan id and the binding digest are the only binding tokens the
+  prompt carries.
+- **No weakening of the B6/B7 gates.** The alias citation is an explicit
+  opt-in argument; the default `_manifest` / `_manifest_cites` /
+  `_is_read_manifest_for` / `_bound_read_team_hold` behavior is unchanged, and a
+  manifest that cites only the alias is still refused by the default
+  foreign-team / READ-only / source / approval gates.
+- **No duplicate prompt.** A restart, an ambiguous audit or a second start is
+  refused (`ALREADY_STARTED`) rather than re-prompted; no shadow team, ledger or
+  scheduler is created.
+- **Boundary check:** `tests/test_boundaries.py` registers
+  `decision_execution.py`, which reaches the owner API only through the B6
+  dispatch path, mutates no team directly, writes no Registry row and opens no
+  egress surface.
+- **Runnable check:** `tests/test_decision_execution.py` (plus the citation
+  cases in `tests/test_intake_handoff.py` and `tests/test_intake_queue.py`)
+  covers the default-off gate, the authorized plan, the real native READ
+  lifecycle to `PROPOSED`, and every listed hold.
+
 ## 6. Success and failure matrix
 
 | Dimension | Success | Failure (hold) |

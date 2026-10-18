@@ -69,6 +69,7 @@ __all__ = [
     "derive_eligibility",
     "plan_id_for",
     "handoff_plan",
+    "dispatch_read_plan",
     "handoff_status",
     "decision_projection",
     "recover_plan",
@@ -134,6 +135,12 @@ _STAMP_RE = re.compile(r"[0-9]{1,12}")
 _MODEL_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:@+/#-]{0,150}\Z"
 )
+#: The opt-in pseudonymous citation a model-visible READ manifest may carry in
+#: place of the private admission id: one B2b ``synthetic-`` alias (a one-way
+#: 160-bit digest). It names the exact binding without naming the admission, so
+#: the raw submission id, title, body and every credential stay out of the
+#: model-visible prompt while the binding is still independently provable.
+_ALIAS_RE = re.compile(r"synthetic-[0-9a-f]{40}\Z")
 
 # ---------------------------------------------------------------------------
 # Deterministic consequential-effect classification (mention vs request)
@@ -780,12 +787,16 @@ def _registry_claim_state(
 # ---------------------------------------------------------------------------
 
 
-def _manifest_cites(spec: Mapping[str, Any], submission_id: str) -> bool:
+def _manifest_cites(spec: Mapping[str, Any], submission_id: str,
+                    *, citation: str | None = None) -> bool:
     """Whether the immutable manifest itself cites the submission id.
 
     Only the manifest's own governed fields are scanned (initiative, task
     prompts, role instructions); a caller-supplied field is never consulted, so
-    provenance cannot be self-asserted.
+    provenance cannot be self-asserted. When a verified pseudonymous ``citation``
+    is supplied, a manifest that cites that one-way binding token instead of the
+    raw submission id is equally proven: the token is a digest of the exact
+    admission, source, HEAD and plan and cannot be derived without them.
     """
 
     texts: list[str] = [str(spec.get("initiative") or "")]
@@ -797,11 +808,13 @@ def _manifest_cites(spec: Mapping[str, Any], submission_id: str) -> bool:
         for role in roles.values():
             if isinstance(role, Mapping):
                 texts.append(str(role.get("instruction") or ""))
-    return any(submission_id in text for text in texts)
+    tokens = [submission_id] if citation is None else [submission_id, citation]
+    return any(token in text for text in texts for token in tokens)
 
 
 def _validate_linked_team(
-    team_id: str, submission_id: str, env: Mapping[str, str] | None
+    team_id: str, submission_id: str, env: Mapping[str, str] | None,
+    *, citation: str | None = None,
 ) -> dict[str, Any]:
     """Validate one nominated team as a governed READ audit of a submission.
 
@@ -833,7 +846,7 @@ def _validate_linked_team(
             )
         if task.get("write_scope"):
             raise HandoffRefused("the nominated READ team carries a write scope")
-    if not _manifest_cites(spec, submission_id):
+    if not _manifest_cites(spec, submission_id, citation=citation):
         raise HandoffRefused(
             "the nominated team's immutable manifest does not cite this "
             "submission and is never linked as its audit"
@@ -859,7 +872,8 @@ def _validate_linked_team(
 
 
 def _existing_read_audit(
-    submission_id: str, env: Mapping[str, str] | None
+    submission_id: str, env: Mapping[str, str] | None,
+    *, citation: str | None = None,
 ) -> dict[str, Any]:
     """Find the already-started, validated READ audit(s) for a submission.
 
@@ -880,7 +894,7 @@ def _existing_read_audit(
         if not isinstance(team_id, str) or not _TEAM_ID_RE.fullmatch(team_id):
             continue
         try:
-            link = _validate_linked_team(team_id, submission_id, env)
+            link = _validate_linked_team(team_id, submission_id, env, citation=citation)
         except HandoffError:
             continue
         matches.append(link)
@@ -897,7 +911,8 @@ def _existing_read_audit(
 
 
 def linked_state(
-    submission_id: str, env: Mapping[str, str] | None = None
+    submission_id: str, env: Mapping[str, str] | None = None,
+    *, citation: str | None = None,
 ) -> dict[str, Any]:
     """The read-only linked team/claim state for one submission.
 
@@ -907,7 +922,7 @@ def linked_state(
     """
 
     sid = _record_id(submission_id, "submission id")
-    audit = _existing_read_audit(sid, env)
+    audit = _existing_read_audit(sid, env, citation=citation)
     link = audit.get("link")
     state: dict[str, Any] = {
         "source": "handoff",
@@ -1195,16 +1210,45 @@ def _authority_verdict(
     }
 
 
+def _citation(value: Any, submission_id: str) -> str | None:
+    """Validate the optional pseudonymous citation token, or fail closed.
+
+    ``None`` keeps the legacy manifest (which cites the raw submission id).
+    A supplied citation must be exactly one bounded ``synthetic-`` alias and
+    never the submission id itself, so the model-visible prompt can only ever
+    carry a one-way binding token, never the private admission id.
+    """
+
+    if value is None:
+        return None
+    if (not isinstance(value, str) or not _ALIAS_RE.fullmatch(value)
+            or value == submission_id):
+        raise HandoffInvalid(
+            "citation must be one bounded synthetic pseudonymous alias"
+        )
+    return value
+
+
 def _manifest(
-    plan: Mapping[str, Any], grant: Mapping[str, Any]
+    plan: Mapping[str, Any], grant: Mapping[str, Any],
+    *, citation: str | None = None,
 ) -> dict[str, Any]:
-    """The immutable ``cao.team.v1`` manifest for the granted READ execution."""
+    """The immutable ``cao.team.v1`` manifest for the granted READ execution.
+
+    When a verified ``citation`` is supplied the model-visible prompt cites that
+    pseudonymous alias as its advisory reference instead of the raw admission
+    id; the exact plan id and binding digest (one-way hashes) still bind it. The
+    private submission id, title, body and every credential never reach the
+    prompt.
+    """
 
     binding = plan["binding"]
     submission_id = binding["submission_id"]
+    citation = _citation(citation, submission_id)
+    reference = citation or submission_id
     prompt = (
-        f"Governed CAO Intake READ audit for submission {submission_id} bound to "
-        f"handoff plan {plan['plan_id']} (digest {_binding_digest(plan)}). Inspect "
+        f"Governed CAO Intake READ audit for advisory reference {reference} bound "
+        f"to handoff plan {plan['plan_id']} (digest {_binding_digest(plan)}). Inspect "
         "the scoped source and report evidence only. Do not merge, deploy, "
         "publish, release, change credentials or permissions, or delete "
         "anything. Return a bounded, truthful evidence report."
@@ -1240,16 +1284,19 @@ def _dispatch(
     plan: dict[str, Any],
     grant: Mapping[str, Any],
     env: Mapping[str, str] | None,
+    *, citation: str | None = None,
 ) -> dict[str, Any]:
     """Hand one fully-proven READ manifest to the existing CAO team owner API.
 
-    Only reachable behind the authenticated operator authority. It validates the
+    Reachable only from a fully-proven authority path: the governed
+    ``handoff_plan`` behind the authenticated operator authority, or the Batch
+    B2d adapter behind the protected B8 standing grant. It validates the
     manifest, initializes the team and sets it running; it never ticks, never
     schedules and never writes a Registry row. The existing daemon reconciles
     from there.
     """
 
-    manifest = _manifest(plan, grant)
+    manifest = _manifest(plan, grant, citation=citation)
     selected = team.validate_spec(manifest)
     config = _load_config(env)
     from . import team_approval  # local import keeps the module's top level lean
@@ -1386,6 +1433,49 @@ def _persist(
     )
 
 
+def _plan_record(
+    eligibility: Mapping[str, Any], binding: Mapping[str, Any],
+    ids: Mapping[str, str], *, clock: Any,
+) -> dict[str, Any]:
+    """The deterministic pre-authority handoff plan record.
+
+    Shared by the operator-authority ``handoff_plan`` and the B2d adapter's
+    ``dispatch_read_plan`` so both derive exactly the same immutable identity.
+    """
+
+    return {
+        "schema": PLAN_SCHEMA,
+        "plan_id": plan_id_for(binding),
+        "submission_id": binding["submission_id"],
+        "item_id": eligibility["item_id"],
+        "status": "HOLD",
+        "eligibility": {
+            "verdict": eligibility["verdict"],
+            "fingerprint": eligibility["fingerprint"],
+            "holds": eligibility["holds"],
+            "effects": eligibility["effects"],
+        },
+        "binding": binding,
+        "checkpoint": {
+            "team_id": ids["team_id"],
+            "spec_hash": None,
+            "started": False,
+        },
+        "link": None,
+        "grant": None,
+        "registry_owner": None,
+        "authority": "none",
+        "dispatch": False,
+        "missing": [],
+        "refusals": [],
+        "advisory": True,
+        "deterministic": True,
+        "created_at": utc_now(clock),
+        "plan_digest": "",
+        "uncertainties": [_NOTE_NOT_AUTHORITY, _NOTE_READ_ONLY_PLAN],
+    }
+
+
 def handoff_plan(
     submission_id: str,
     *,
@@ -1421,37 +1511,8 @@ def handoff_plan(
     qualification = _qualification(_load_config(env))
     ids = _derived_ids(sid)
     binding = _binding(eligibility, source, qualification, ids)
-    plan: dict[str, Any] = {
-        "schema": PLAN_SCHEMA,
-        "plan_id": plan_id_for(binding),
-        "submission_id": sid,
-        "item_id": eligibility["item_id"],
-        "status": "HOLD",
-        "eligibility": {
-            "verdict": eligibility["verdict"],
-            "fingerprint": eligibility["fingerprint"],
-            "holds": eligibility["holds"],
-            "effects": eligibility["effects"],
-        },
-        "binding": binding,
-        "checkpoint": {
-            "team_id": ids["team_id"],
-            "spec_hash": None,
-            "started": False,
-        },
-        "link": audit.get("link"),
-        "grant": None,
-        "registry_owner": None,
-        "authority": "none",
-        "dispatch": False,
-        "missing": [],
-        "refusals": [],
-        "advisory": True,
-        "deterministic": True,
-        "created_at": utc_now(clock),
-        "plan_digest": "",
-        "uncertainties": [_NOTE_NOT_AUTHORITY, _NOTE_READ_ONLY_PLAN],
-    }
+    plan: dict[str, Any] = _plan_record(eligibility, binding, ids, clock=clock)
+    plan["link"] = audit.get("link")
 
     if audit["verdict"] == "REFUSED":
         plan["status"] = "REFUSED"
@@ -1535,6 +1596,119 @@ def handoff_plan(
             else:
                 plan["status"] = "DISPATCH_PENDING"
                 plan["dispatch"] = True
+    plan["plan_digest"] = _plan_digest(plan)
+
+    if dry_run or plan["status"] in ("HOLD", "REFUSED", "ALREADY_STARTED"):
+        return {"schema": RESULT_SCHEMA, "status": plan["status"],
+                "persisted": False, "duplicate": False, "plan": plan}
+    result = _persist(plan, env)
+    return {
+        "schema": RESULT_SCHEMA,
+        "status": result["status"],
+        "persisted": True,
+        "duplicate": result["status"] == "DUPLICATE",
+        "plan": result["plan"],
+    }
+
+
+def dispatch_read_plan(
+    submission_id: str,
+    *,
+    grant: Mapping[str, Any],
+    citation: str,
+    env: Mapping[str, str] | None = None,
+    repo: str | None = None,
+    source_ref: str | None = None,
+    dry_run: bool = False,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Derive and hand one alias-citing READ manifest to the existing owner API.
+
+    This is the Batch B2d adapter's dispatch entry, and the *purpose-built
+    sibling* of :func:`handoff_plan` for an already-verified grant: the caller
+    (:mod:`cao.decision_execution`) has already proved the protected B8 standing
+    grant, the invariant admission/source/HEAD binding and the route privacy
+    qualification, so ``grant`` is a verified grant and never a caller-asserted
+    authority. It re-derives the exact same immutable plan through the shared
+    :func:`_plan_record`, refuses when a validated audit already exists (so a
+    restart never re-prompts), and hands one immutable READ manifest to the
+    existing team owner API with its model-visible prompt citing the pseudonymous
+    ``citation``. It ticks, schedules and claims nothing; the existing daemon
+    reconciles the team.
+    """
+
+    sid = _record_id(submission_id, "submission id")
+    if repo is not None:
+        _bounded_str(repo, "repo", 4096, allow_empty=False)
+    if source_ref is not None and not (
+        git.valid_commit_id(source_ref) or git.valid_short_ref(source_ref)
+    ):
+        raise HandoffInvalid("source ref must be a commit id or a valid ref name")
+    token = _citation(citation, sid)
+    if token is None:
+        raise HandoffInvalid(
+            "an alias read dispatch requires one pseudonymous citation"
+        )
+    for field in ("operator", "owner", "role", "model", "repo"):
+        _bounded_str(grant.get(field), f"grant.{field}", 4096, allow_empty=False)
+    if not isinstance(grant.get("paths"), list):
+        raise HandoffInvalid("grant.paths must be a bounded list")
+
+    audit = _existing_read_audit(sid, env, citation=token)
+    eligibility = derive_eligibility(sid, env=env, clock=clock)
+    source = _source_evidence(repo, source_ref)
+    qualification = _qualification(_load_config(env))
+    ids = _derived_ids(sid)
+    binding = _binding(eligibility, source, qualification, ids)
+    plan = _plan_record(eligibility, binding, ids, clock=clock)
+    plan["link"] = audit.get("link")
+
+    if audit["verdict"] == "REFUSED":
+        plan["status"] = "REFUSED"
+        plan["refusals"].append(
+            {"code": "ambiguous_existing_audit", "reason": audit["reason"]})
+        plan["plan_digest"] = _plan_digest(plan)
+        return {"schema": RESULT_SCHEMA, "status": "REFUSED", "persisted": False,
+                "duplicate": False, "plan": plan}
+    if audit["verdict"] == "SUPPORTED" and audit["link"] is not None:
+        plan["status"] = "ALREADY_STARTED"
+        plan["plan_digest"] = _plan_digest(plan)
+        return {"schema": RESULT_SCHEMA, "status": "ALREADY_STARTED",
+                "persisted": False, "duplicate": False, "plan": plan}
+    if eligibility["verdict"] != "ELIGIBLE_READ":
+        plan["status"] = "HOLD"
+        plan["plan_digest"] = _plan_digest(plan)
+        return {"schema": RESULT_SCHEMA, "status": "HOLD", "persisted": False,
+                "duplicate": False, "plan": plan}
+
+    plan["authority"] = "operator"
+    plan["grant"] = {
+        "operator": grant["operator"],
+        "owner": grant["owner"],
+        "role": grant["role"],
+        "model": grant["model"],
+        "repo": grant["repo"],
+        "paths": list(grant["paths"]),
+        "privacy_qualified": True,
+        "bound": _binding_digest(plan),
+    }
+    plan["registry_owner"] = grant["owner"]
+    if dry_run:
+        plan["status"] = "AUTHORIZED"
+    else:
+        try:
+            plan = _dispatch(plan, grant, env, citation=token)
+        except HandoffRefused as exc:
+            plan["status"] = "REFUSED"
+            plan["authority"] = "none"
+            plan["dispatch"] = False
+            plan["grant"] = None
+            plan["registry_owner"] = None
+            plan["refusals"].append(
+                {"code": "dispatch_refused", "reason": str(exc)})
+        else:
+            plan["status"] = "DISPATCH_PENDING"
+            plan["dispatch"] = True
     plan["plan_digest"] = _plan_digest(plan)
 
     if dry_run or plan["status"] in ("HOLD", "REFUSED", "ALREADY_STARTED"):
