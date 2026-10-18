@@ -13,7 +13,9 @@ team, READ manifest, admission, exact task slot at the bound HEAD, task-bound
 terminal receipt, released owned READ claim) with its holds (missing, corrupt,
 unapproved, foreign or incomplete team; missing, non-terminal, duplicated or
 echoed receipt; unknown, missing, active, foreign or stale-HEAD Registry
-claim); the reported receipt-grammar interface gap; injection inertness;
+claim); the closed native receipt bridge (a genuine tagged READ result with the
+exact native two-token receipt now reaches PROPOSED end-to-end, with no missing
+interface reported); injection inertness;
 idempotence; zero side effects; and the read-only, stdlib-only, no-egress
 shape of the module itself.
 
@@ -278,6 +280,36 @@ class DecisionCase(unittest.TestCase):
             plan_id=plan["plan_id"],
         )
 
+    def resolve(self, sid: str, *, grant=DEFAULT_GRANT) -> dict:
+        """The shared verified native binding, under the protected grant seam."""
+
+        with self.protected(grant):
+            return decision_intake._resolve(
+                sid, env=self.env, repo=self.repo_real, source_ref="main",
+                route_qualification=self.qualify(), clock=None,
+            )
+
+    def native_read_plan(self, ref: dict) -> dict:
+        """A bounded READ plan bound to one verified native source reference."""
+
+        return {
+            "schema": da.PLAN_SCHEMA,
+            "source_refs": [{"location": ref["location"], "digest": ref["digest"]}],
+            "plan": "Inspect the scoped source and report findings.",
+            "subtasks": [{"id": "s1", "summary": "inspect the scoped source",
+                          "action_class": "READ"}],
+            "dependencies": [{"id": "s1", "depends_on": []}],
+            "owner": "operator-one-role",
+            "capability": {"kind": "read", "performer": "example-reader"},
+            "privacy_and_model_qualification": {
+                "data_class": DATA_CLASS, "route": ROUTE},
+            "confidence": 0.5,
+            "uncertainty": "the example evidence may be incomplete",
+            "action_class": "READ",
+            "tests": [],
+            "approval_requirements": ["operator_read_gate"],
+        }
+
     def complete_task(
         self,
         sid: str,
@@ -289,6 +321,9 @@ class DecisionCase(unittest.TestCase):
         drop_receipt: bool = False,
         extra_tail: bool = False,
         prompt: str | None = None,
+        plan_body: dict | None = None,
+        tag_task: str | None = None,
+        tag_submission: str | None = None,
     ) -> dict:
         """Set the bound team's single task to a terminal native checkpoint."""
 
@@ -311,11 +346,21 @@ class DecisionCase(unittest.TestCase):
             error=None,
         )
         receipt = team._receipt_for(slot["execution_id"], slot["prompt"])
-        text = (
-            "CAO advisory READ review (bounded).\n"
-            f"Submission: {self.alias_for(sid, head)}\n"
-            "Findings: the scoped source was inspected at the bound revision.\n"
-        )
+        if plan_body is not None:
+            # A genuine-shape tagged bounded result bound to this task's alias.
+            text = (
+                f'{decision_stage.OPEN_TAG} '
+                f'submission="{tag_submission or self.alias_for(sid, head)}" '
+                f'task="{tag_task or task["id"]}">\n'
+                f"{json.dumps(plan_body)}\n"
+                f"{decision_stage.CLOSE_TAG}\n"
+            )
+        else:
+            text = (
+                "CAO advisory READ review (bounded).\n"
+                f"Submission: {self.alias_for(sid, head)}\n"
+                "Findings: the scoped source was inspected at the bound revision.\n"
+            )
         if not drop_receipt:
             text += f"{receipt}\n"
         if extra_tail:
@@ -687,17 +732,18 @@ class ResultTests(DecisionCase):
         self.assertIsNone(result["stage"])
         self.assertFalse(result["dispatch"])
 
-    def test_verified_native_result_holds_only_on_the_receipt_grammar(self) -> None:
+    def test_prose_without_a_tagged_plan_holds_after_the_receipt_bridge(self) -> None:
+        # The exact native two-token receipt is admitted by B2c, so a verified
+        # native result whose output carries no tagged plan now holds on the
+        # plan block alone -- never on a fabricated missing-interface report.
         sid = self.admitted()
         manifest, done = self.finished_team(sid)
         result = self.validate(sid)
         self.assertEqual(result["status"], "HELD")
-        self.assertEqual(result["code"], "receipt_unverifiable")
-        self.assertIsNotNone(result["missing_interface"])
-        self.assertIn("decision_stage.validate_result", result["missing_interface"])
-        self.assertIn("no receipt is invented", result["missing_interface"])
+        self.assertEqual(result["code"], "plan_block_missing")
+        self.assertIsNone(result["missing_interface"])
         self.assertEqual(result["stage"]["status"], "HELD")
-        self.assertEqual(result["stage"]["code"], "receipt_unverifiable")
+        self.assertEqual(result["stage"]["code"], "plan_block_missing")
         self.assertEqual(result["detail"]["slot_status"], "complete")
         self.assertIs(result["detail"]["receipt_verified"], True)
         self.assertEqual(result["detail"]["claim"], "released_read_claim")
@@ -706,6 +752,102 @@ class ResultTests(DecisionCase):
         self.assertEqual(result["source"]["head"], self.head)
         self.assertFalse(result["dispatch"])
         self.assertEqual(result["authority"], "none")
+
+    def test_native_tagged_result_with_missing_grant_is_held(self) -> None:
+        sid = self.admitted()
+        manifest = self.start_team(sid)
+        ctx = self.resolve(sid)
+        done = self.complete_task(
+            sid, manifest, plan_body=self.native_read_plan(ctx["ref"])
+        )
+        self.release_claim(manifest, done["execution_id"], self.head)
+        result = self.validate(sid, grant=NO_GRANT)
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "standing_grant_unavailable")
+        self.assertIsNone(result["stage"])
+        self.assertEqual(result["authority"], "none")
+
+    def test_native_tagged_result_with_wrong_tag_is_held(self) -> None:
+        for over, code in (
+            ({"tag_task": "read-000000000000"}, "task_binding_mismatch"),
+            ({"tag_submission": "synthetic-other"}, "submission_mismatch"),
+        ):
+            with self.subTest(code=code):
+                sid = self.admitted()
+                manifest = self.start_team(sid)
+                ctx = self.resolve(sid)
+                done = self.complete_task(
+                    sid, manifest, plan_body=self.native_read_plan(ctx["ref"]),
+                    **over,
+                )
+                self.release_claim(manifest, done["execution_id"], self.head)
+                result = self.validate(sid)
+                self.assertEqual(result["status"], "HELD")
+                self.assertEqual(result["code"], code)
+                self.assertEqual(result["stage"]["code"], code)
+                self.assertFalse(result["dispatch"])
+                self.assertEqual(result["authority"], "none")
+
+    def test_native_tagged_result_with_spoofed_source_is_held(self) -> None:
+        sid = self.admitted()
+        manifest = self.start_team(sid)
+        ctx = self.resolve(sid)
+        body = self.native_read_plan(ctx["ref"])
+        body["source_refs"] = [{"location": ctx["ref"]["location"],
+                                "digest": "sha256:" + "b" * 64}]
+        done = self.complete_task(sid, manifest, plan_body=body)
+        self.release_claim(manifest, done["execution_id"], self.head)
+        result = self.validate(sid)
+        self.assertEqual(result["status"], "HELD")
+        self.assertEqual(result["code"], "source_spoofed")
+        self.assertFalse(result["dispatch"])
+        self.assertEqual(result["authority"], "none")
+
+    def test_native_tagged_result_with_active_claim_is_held(self) -> None:
+        sid = self.admitted()
+        manifest = self.start_team(sid)
+        ctx = self.resolve(sid)
+        done = self.complete_task(
+            sid, manifest, plan_body=self.native_read_plan(ctx["ref"])
+        )
+        self.release_claim(manifest, done["execution_id"], self.head)
+        conn = registry.connect(str(self.ledger))
+        conn.execute(
+            "UPDATE claims SET released_at=NULL, outcome=NULL, released_head='' "
+            "WHERE run_id=? AND work_key=?",
+            ("cao-team-" + manifest["team_id"], done["execution_id"]),
+        )
+        conn.close()
+        result = self.validate(sid)
+        self.assertEqual(result["code"], "registry_claim_active")
+
+    def test_native_tagged_result_with_foreign_claim_is_held(self) -> None:
+        sid = self.admitted()
+        manifest = self.start_team(sid)
+        ctx = self.resolve(sid)
+        done = self.complete_task(
+            sid, manifest, plan_body=self.native_read_plan(ctx["ref"])
+        )
+        self.release_claim(
+            manifest, done["execution_id"], self.head, owner="someone-else"
+        )
+        result = self.validate(sid)
+        self.assertEqual(result["code"], "registry_claim_foreign")
+
+    def test_native_tagged_result_with_unreadable_registry_is_held(self) -> None:
+        sid = self.admitted()
+        manifest = self.start_team(sid)
+        ctx = self.resolve(sid)
+        done = self.complete_task(
+            sid, manifest, plan_body=self.native_read_plan(ctx["ref"])
+        )
+        self.release_claim(manifest, done["execution_id"], self.head)
+        with mock.patch.object(
+            registry, "connect_readonly",
+            side_effect=registry.RegistryError("unreadable"),
+        ):
+            result = self.validate(sid)
+        self.assertEqual(result["code"], "registry_unknown")
 
     def test_missing_team_is_held(self) -> None:
         result = self.validate(self.admitted())
@@ -1027,6 +1169,56 @@ class ReadOnlyJudgmentTests(DecisionCase):
         forged["digest"] = "sha256:" + "b" * 64
         self.assertIs(context["source_known"](forged), False)
         self.assertIs(context["source_known"](None), False)
+
+    def test_native_tagged_read_plan_is_proposed_end_to_end(self) -> None:
+        """B2c: a genuine tagged READ result with the exact native receipt."""
+
+        sid = self.admitted()
+        manifest = self.start_team(sid)
+        ctx = self.resolve(sid)
+        done = self.complete_task(
+            sid, manifest, plan_body=self.plan(ctx["ref"], "READ")
+        )
+        self.release_claim(manifest, done["execution_id"], self.head)
+        result = self.validate(sid)
+        self.assertEqual(result["status"], "PROPOSED")
+        self.assertIsNone(result["code"])
+        self.assertEqual(result["stage"]["action_class"], "READ")
+        self.assertEqual(result["stage"]["plan"]["schema"], da.PLAN_SCHEMA)
+        self.assertEqual(result["authority"], "none")
+        self.assertIs(result["dispatch"], False)
+        self.assertEqual(result["effects"], [])
+        self.assertEqual(result["egress"], "none")
+        self.assertIs(result["advisory_only"], True)
+        self.assertIsNone(result["missing_interface"])
+        self.assertIs(result["detail"]["receipt_verified"], True)
+        self.assertEqual(result["detail"]["claim"], "released_read_claim")
+        self.assertEqual(result["team_id"], manifest["team_id"])
+        self.assertEqual(result["task_id"], done["task_id"])
+        self.assertEqual(result["source"]["head"], self.head)
+        # The synthetic private title and body never reach the native output.
+        record = team._read(manifest["team_id"], self.env)
+        output = record["slots"][done["task_id"]]["output"]
+        self.assertNotIn(TITLE, output)
+        self.assertNotIn(BODY_TOKEN, output)
+
+    def test_native_tagged_write_and_reserved_plans_stay_held(self) -> None:
+        for action, code in (("WRITE", "review_only"),
+                             ("RESERVED", "review_only")):
+            with self.subTest(action=action):
+                sid = self.admitted()
+                manifest = self.start_team(sid)
+                ctx = self.resolve(sid)
+                done = self.complete_task(
+                    sid, manifest, plan_body=self.plan(ctx["ref"], action)
+                )
+                self.release_claim(manifest, done["execution_id"], self.head)
+                result = self.validate(sid)
+                self.assertEqual(result["status"], "HELD")
+                self.assertEqual(result["code"], code)
+                self.assertIs(result["dispatch"], False)
+                self.assertEqual(result["authority"], "none")
+                self.assertEqual(result["effects"], [])
 
 
 class ModuleShapeTests(unittest.TestCase):

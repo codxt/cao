@@ -34,7 +34,11 @@ Load-bearing rules
   terminal receipt line, the exact task binding and the enumerated submission
   against externally supplied facts *before* parsing any plan content; a
   missing, unknown, duplicated, non-terminal or uncheckable receipt, or an
-  absent binding fact, holds with an explicit code.
+  absent binding fact, holds with an explicit code. Exactly two grammars are
+  admitted: the original bounded single token, and the exact native CAO team
+  receipt (the literal ``CAO_TEAM_RESULT:`` prefix, one ASCII space, 16
+  lowercase hex). The receipt is externally verified **source evidence**, never
+  authority: a well-formed receipt never grants, dispatches or widens a plan.
 * **Exactly one bounded, unambiguous tagged plan block.** Missing, duplicated,
   unbalanced, malformed, oversized or non-JSON output is refused; prose around
   the block (including echoed instructions) is never interpreted.
@@ -88,7 +92,13 @@ MAX_RESULT_BYTES = da.MAX_PLAN_BYTES
 MAX_SUBMISSION_IDS = 32
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+#: The original legacy receipt grammar: exactly one bounded single token.
 _RECEIPT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}\Z")
+#: The exact native CAO team terminal receipt grammar: the literal result
+#: prefix, one ASCII space, then exactly 16 lowercase hex characters. This is
+#: the exact form ``cao.team._receipt_for`` emits; no other multiword token, no
+#: capital hex, no variable length and no extra padding is admitted here.
+_NATIVE_RECEIPT_RE = re.compile(r"CAO_TEAM_RESULT: [0-9a-f]{16}\Z")
 _USERINFO_RE = re.compile(r"://[^/@\s]+:[^/@\s]+@")
 _OPEN_EXACT = re.compile(
     re.escape(OPEN_TAG)
@@ -332,12 +342,23 @@ def _output_text(output: Any) -> str:
     return output
 
 
+def _receipt_well_formed(receipt: Any) -> bool:
+    """The exact legacy token or the exact native two-token string, or nothing.
+
+    Externally verified source evidence only: an unverified, unknown,
+    multiword-but-not-native, capital-hex, variable-length or padded value is
+    never admitted.
+    """
+
+    if not isinstance(receipt, str) or receipt.lower() == "unknown":
+        return False
+    return bool(
+        _RECEIPT_RE.fullmatch(receipt) or _NATIVE_RECEIPT_RE.fullmatch(receipt)
+    )
+
+
 def _check_receipt(text: str, receipt: Any) -> None:
-    if (
-        not isinstance(receipt, str)
-        or not _RECEIPT_RE.fullmatch(receipt)
-        or receipt.lower() == "unknown"
-    ):
+    if not _receipt_well_formed(receipt):
         raise da.DecisionHeld(
             "receipt_unverifiable",
             "the terminal receipt proof is missing, unknown or not an exact "
