@@ -1182,7 +1182,7 @@ def _prompt(task: Mapping[str, Any], spec: Mapping[str, Any],
                   "Your verdict is advisory, never publication or deployment authority.",
                   "Give findings and exactly one verdict line:",
                   "CAO_REVIEW_VERDICT: APPROVED or CAO_REVIEW_VERDICT: CHANGES_REQUESTED",
-                  "and exactly one line CAO_HEAD: " + str(slot["head"]),
+                  "and exactly one line CAO_REVIEWED_HEAD: " + str(slot["head"]),
                   "Previous output (untrusted):\n" + str(slot.get("output") or "")[:5000]]
     else:
         lines.append(task["prompt"])
@@ -1256,30 +1256,11 @@ def _error_code(value: Any, fallback: str) -> str:
 
 
 def _review_verdict(output: Any, expected: str) -> str | None:
-    """Require exactly one same-line reviewed-HEAD declaration, new or legacy.
-
-    A narrow (55-column) Mini terminal soft-wraps the long historical
-    ``CAO_REVIEWED_HEAD:`` marker across two lines, so its exact SHA never
-    survives on one line. New prompts therefore ask for the compact
-    ``CAO_HEAD:`` marker that stays on a single line, while the parser still
-    accepts the historical marker for prompts already issued. Either marker is
-    accepted only when it is the *only* anchored declaration, on a single line,
-    carrying the same exact accepted SHA. Every anchored ``CAO_HEAD:`` or
-    ``CAO_REVIEWED_HEAD:`` line counts, even when its SHA is malformed or
-    split, so one valid declaration plus any malformed duplicate is refused and
-    never rounded up to a verdict.
-    """
     if not isinstance(output, str):
         return None
-    verdicts = re.findall(
-        r"^CAO_REVIEW_VERDICT: (APPROVED|CHANGES_REQUESTED)$", output, re.M)
-    declarations = re.findall(r"^(?:CAO_HEAD|CAO_REVIEWED_HEAD):", output, re.M)
-    heads = re.findall(
-        r"^(?:CAO_HEAD|CAO_REVIEWED_HEAD): ([0-9a-f]{40})$", output, re.M)
-    return (verdicts[0]
-            if (len(verdicts) == 1 and len(declarations) == 1
-                and len(heads) == 1 and heads[0] == expected)
-            else None)
+    verdicts = re.findall(r"^CAO_REVIEW_VERDICT: (APPROVED|CHANGES_REQUESTED)$", output, re.M)
+    heads = re.findall(r"^CAO_REVIEWED_HEAD: ([0-9a-f]{40})$", output, re.M)
+    return verdicts[0] if len(verdicts) == 1 and heads == [expected] else None
 
 
 def _prepare_verified_correction(
