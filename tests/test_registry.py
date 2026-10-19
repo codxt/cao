@@ -50,6 +50,10 @@ def make_repo(root: Path, name: str = "repo") -> Path:
     return path
 
 
+def head_of(path: os.PathLike | str) -> str:
+    return run_git(path, "rev-parse", "HEAD").strip()
+
+
 EMPTY = RuntimeObservation.empty()
 
 
@@ -1510,6 +1514,567 @@ class EvidenceValidityTests(RegistryTestCase):
                                return_value=dict(probe)):
             report = registry.reconcile(self.conn, evidence)
         self.assertNotIn(secret, repr(report))
+
+
+class _ReleasedSourceMixin:
+    """Builders for the released-with-preserved-unmerged-source state.
+
+    A released claim's clean committed source is exactly the historical-worktree
+    conflict: the claim is gone, yet the checkout still holds committed work
+    relative to the baseline, so the Registry reports it as unregistered.
+    """
+
+    def feature_commit(self):
+        """A feature checkout with one preserved commit and NO Registry record."""
+        linked = self.root / "feature"
+        run_git(self.repo, "worktree", "add", "-b", "feature", str(linked))
+        (linked / "src" / "app.py").write_text("print('feature')\n",
+                                               encoding="utf-8")
+        run_git(linked, "add", "-A")
+        run_git(linked, "commit", "-m", "feature work")
+        return linked, head_of(linked)
+
+    def feature_leftover(self, *, release: bool = True):
+        """Claim first (clean), commit, then release ``complete`` at that HEAD."""
+        linked = self.root / "feature"
+        run_git(self.repo, "worktree", "add", "-b", "feature", str(linked))
+        self.propose("a", ["src"])
+        granted = self.claim("a", "alice", worktree=str(linked), branch="feature")
+        self.assertEqual(granted["status"], registry.CLAIMED)
+        (linked / "src" / "app.py").write_text("print('feature')\n",
+                                               encoding="utf-8")
+        run_git(linked, "add", "-A")
+        run_git(linked, "commit", "-m", "feature work")
+        head = head_of(linked)
+        if release:
+            self.assertEqual(
+                registry.release(self.conn, "run", "alice", "a",
+                                 outcome="complete", released_head=head)["status"],
+                registry.RELEASED)
+        return linked, head
+
+    def reconcile_feature(self, linked, observation=EMPTY):
+        return registry.reconcile(
+            self.conn,
+            registry.gather_evidence(str(self.repo), observation,
+                                     worktree=str(linked)))
+
+    def feature_finding(self, report, linked):
+        real = os.path.realpath(str(linked))
+        return next(f for f in report["findings"]
+                    if f.get("worktree")
+                    and os.path.realpath(f["worktree"]) == real)
+
+    def feature_spec(self, work_key="b", owner="bob"):
+        return ClaimSpec(run_id="run", work_key=work_key, owner=owner,
+                         mode="WRITE", worktree=str(self.root / "feature"),
+                         branch="feature")
+
+    def feature_evidence(self, observation=EMPTY):
+        return registry.gather_evidence(str(self.repo), observation,
+                                        worktree=str(self.root / "feature"))
+
+
+class ReleasedSourceTests(_ReleasedSourceMixin, RegistryTestCase):
+    def test_released_clean_source_is_distinguished(self) -> None:
+        linked, head = self.feature_leftover()
+        report = self.reconcile_feature(linked)
+        self.assertTrue(report["ok"])
+        finding = self.feature_finding(report, linked)
+        self.assertEqual(finding["kind"], registry.DISCOVERED_UNREGISTERED)
+        self.assertEqual(finding["status"], registry.RELEASED_UNMERGED)
+        self.assertEqual(finding["released_source"]["released_head"], head)
+        self.assertEqual(finding["released_source"]["owner"], "alice")
+        self.assertEqual(finding["released_source"]["scope"], ["src"])
+        self.assertIn("src/app.py", finding["committed"])
+
+    def test_reconcile_alone_does_not_waive_the_block(self) -> None:
+        linked, head = self.feature_leftover()
+        self.propose("b", ["src/app.py"])
+        # Classification is diagnostic only: with no explicit disposition the
+        # released leftover still blocks an independent writer.
+        refusal = registry.write_gate(self.conn, self.feature_spec(),
+                                      self.feature_evidence())
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["status"], registry.CONFLICT)
+        self.assertEqual(refusal["conflicts"][0]["kind"],
+                         "discovered_unregistered")
+
+    def test_evidence_bound_disposition_clears_the_block(self) -> None:
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        result = registry.record_historical_disposition(
+            self.conn, "run", finding, "operator",
+            "released intermediate WRITE accepted at %s" % head,
+            expected_fingerprint=finding["fingerprint"])
+        self.assertEqual(result["disposition"], registry.DISPOSITION_HISTORICAL)
+        self.assertTrue(result["clears_block"])
+        self.assertEqual(result["released_source"]["released_head"], head)
+        self.assertIsNotNone(registry.find_disposition(self.conn, "run", finding))
+
+        self.propose("b", ["src/app.py"])
+        self.assertIsNone(registry.write_gate(self.conn, self.feature_spec(),
+                                              self.feature_evidence()))
+
+    def test_advanced_head_withdraws_the_decision(self) -> None:
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        registry.record_historical_disposition(
+            self.conn, "run", finding, "operator", "reviewed",
+            expected_fingerprint=finding["fingerprint"])
+
+        (linked / "src" / "app.py").write_text("print('more')\n",
+                                               encoding="utf-8")
+        run_git(linked, "add", "-A")
+        run_git(linked, "commit", "-m", "more")
+        moved = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertNotEqual(moved["head"], head)
+        self.assertNotIn("released_source", moved)
+        self.assertIsNone(registry.find_disposition(self.conn, "run", moved))
+
+        self.propose("b", ["src/app.py"])
+        refusal = registry.write_gate(self.conn, self.feature_spec(),
+                                      self.feature_evidence())
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["conflicts"][0]["kind"],
+                         "discovered_unregistered")
+
+    def test_dirty_released_leftover_is_not_cleared(self) -> None:
+        linked, head = self.feature_leftover()
+        (linked / "src" / "app.py").write_text("print('uncommitted')\n",
+                                               encoding="utf-8")
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertNotIn("released_source", finding)
+        self.assertNotEqual(finding["status"], registry.RELEASED_UNMERGED)
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+    def test_active_writer_is_not_cleared(self) -> None:
+        linked, head = self.feature_leftover()
+        observation = RuntimeObservation(
+            True, (AgentObservation("w1", str(linked), "working"),))
+        finding = self.feature_finding(
+            self.reconcile_feature(linked, observation), linked)
+        self.assertTrue(finding["live"])
+        self.assertNotIn("released_source", finding)
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+    def test_unknown_finding_cannot_be_cleared(self) -> None:
+        linked, head = self.feature_leftover()
+        broken = {"ok": False, "source": "git", "reason": "probe_failed",
+                  "error": "unreadable", "items": None}
+        with mock.patch.object(registry.git, "probe_status",
+                               return_value=broken):
+            report = self.reconcile_feature(linked)
+        finding = self.feature_finding(report, linked)
+        self.assertEqual(finding["kind"], registry.UNKNOWN)
+        self.assertTrue(finding.get("unverifiable"))
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+    def test_self_attributed_provenance_and_run_id_are_refused(self) -> None:
+        # No released claim exists anywhere. A fabricated finding that even
+        # annotates itself historical, plus a caller-chosen run id, clear
+        # nothing: the ledger is the only source of prior acceptance.
+        forged = {
+            "kind": registry.DISCOVERED_UNREGISTERED,
+            "status": registry.RELEASED_UNMERGED,
+            "worktree": str(self.repo),
+            "branch": "main",
+            "head": "a" * 40,
+            "detached": False,
+            "live": False,
+            "changes": [],
+            "status_codes": [],
+            "committed": ["src/app.py"],
+            "released_source": {"claim_id": 7, "owner": "attacker",
+                                "released_head": "a" * 40},
+        }
+        registry.stamp_findings([forged])
+        self.assertIsNone(
+            registry.released_source_provenance(self.conn, forged))
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "attacker-run", forged, "attacker", "trust me")
+
+    def test_out_of_scope_commit_is_not_historical(self) -> None:
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        finding["committed"] = ["outside.txt"]  # outside the released scope
+        self.assertIsNone(
+            registry.released_source_provenance(self.conn, finding))
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+    def test_detached_leftover_is_not_historical(self) -> None:
+        linked, head = self.feature_leftover()
+        run_git(linked, "checkout", "--detach")
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertTrue(finding["detached"])
+        self.assertNotIn("released_source", finding)
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+    def test_ambiguous_duplicate_releases_are_not_provenance(self) -> None:
+        linked, head = self.feature_leftover()
+        # A second completed release at the SAME repository/worktree/HEAD/branch
+        # makes the historical claim ambiguous, so the ledger cannot single one
+        # out and the leftover stays a blocker.
+        self.conn.execute(
+            "INSERT INTO claims (run_id, work_key, issue, owner, mode, branch, "
+            "worktree, claimed_at, released_at, outcome, released_head) "
+            "VALUES ('run','a','','mallory','WRITE','feature',?,'t','t',"
+            "'complete',?)",
+            (os.path.realpath(str(linked)), head))
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertNotIn("released_source", finding)
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+    def test_forged_annotation_cannot_override_the_ledger(self) -> None:
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        true_id = finding["released_source"]["claim_id"]
+        # The caller overwrites the annotation with a lie. The recorder
+        # recomputes provenance from the ledger, so the lie is ignored.
+        finding["released_source"] = {"claim_id": 999, "owner": "attacker",
+                                      "released_head": "b" * 40}
+        result = registry.record_historical_disposition(
+            self.conn, "run", finding, "operator", "reviewed",
+            expected_fingerprint=finding["fingerprint"])
+        self.assertEqual(result["released_source"]["claim_id"], true_id)
+        self.assertEqual(result["released_source"]["released_head"], head)
+        self.assertEqual(result["released_source"]["owner"], "alice")
+
+
+class ReleasedSourceRepoTests(_ReleasedSourceMixin, RegistryTestCase):
+    def test_other_repository_release_does_not_verify(self) -> None:
+        # Repository A holds a clean preserved commit with NO Registry record.
+        linked, head = self.feature_commit()
+        # Repository B releases completed AT THE SAME HEAD. That is not evidence
+        # about repository A: the check is repository-bound, not run-id-bound.
+        other = make_repo(self.root, "other")
+        registry.propose(self.conn, "run", "z", str(other), paths=["src"])
+        self.assertEqual(
+            self.claim("z", "zed", worktree=str(other), branch="main")["status"],
+            registry.CLAIMED)
+        self.assertEqual(
+            registry.release(self.conn, "run", "zed", "z", outcome="complete",
+                             released_head=head)["status"],
+            registry.RELEASED)
+
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertNotIn("released_source", finding)
+        with self.assertRaises(registry.RegistryError):
+            registry.record_historical_disposition(
+                self.conn, "run", finding, "operator", "trust me")
+
+
+class HistoricalReuseTests(_ReleasedSourceMixin, RegistryTestCase):
+    """Cross-run reuse of an evidence-checked historical decision.
+
+    The accepted decision belongs to the source run. A later, independent run
+    may reuse it ONLY while the exact released leftover still re-verifies and
+    the decision carries the recorder's proof bit. Each test proves the reuse
+    or one way it must stay a block.
+    """
+
+    def accept_historical(self, run_id: str = "run"):
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        result = registry.record_historical_disposition(
+            self.conn, run_id, finding, "operator",
+            "released intermediate WRITE accepted at %s" % head,
+            expected_fingerprint=finding["fingerprint"])
+        return linked, head, finding, result
+
+    def successor_spec(self, run_id: str = "run2", work_key: str = "b",
+                       owner: str = "bob") -> ClaimSpec:
+        return ClaimSpec(run_id=run_id, work_key=work_key, owner=owner,
+                         mode="WRITE", worktree=str(self.root / "feature"),
+                         branch="feature")
+
+    def propose_for(self, run_id: str, work_key: str, paths) -> dict:
+        return registry.propose(self.conn, run_id, work_key, str(self.repo),
+                                paths=paths)
+
+    def test_run_local_negative_decision_still_blocks_reuse(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        # A run-local handoff on the successor's own run is a pending action, so
+        # it takes precedence over the cross-run historical decision and keeps
+        # the finding blocking.
+        registry.record_disposition(
+            self.conn, "run2", finding, registry.DISPOSITION_HANDOFF,
+            "operator", "hand this to a human", target_owner="human",
+            expected_fingerprint=finding["fingerprint"])
+        found = registry.find_disposition(self.conn, "run2", finding)
+        self.assertEqual(found["disposition"], registry.DISPOSITION_HANDOFF)
+        self.propose_for("run2", "b", ["src/app.py"])
+        refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
+                                      self.feature_evidence())
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["conflicts"][0]["kind"],
+                         "discovered_unregistered")
+
+    def test_successor_run_reuses_the_verified_decision(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        self.assertTrue(result["verified_historical"])
+        # A different run holds no disposition of its own...
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM dispositions WHERE run_id=?", ("run2",)).fetchone())
+        # ...yet the exact leftover re-verifies, so the successor claim succeeds.
+        self.propose_for("run2", "b", ["src/app.py"])
+        granted = registry.claim(self.conn, self.successor_spec("run2"), EMPTY)
+        self.assertEqual(granted["status"], registry.CLAIMED)
+        # Reuse did not fabricate a decision record for the successor run.
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM dispositions WHERE run_id=?", ("run2",)).fetchone())
+
+    def test_reuse_requires_the_exact_same_evidence(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        # An advanced HEAD is a different finding: the old decision withdraws.
+        (linked / "src" / "app.py").write_text("print('more')\n",
+                                               encoding="utf-8")
+        run_git(linked, "add", "-A")
+        run_git(linked, "commit", "-m", "more")
+        moved = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertNotEqual(moved["head"], head)
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", moved))
+        self.propose_for("run2", "b", ["src/app.py"])
+        refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
+                                      self.feature_evidence())
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["conflicts"][0]["kind"],
+                         "discovered_unregistered")
+
+    def test_dirty_leftover_is_not_reused(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        (linked / "src" / "app.py").write_text("print('uncommitted')\n",
+                                               encoding="utf-8")
+        dirty = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertNotIn("released_source", dirty)
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", dirty))
+
+    def test_unaccepted_unmerged_source_is_not_reused(self) -> None:
+        # Released complete, but no historical disposition was ever recorded.
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", finding))
+        self.propose_for("run2", "b", ["src/app.py"])
+        refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
+                                      self.feature_evidence())
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["conflicts"][0]["kind"],
+                         "discovered_unregistered")
+
+    def test_generic_caller_attributed_historical_stays_run_local(self) -> None:
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        # A caller records a generic historical decision under the source run,
+        # BYPASSING the evidence-checked recorder.
+        result = registry.record_disposition(
+            self.conn, "run", finding, registry.DISPOSITION_HISTORICAL,
+            "operator", "generic caller attribution",
+            expected_fingerprint=finding["fingerprint"])
+        self.assertFalse(result["verified_historical"])
+        # It clears for its own run...
+        self.assertIsNotNone(registry.find_disposition(self.conn, "run", finding))
+        # ...but another run can never inherit a caller-attributed decision.
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", finding))
+        self.propose_for("run2", "b", ["src/app.py"])
+        refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
+                                      self.feature_evidence())
+        self.assertIsNotNone(refusal)
+
+    def test_a_live_occupant_blocks_reuse(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        observation = RuntimeObservation(
+            True, (AgentObservation("w2", str(linked), "working"),))
+        live = self.feature_finding(
+            self.reconcile_feature(linked, observation), linked)
+        self.assertTrue(live["live"])
+        self.assertNotIn("released_source", live)
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", live))
+
+    def test_unknown_state_is_never_reused(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        broken = {"ok": False, "source": "git", "reason": "probe_failed",
+                  "error": "unreadable", "items": None}
+        with mock.patch.object(registry.git, "probe_status",
+                               return_value=broken):
+            report = self.reconcile_feature(linked)
+        unknown = self.feature_finding(report, linked)
+        self.assertEqual(unknown["kind"], registry.UNKNOWN)
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", unknown))
+
+    def test_a_new_writer_claim_is_not_waived_by_the_old_decision(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        # A new, independent run may reuse the decision to claim the leftover.
+        self.propose_for("writer", "w", ["src"])
+        first = registry.claim(self.conn, ClaimSpec(
+            run_id="writer", work_key="w", owner="carol", mode="WRITE",
+            worktree=str(linked), branch="feature"), EMPTY)
+        self.assertEqual(first["status"], registry.CLAIMED)
+        # A further run now conflicts with the LIVE holder: the historical
+        # decision is not a general waiver that clears a new active writer.
+        self.propose_for("run3", "c", ["src/app.py"])
+        third = registry.claim(self.conn, ClaimSpec(
+            run_id="run3", work_key="c", owner="dave", mode="WRITE",
+            worktree=str(linked), branch="feature"), EMPTY)
+        self.assertEqual(third["status"], registry.CONFLICT)
+
+    def test_a_forged_proof_bit_without_provenance_is_ignored(self) -> None:
+        # The proof bit alone grants nothing: the current finding must still
+        # re-verify as a released leftover at lookup time.
+        self.propose("a", ["src"])
+        self.claim("a", "alice", worktree=str(self.repo), branch="main")
+        (self.repo / "src" / "app.py").write_text("print('two')\n",
+                                                  encoding="utf-8")
+        report = registry.reconcile(self.conn, self.evidence())
+        finding = next(f for f in report["findings"]
+                       if f["kind"] == registry.STALE_DIRTY)
+        self.conn.execute(
+            "INSERT INTO dispositions (run_id, finding_key, fingerprint, "
+            "disposition, authority, rationale, target_owner, created_at, "
+            "verified_historical) VALUES ('run',?,?,?,?,?,?,?,1)",
+            (registry.finding_key(finding),
+             registry.finding_fingerprint(finding),
+             registry.DISPOSITION_HISTORICAL, "x", "y", "", "t"))
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", finding))
+
+    def test_wrong_leftover_in_the_same_repo_is_not_cleared(self) -> None:
+        linked, head, finding, result = self.accept_historical("run")
+        # A second, unrelated unregistered checkout with committed work and no
+        # released claim of its own must not borrow the first leftover's
+        # decision.
+        stray = self.root / "stray"
+        run_git(self.repo, "worktree", "add", "-b", "stray", str(stray))
+        (stray / "src" / "app.py").write_text("print('stray')\n",
+                                              encoding="utf-8")
+        run_git(stray, "add", "-A")
+        run_git(stray, "commit", "-m", "stray work")
+        sreport = registry.reconcile(
+            self.conn, registry.gather_evidence(str(self.repo), EMPTY,
+                                                worktree=str(stray)))
+        sfinding = next(f for f in sreport["findings"]
+                        if f.get("worktree")
+                        and os.path.realpath(f["worktree"])
+                        == os.path.realpath(str(stray)))
+        self.assertNotIn("released_source", sfinding)
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", sfinding))
+
+    def test_other_repository_leftover_does_not_borrow_the_decision(self) -> None:
+        # A verified decision for repository A's leftover must not clear a
+        # structurally similar leftover in repository B.
+        linked, head, finding, result = self.accept_historical("run")
+        other = make_repo(self.root, "other")
+        olinked = self.root / "other-feature"
+        run_git(other, "worktree", "add", "-b", "feature", str(olinked))
+        registry.propose(self.conn, "run", "z", str(other), paths=["src"])
+        self.assertEqual(
+            self.claim("z", "zed", worktree=str(olinked),
+                       branch="feature")["status"], registry.CLAIMED)
+        (olinked / "src" / "app.py").write_text("print('other')\n",
+                                                encoding="utf-8")
+        run_git(olinked, "add", "-A")
+        run_git(olinked, "commit", "-m", "other work")
+        ohead = head_of(olinked)
+        self.assertEqual(
+            registry.release(self.conn, "run", "zed", "z", outcome="complete",
+                             released_head=ohead)["status"], registry.RELEASED)
+        oreport = registry.reconcile(
+            self.conn, registry.gather_evidence(str(other), EMPTY,
+                                                worktree=str(olinked)))
+        ofinding = next(f for f in oreport["findings"]
+                        if f.get("worktree")
+                        and os.path.realpath(f["worktree"])
+                        == os.path.realpath(str(olinked)))
+        # Repository B's own leftover is genuine, but no verified decision
+        # exists for it, so repository A's decision cannot be borrowed.
+        self.assertIsNotNone(ofinding.get("released_source"))
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", ofinding))
+
+
+class LegacyRegistryMigrationTests(_ReleasedSourceMixin, RegistryTestCase):
+    """The additive proof-bit migration never promotes a legacy decision."""
+
+    LEGACY_DISPOSITIONS = (
+        "CREATE TABLE dispositions ("
+        " disp_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " run_id TEXT NOT NULL,"
+        " finding_key TEXT NOT NULL,"
+        " fingerprint TEXT NOT NULL,"
+        " disposition TEXT NOT NULL,"
+        " authority TEXT NOT NULL,"
+        " rationale TEXT NOT NULL DEFAULT '',"
+        " target_owner TEXT NOT NULL DEFAULT '',"
+        " created_at TEXT NOT NULL"
+        ")")
+
+    def downgrade_dispositions(self) -> None:
+        """Rebuild ``dispositions`` in the pre-proof-bit shape, keeping rows."""
+        columns = ("disp_id, run_id, finding_key, fingerprint, disposition, "
+                   "authority, rationale, target_owner, created_at")
+        self.conn.executescript(
+            self.LEGACY_DISPOSITIONS.replace(
+                "dispositions", "dispositions_legacy", 1)
+            + ";INSERT INTO dispositions_legacy (" + columns + ") SELECT "
+              + columns + " FROM dispositions;DROP TABLE dispositions;"
+              "ALTER TABLE dispositions_legacy RENAME TO dispositions;")
+
+    def test_migration_demotes_a_legacy_decision_to_run_local(self) -> None:
+        linked, head = self.feature_leftover()
+        finding = self.feature_finding(self.reconcile_feature(linked), linked)
+        registry.record_historical_disposition(
+            self.conn, "run", finding, "operator", "reviewed",
+            expected_fingerprint=finding["fingerprint"])
+        # While the proof bit is present, a second run reuses the decision.
+        self.assertIsNotNone(registry.find_disposition(self.conn, "run2", finding))
+
+        # Simulate the pre-migration database: same row, no proof column.
+        self.downgrade_dispositions()
+        self.conn.close()
+        self.conn = registry.connect(self.db)
+        columns = {row["name"] for row in self.conn.execute(
+            "PRAGMA table_info(dispositions)").fetchall()}
+        self.assertIn("verified_historical", columns)
+        row = self.conn.execute(
+            "SELECT verified_historical FROM dispositions WHERE run_id='run'"
+        ).fetchone()
+        self.assertEqual(row["verified_historical"], 0)
+        # A legacy decision still clears its own run, but is never promoted to
+        # a reusable cross-run clearance.
+        self.assertIsNotNone(registry.find_disposition(self.conn, "run", finding))
+        self.assertIsNone(registry.find_disposition(self.conn, "run2", finding))
+
+    def test_legacy_table_without_the_bit_migrates_cleanly(self) -> None:
+        # A truly minimal legacy DB: only the old dispositions table exists.
+        self.conn.close()
+        os.remove(self.db)
+        legacy = sqlite3.connect(self.db, isolation_level=None)
+        try:
+            legacy.executescript(self.LEGACY_DISPOSITIONS)
+            legacy.execute(
+                "INSERT INTO dispositions (run_id, finding_key, fingerprint, "
+                "disposition, authority, rationale, created_at) "
+                "VALUES ('old','k','f','historical','sup','legacy','t')")
+        finally:
+            legacy.close()
+        conn = registry.connect(self.db)
+        self.addCleanup(conn.close)
+        columns = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(dispositions)").fetchall()}
+        self.assertIn("verified_historical", columns)
+        self.assertEqual(
+            conn.execute("SELECT verified_historical FROM dispositions")
+            .fetchone()["verified_historical"], 0)
 
 
 if __name__ == "__main__":

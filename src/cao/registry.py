@@ -59,6 +59,7 @@ __all__ = [
     "evaluate", "write_gate", "reconcile", "gather_evidence",
     "list_active_claims", "list_works", "get_work", "get_open_claim",
     "record_disposition", "find_disposition", "list_dispositions",
+    "record_historical_disposition", "released_source_provenance",
     "finding_key", "finding_fingerprint", "stamp_findings",
     "objective_tokens", "lexical_similarity", "probable_overlaps",
     "record_observation", "list_observations",
@@ -66,7 +67,7 @@ __all__ = [
     "BLOCKED", "ERROR", "RELEASED", "PROPOSED", "UNCHANGED", "AMENDED",
     "NEEDS_RECONCILIATION", "NEEDS_SCOPE", "HANDED_OFF", "RESOLVED",
     "DISCOVERED_UNREGISTERED", "SCOPE_DRIFT", "STALE_DIRTY", "STALE_CLEAN",
-    "UNKNOWN", "LIVE",
+    "UNKNOWN", "LIVE", "RELEASED_UNMERGED",
 ]
 
 READ = "READ"
@@ -99,6 +100,12 @@ STALE_CLEAN = "STALE_CLEAN"
 STALE_DIRTY = "STALE_DIRTY"
 UNKNOWN = "UNKNOWN"
 LIVE = "LIVE"
+
+# Diagnostic sub-status for a DISCOVERED_UNREGISTERED finding that the ledger
+# proves is the clean preserved-unmerged leftover of a completed, released
+# claim. It is a classification, not a waiver: the finding keeps its blocking
+# kind until an explicit, fingerprint-bound historical disposition clears it.
+RELEASED_UNMERGED = "released_unmerged_source"
 
 # The one persisted reconciliation record kind: a whole current-state snapshot
 # that a later reconciliation replaces wholesale.
@@ -196,7 +203,13 @@ CREATE TABLE IF NOT EXISTS dispositions (
     authority    TEXT NOT NULL,
     rationale    TEXT NOT NULL DEFAULT '',
     target_owner TEXT NOT NULL DEFAULT '',
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    -- Durable proof that this decision was made through the evidence-checked
+    -- recorder, which re-verified the released source against the ledger. Only
+    -- that path sets it to 1; a generic caller-attributed disposition is always
+    -- 0 and stays run-local. A later, independent run may reuse a verified
+    -- historical decision, but never a caller's own claim.
+    verified_historical INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS dispositions_lookup
@@ -259,9 +272,37 @@ def connect(db: str | None = None, timeout: float = 10.0) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = %d" % int(timeout * 1000))
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.execute(
         "INSERT OR IGNORE INTO runs (run_id, created_at) VALUES ('', '')")
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing registry up to this version's shape, additively.
+
+    Only additions are made here, and only when the existing object predates
+    them: a column is added when it is missing, never rewritten, and no row is
+    mass-updated. The one migration so far is ``dispositions.verified_historical``
+    (see :func:`_ensure_disposition_provenance`).
+    """
+    _ensure_disposition_provenance(conn)
+
+
+def _ensure_disposition_provenance(conn: sqlite3.Connection) -> None:
+    """Add the durable ``verified_historical`` proof bit if a DB predates it.
+
+    ``ALTER TABLE ... ADD COLUMN`` is not idempotent, so it runs only when the
+    column is absent (a fresh database already has it from ``SCHEMA``). Existing
+    rows default to 0: a decision recorded before this column existed is
+    caller-attributed and stays run-local, never silently promoted to a reusable
+    historical clearance.
+    """
+    columns = {row["name"] for row in conn.execute(
+        "PRAGMA table_info(dispositions)").fetchall()}
+    if "verified_historical" not in columns:
+        conn.execute("ALTER TABLE dispositions ADD COLUMN "
+                     "verified_historical INTEGER NOT NULL DEFAULT 0")
 
 
 def connect_readonly(db: str | None = None,
@@ -1354,6 +1395,106 @@ def _classify_claim(entry: dict, live: bool) -> None:
         entry["status"] = "live_clean"
 
 
+def released_source_provenance(conn: sqlite3.Connection,
+                               finding: dict) -> dict | None:
+    """Ledger-verified provenance of a preserved-unmerged released worktree.
+
+    Returns a compact record ONLY when the Registry's own durable ledger proves
+    the finding is the clean leftover of a completed, released claim. All of:
+
+    * the finding is unregistered work with no live occupant, no uncommitted
+      change and no unreadable evidence (a live, dirty, detached or unknown
+      worktree is a blocker, never "historical");
+    * its exact HEAD equals a released claim's ``released_head`` for the SAME
+      repository identity and the SAME physical checkout;
+    * the released claim completed, declared a branch the checkout still has
+      attached, and wrote in WRITE/EXCLUSIVE mode;
+    * every committed path lies inside that released claim's declared scope.
+
+    The answer is derived from the ledger and the live-derived finding alone:
+    the repository identity is re-derived from the finding's worktree, so a
+    caller cannot point one repository's finding at another repository's
+    release. No run id, authority string or self-attributed provenance is ever
+    the basis for the answer. Anything unreadable, ambiguous or unmatched
+    returns ``None`` (fail closed), so an active or unknown writer can never be
+    misread as historical.
+    """
+    try:
+        return _released_source_provenance_inner(conn, finding)
+    except Exception:  # noqa: BLE001 - a verification never raises
+        return None
+
+
+def _released_source_provenance_inner(conn, finding) -> dict | None:
+    if type(finding) is not dict:
+        return None
+    if finding.get("kind") != DISCOVERED_UNREGISTERED \
+            or finding.get("claim_id") is not None:
+        return None
+    if finding.get("unverifiable") or finding.get("live"):
+        return None
+    for flag in ("worktree_absent", "scope_unknown", "committed_unknown",
+                 "dirty_digest_unknown", "worker_state_unknown"):
+        if finding.get(flag):
+            return None
+    if finding.get("changes") or finding.get("status_codes") \
+            or finding.get("detached"):
+        return None
+    head = finding.get("head")
+    if not git.valid_commit_id(head):
+        return None
+    committed = finding.get("committed")
+    if type(committed) is not list or not committed \
+            or not all(git.valid_relpath(path) for path in committed):
+        return None
+    worktree = finding.get("worktree")
+    if not git.valid_abs_path(worktree):
+        return None
+    real = os.path.realpath(worktree)
+    identity = git.normalize_repo(real)
+    if not identity:
+        return None
+    rows = conn.execute(
+        "SELECT c.claim_id, c.run_id, c.work_key, c.issue, c.owner, c.mode, "
+        "c.branch, c.worktree, c.released_at, c.outcome, c.released_head, "
+        "w.repo AS repo, w.paths AS paths "
+        "FROM claims c JOIN works w "
+        "  ON w.run_id=c.run_id AND w.work_key=c.work_key AND w.issue=c.issue "
+        "WHERE c.released_at IS NOT NULL AND c.outcome='complete' "
+        "  AND c.released_head=? AND c.mode IN (?,?) AND w.repo=?",
+        (head, WRITE, EXCLUSIVE, identity),
+    ).fetchall()
+    branch = finding.get("branch")
+    matches = []
+    for row in rows:
+        if not row["owner"] or not row["branch"] or row["branch"] != branch:
+            continue
+        if os.path.realpath(row["worktree"]) != real:
+            continue
+        scope = _unpack(row["paths"])
+        if not scope or not all(_paths_within(path, scope) for path in committed):
+            continue
+        matches.append(row)
+    if len(matches) != 1:
+        # Zero matches is not provenance; more than one is an ambiguity the
+        # ledger cannot resolve, so it stays a blocker rather than being guessed.
+        return None
+    row = matches[0]
+    return {
+        "claim_id": row["claim_id"],
+        "run_id": row["run_id"],
+        "work_key": row["work_key"],
+        "issue": row["issue"],
+        "owner": row["owner"],
+        "mode": row["mode"],
+        "branch": row["branch"],
+        "released_head": row["released_head"],
+        "released_at": row["released_at"],
+        "repo": row["repo"],
+        "scope": _unpack(row["paths"]),
+    }
+
+
 def reconcile(conn: sqlite3.Connection, evidence: dict) -> dict:
     """Compare this repository's open claims against live evidence.
 
@@ -1596,6 +1737,14 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
         if any(a.get("liveness") == UNKNOWN_LIVENESS for a in others):
             entry["worker_state_unknown"] = True
             entry["unverifiable"] = True
+        # Distinguish a completed released claim's clean preserved source from
+        # active/unknown work. This is diagnostic only: the finding keeps its
+        # blocking kind until an explicit, fingerprint-bound historical
+        # disposition clears it, and an unverifiable worktree is never labelled.
+        released = released_source_provenance(conn, entry)
+        if released is not None:
+            entry["released_source"] = released
+            entry["status"] = RELEASED_UNMERGED
         if not live_here and not entry["touched"] and not others \
                 and not entry.get("committed_unknown") \
                 and not entry.get("dirty_digest_unknown") \
@@ -2368,7 +2517,22 @@ def record_disposition(conn: sqlite3.Connection, run_id: str, finding: dict,
     ``authority`` are required; and UNKNOWN / unverifiable findings are refused
     outright. ``authority`` is caller attribution, NOT authentication: the
     registry records who claimed it, not who is really there.
+
+    This path never sets the durable ``verified_historical`` proof bit, so a
+    decision recorded through it is caller-attributed and stays run-local. Only
+    :func:`record_historical_disposition`, which re-verifies a released source
+    against the ledger first, marks a decision as reusable.
     """
+    return _record_disposition(
+        conn, run_id, finding, disposition, authority, rationale, target_owner,
+        expected_fingerprint, verified_historical=False)
+
+
+def _record_disposition(conn: sqlite3.Connection, run_id: str, finding: dict,
+                        disposition: str, authority: str, rationale: str,
+                        target_owner: str, expected_fingerprint: str,
+                        *, verified_historical: bool) -> dict:
+    """Shared disposition writer; ``verified_historical`` is never caller input."""
     if not run_id.strip():
         raise RegistryError("run id is required to record a disposition")
     if disposition not in DISPOSITIONS:
@@ -2402,10 +2566,11 @@ def record_disposition(conn: sqlite3.Connection, run_id: str, finding: dict,
     try:
         cur = conn.execute(
             "INSERT INTO dispositions (run_id, finding_key, fingerprint, "
-            "disposition, authority, rationale, target_owner, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "disposition, authority, rationale, target_owner, created_at, "
+            "verified_historical) VALUES (?,?,?,?,?,?,?,?,?)",
             (run_id, key, fingerprint, disposition, authority.strip(),
-             rationale.strip(), (target_owner or "").strip(), stamp))
+             rationale.strip(), (target_owner or "").strip(), stamp,
+             1 if verified_historical else 0))
         record_observation(conn, run_id, "", DISPOSITION_KIND, {
             "finding_key": key, "fingerprint": fingerprint,
             "kind": finding.get("kind", ""), "disposition": disposition,
@@ -2421,7 +2586,46 @@ def record_disposition(conn: sqlite3.Connection, run_id: str, finding: dict,
             "authority": authority.strip(), "rationale": rationale.strip(),
             "target_owner": (target_owner or "").strip(),
             "clears_block": disposition in CLEARING_DISPOSITIONS,
+            "verified_historical": bool(verified_historical),
             "disp_id": cur.lastrowid, "resolved_at": stamp}
+
+
+def record_historical_disposition(conn: sqlite3.Connection, run_id: str,
+                                  finding: dict, authority: str,
+                                  rationale: str,
+                                  expected_fingerprint: str = "") -> dict:
+    """Record an evidence-bound historical disposition, or refuse.
+
+    Unlike :func:`record_disposition`, the clearance is NOT granted by the
+    caller's ``authority`` string or by ``run_id``: both remain attribution and
+    the namespace the successor's write gate will look the decision up under.
+    The Registry first re-verifies, against its own durable ledger, that the
+    finding is the clean preserved-unmerged leftover of a completed, released
+    claim (:func:`released_source_provenance`). A finding the ledger cannot
+    vouch for is refused outright, so no self-attributed provenance, run id or
+    copied annotation can waive a block: the block stands and the refusal is the
+    diagnostic.
+
+    When it does verify, the decision is a normal fingerprint-bound disposition
+    that also carries the durable ``verified_historical`` proof bit, so a later,
+    independent run may reuse it for the same exact leftover. Any change to
+    HEAD, branch, status, digest or scope withdraws it, and it is withdrawn the
+    moment the source stops re-verifying. It suppresses only the block; it
+    grants no claim, scope, release, push, merge or deployment right.
+    """
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise RegistryError("run id is required to record a disposition")
+    provenance = released_source_provenance(conn, finding)
+    if provenance is None:
+        raise RegistryError(
+            "no durable released-claim evidence verifies this finding as "
+            "historical leftover; refusing to waive a block the ledger cannot "
+            "vouch for")
+    result = _record_disposition(
+        conn, run_id, finding, DISPOSITION_HISTORICAL, authority, rationale, "",
+        expected_fingerprint, verified_historical=True)
+    result["released_source"] = provenance
+    return result
 
 
 def find_disposition(conn: sqlite3.Connection, run_id: str,
@@ -2432,14 +2636,62 @@ def find_disposition(conn: sqlite3.Connection, run_id: str,
     cannot make a stale decision match by passing its own stamp. A mismatch on
     any of the three means the evidence moved and the decision no longer
     describes what is there now.
+
+    When this run holds no decision of its own, one further source is consulted:
+    a historical decision another run recorded through the evidence-checked
+    recorder, for the same finding and fingerprint, while the ledger still
+    proves the same released leftover. This is the ONLY cross-run reuse, and it
+    is re-proved against the current ledger and live evidence on every lookup
+    (:func:`_find_reusable_historical_disposition`). A generic caller-attributed
+    disposition stays run-local: it is never returned for a different run.
     """
     key = finding.get("finding_key") or finding_key(finding)
     if not run_id or not key:
         return None
+    fingerprint = finding_fingerprint(finding)
     row = conn.execute(
         "SELECT * FROM dispositions WHERE run_id=? AND finding_key=? AND "
         "fingerprint=? ORDER BY disp_id DESC LIMIT 1",
-        (run_id, key, finding_fingerprint(finding))).fetchone()
+        (run_id, key, fingerprint)).fetchone()
+    if row is not None:
+        return dict(row)
+    return _find_reusable_historical_disposition(conn, key, fingerprint, finding)
+
+
+def _find_reusable_historical_disposition(conn: sqlite3.Connection, key: str,
+                                          fingerprint: str,
+                                          finding: dict) -> dict | None:
+    """A verified historical decision made under another run, or ``None``.
+
+    A decision one run recorded may clear the same preserved-unmerged leftover
+    as seen by a later, independent run, but never on the caller's word. Every
+    part of the original proof must still hold BEFORE the decision is handed
+    back, so reuse cannot outlive the evidence it was made against:
+
+    * the finding must re-verify against the ledger as the clean preserved
+      source of exactly one completed, released WRITE/EXCLUSIVE claim in this
+      repository identity and this checkout, on the still-attached, declared
+      branch, with every committed path inside the released scope
+      (:func:`released_source_provenance`) - so a live, dirty, detached, moved,
+      unknown, ambiguous, cross-repo or unaccepted source never gets here;
+    * the stored decision must bind the exact same finding identity and
+      recomputed fingerprint (the query below), so changed HEAD, branch, status,
+      digest or scope withdraws it;
+    * the decision must carry the ``verified_historical`` proof bit, so only a
+      decision the evidence-checked recorder made is reusable; a generic
+      caller-attributed ``historical`` stays run-local.
+
+    Anything short of all three returns ``None`` and the finding keeps blocking.
+    Reuse only suppresses the block: it releases no claim, grants no scope, and
+    confers no execution, release, push, merge or deployment right.
+    """
+    if released_source_provenance(conn, finding) is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM dispositions WHERE finding_key=? AND fingerprint=? "
+        "AND disposition=? AND verified_historical=1 "
+        "ORDER BY disp_id DESC LIMIT 1",
+        (key, fingerprint, DISPOSITION_HISTORICAL)).fetchone()
     return dict(row) if row is not None else None
 
 
