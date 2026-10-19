@@ -1185,6 +1185,128 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(result["pane_closed"], "w1:p1")
         self.assertTrue(result["claim"]["released"])
 
+    def test_review_head_marker_requires_one_exact_same_line_declaration(self):
+        """P4: exactly one same-line reviewed-HEAD declaration, new or legacy.
+
+        A narrow 55-column Mini terminal soft-wraps the long historical
+        ``CAO_REVIEWED_HEAD:`` marker, so new prompts ask for the compact
+        ``CAO_HEAD:`` marker that stays on one line; the historical marker is
+        still accepted for a review already in flight. Either marker must
+        appear exactly once, on a single line, carrying the exact accepted SHA.
+        """
+        approved = "CAO_REVIEW_VERDICT: APPROVED"
+        cases = (
+            ("compact", approved + "\nCAO_HEAD: " + A, "APPROVED"),
+            ("legacy", approved + "\nCAO_REVIEWED_HEAD: " + A, "APPROVED"),
+            ("compact changes requested",
+             "CAO_REVIEW_VERDICT: CHANGES_REQUESTED\nCAO_HEAD: " + A,
+             "CHANGES_REQUESTED"),
+            ("wrong compact sha", approved + "\nCAO_HEAD: " + B, None),
+            ("wrong legacy sha", approved + "\nCAO_REVIEWED_HEAD: " + B, None),
+            ("missing", approved, None),
+            ("malformed sha", approved + "\nCAO_HEAD: " + A.upper(), None),
+            ("short sha", approved + "\nCAO_HEAD: " + A[:-1], None),
+            ("split legacy",
+             approved + "\nCAO_REVIEWED_HEAD: " + A[:20] + "\n" + A[20:], None),
+            ("split compact",
+             approved + "\nCAO_HEAD: " + A[:20] + "\n" + A[20:], None),
+            ("duplicated compact",
+             approved + "\nCAO_HEAD: " + A + "\nCAO_HEAD: " + A, None),
+            ("mixed compact and legacy",
+             approved + "\nCAO_HEAD: " + A + "\nCAO_REVIEWED_HEAD: " + A, None),
+            ("two verdicts",
+             approved + "\n" + approved + "\nCAO_HEAD: " + A, None),
+        )
+        for label, output, verdict in cases:
+            with self.subTest(label=label):
+                self.assertEqual(team._review_verdict(output, A), verdict)
+
+    def test_review_head_marker_refuses_valid_plus_malformed_duplicate(self):
+        """P4: one valid HEAD plus any malformed extra declaration is refused.
+
+        Every anchored ``CAO_HEAD:`` / ``CAO_REVIEWED_HEAD:`` line is a
+        declaration regardless of whether its SHA is well formed, so a correct
+        40-hex declaration sitting next to a malformed one is never rounded up
+        to ``APPROVED``. Only the exact single-declaration output survives.
+        """
+        approved = "CAO_REVIEW_VERDICT: APPROVED"
+        malformed = (
+            ("CAO_HEAD: " + A.upper()),
+            ("CAO_HEAD: " + A[:-1]),
+            ("CAO_HEAD: not-a-sha"),
+            ("CAO_HEAD: " + A[:20]),
+            ("CAO_REVIEWED_HEAD: " + A.upper()),
+            ("CAO_REVIEWED_HEAD: " + A[:-1]),
+            ("CAO_REVIEWED_HEAD: invalid"),
+            ("CAO_REVIEWED_HEAD: " + A[:20]),
+        )
+        for marker in malformed:
+            for valid in ("CAO_HEAD: " + A, "CAO_REVIEWED_HEAD: " + A):
+                for order in ((valid, marker), (marker, valid)):
+                    output = approved + "\n" + "\n".join(order)
+                    label = valid.split(":")[0] + " + " + marker
+                    with self.subTest(valid=valid, marker=marker, order=order):
+                        self.assertIsNone(team._review_verdict(output, A))
+        # Only the single exact declaration is admitted.
+        self.assertEqual(
+            team._review_verdict(approved + "\nCAO_HEAD: " + A, A), "APPROVED")
+        self.assertEqual(
+            team._review_verdict(
+                approved + "\nCAO_REVIEWED_HEAD: " + A, A), "APPROVED")
+
+    def test_review_with_compact_head_marker_releases_and_closes(self):
+        """P4: the compact marker is accepted on the exact release path."""
+        repo = git_repo(self.root, name="review-compact-ok")
+        db = str(self.root / "review-compact-ok.sqlite3")
+        driver = FakeDriver()
+        ident = team._execution_id("squad", "a", "review", 0)
+        challenge = team._result_challenge(ident)
+        driver.read_text = (
+            "CAO_REVIEW_VERDICT: APPROVED\n"
+            "CAO_HEAD: " + A + "\n"
+            "CAO_TEAM_RESULT: " + challenge)
+        result = team._execute(
+            execution_id=ident,
+            task={"repo": str(repo), "mode": "write", "write_scope": ["a.txt"]},
+            prompt="review\nCAO_TEAM_NONCE_V2: " + challenge,
+            phase="review", config=self.config, driver=driver, env=self.env,
+            wait_ms=1000, registry_db=db, review_head=A)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["pane_closed"], "w1:p1")
+        self.assertTrue(result["claim"]["released"])
+
+    def test_new_reviewer_prompt_uses_the_compact_head_marker(self):
+        """P4: only the reviewed-HEAD marker is compacted in NEW prompts.
+
+        The exact separate ``CAO_REVIEW_VERDICT`` line and the held-out
+        completion nonce are unchanged, and the instruction keeps its prefix so
+        an echoed prompt can never itself parse as a declaration.
+        """
+        self.init(self.spec([task("a", self.paths[0], reviewer="reviewer")]))
+        dispatched = []
+
+        def fake(**kwargs):
+            dispatched.append((kwargs["phase"], kwargs["prompt"],
+                               kwargs["execution_id"]))
+            if kwargs["phase"] == "review":
+                return self.done(output="CAO_REVIEW_VERDICT: APPROVED\nCAO_HEAD: "
+                                       + A)
+            return self.done()
+
+        self.tick(fake)
+        result = self.tick(fake)
+        review = [item for item in dispatched if item[0] == "review"]
+        self.assertEqual(len(review), 1)
+        _, prompt, execution_id = review[0]
+        self.assertIn("CAO_HEAD: " + A, prompt)
+        self.assertNotIn("CAO_REVIEWED_HEAD", prompt)
+        self.assertIn("CAO_REVIEW_VERDICT: APPROVED or "
+                      "CAO_REVIEW_VERDICT: CHANGES_REQUESTED", prompt)
+        nonce = team._result_challenge(execution_id)
+        self.assertIn("CAO_TEAM_NONCE_V2: " + nonce, prompt)
+        self.assertNotIn("CAO_TEAM_RESULT: " + nonce, prompt)
+        self.assertEqual(result["status"], "COMPLETE")
+
     def test_focused_idle_read_with_receipt_completes_and_is_idempotent(self):
         # A focused tab reports IDLE for the same settled completion an unseen
         # background worker reports as DONE. The team admits it only because
