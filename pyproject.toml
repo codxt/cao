@@ -29,6 +29,9 @@ classifiers = [
 # checkout. Groups this product CLI does not own are answered by the module that
 # owns them (see ``cao.product_cli.main``), keeping every documented command.
 cao = "cao.product_cli:main"
+# A purpose-specific disposition control surface. It is separate from the
+# product CLI and is the only entry that owns the four disposition verbs.
+cao-disposition = "cao.disposition_cli:main"
 
 # Runtime plugins register under the "cao.runtime_plugins" entry-point group.
 # No plugin ships as a built-in default: an entry point registers a plugin, and
