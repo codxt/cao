@@ -103,8 +103,8 @@ LIVE = "LIVE"
 
 # Diagnostic sub-status for a DISCOVERED_UNREGISTERED finding that the ledger
 # proves is the clean preserved-unmerged leftover of a completed, released
-# claim. It is a classification, not a waiver: the finding keeps its blocking
-# kind until an explicit, fingerprint-bound historical disposition clears it.
+# claim. Provenance is independent of quiet-source admission and explicit,
+# fingerprint-bound dispositions.
 RELEASED_UNMERGED = "released_unmerged_source"
 
 # The one persisted reconciliation record kind: a whole current-state snapshot
@@ -1117,7 +1117,7 @@ _PROBE_VALIDATORS = {
 }
 
 
-def _canonical_probe(probe, kind: str):
+def _canonical_probe(probe, kind: str, worktree: str = ""):
     """The ONE schema decision for a probe result.
 
     Returns a canonical PLAIN COPY only when the probe's ``ok`` flag, exact
@@ -1130,14 +1130,18 @@ def _canonical_probe(probe, kind: str):
         validator = _PROBE_VALIDATORS.get(kind)
         if validator is None:
             return None
-        return validator(probe)
+        canonical = validator(probe)
+        if canonical is None or (worktree
+                                 and canonical.get("worktree") != worktree):
+            return None
+        return canonical
     except Exception:  # noqa: BLE001 - a validator never raises
         return None
 
 
-def _probe_items(probe, kind: str):
+def _probe_items(probe, kind: str, worktree: str = ""):
     """Validated ``items`` for a probe, or ``None`` on any mismatch."""
-    canonical = _canonical_probe(probe, kind)
+    canonical = _canonical_probe(probe, kind, worktree)
     if canonical is None:
         return None
     return canonical["items"]
@@ -1512,6 +1516,25 @@ def reconcile(conn: sqlite3.Connection, evidence: dict) -> dict:
         }
 
 
+def _is_quiet_source(finding: dict) -> bool:
+    """Verified clean attached source, with no bound runtime agent."""
+    return (
+        not finding.get("unverifiable")
+        and not finding.get("committed_unknown")
+        and not finding.get("dirty_digest_unknown")
+        and not finding.get("worker_state_unknown")
+        and not finding.get("live") and not finding.get("agents")
+        and not finding.get("workers")
+        and not finding.get("detached")
+        and git.valid_short_ref(finding.get("branch"))
+        and git.valid_commit_id(finding.get("head"))
+        and finding.get("changes") == []
+        and finding.get("status_codes") == []
+        and finding.get("dirty_digest") == ""
+        and type(finding.get("committed")) is list
+    )
+
+
 def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
     """Compare this repository's open claims against live evidence.
 
@@ -1612,6 +1635,10 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
             continue
 
         tree = worktree_by_path[worktree]
+        if tree["locked"] or tree["prunable"]:
+            entry.update(kind=UNKNOWN, status="worktree_ambiguous",
+                         unverifiable=True)
+            continue
         live_here = [a for a in live_by_path.get(worktree, [])
                      if a["liveness"] == "ACTIVE"]
         others = [a for a in live_by_path.get(worktree, [])
@@ -1634,7 +1661,7 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
                 claim["branch"], tree.get("branch") or "(detached)")
 
         status = git.probe_status(worktree)
-        status_items = _probe_items(status, "status")
+        status_items = _probe_items(status, "status", worktree)
         if status_items is None:
             entry["status"] = "unknown"
             entry["status_unknown"] = True
@@ -1647,7 +1674,7 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
             "%s%s" % (c.get("index", "?"), c.get("worktree", "?"))
             for c in status_items})
         digest = git.probe_dirty_digest(worktree)
-        canonical_digest = _canonical_probe(digest, "dirty_digest")
+        canonical_digest = _canonical_probe(digest, "dirty_digest", worktree)
         if canonical_digest is not None:
             # Read ONLY the canonical copy, never the caller's object.
             entry["dirty_digest"] = canonical_digest["digest"]
@@ -1658,7 +1685,8 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
 
         if baseline:
             committed_items = _probe_items(
-                git.probe_committed_diff(worktree, baseline), "committed")
+                git.probe_committed_diff(worktree, baseline), "committed",
+                worktree)
             if committed_items is not None:
                 entry["committed"] = committed_items
             else:
@@ -1689,7 +1717,7 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
         others = [a for a in live_by_path.get(path, [])
                   if a["liveness"] != "ACTIVE"]
         status = git.probe_status(path)
-        status_items = _probe_items(status, "status")
+        status_items = _probe_items(status, "status", path)
         entry = {
             "kind": DISCOVERED_UNREGISTERED,
             "status": "discovered_unregistered",
@@ -1701,6 +1729,11 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
             "agents": [_agent_identity(a) for a in live_here + others],
             "scope_known": True,
         }
+        if tree["locked"] or tree["prunable"]:
+            entry.update(kind=UNKNOWN, status="worktree_ambiguous",
+                         unverifiable=True)
+            findings.append(entry)
+            continue
         if status_items is None:
             entry.update(kind=UNKNOWN, status="unknown", unverifiable=True,
                          detail=_diagnostic(status))
@@ -1714,7 +1747,7 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
             "%s%s" % (c.get("index", "?"), c.get("worktree", "?"))
             for c in status_items})
         digest = git.probe_dirty_digest(path)
-        canonical_digest = _canonical_probe(digest, "dirty_digest")
+        canonical_digest = _canonical_probe(digest, "dirty_digest", path)
         if canonical_digest is not None:
             # Read ONLY the canonical copy, never the caller's object.
             entry["dirty_digest"] = canonical_digest["digest"]
@@ -1724,7 +1757,7 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
             entry["detail"] = _diagnostic(digest)
         if baseline:
             committed_items = _probe_items(
-                git.probe_committed_diff(path, baseline), "committed")
+                git.probe_committed_diff(path, baseline), "committed", path)
             if committed_items is not None:
                 entry["committed"] = committed_items
             else:
@@ -1737,23 +1770,16 @@ def _reconcile_inner(conn: sqlite3.Connection, evidence: dict) -> dict:
         if any(a.get("liveness") == UNKNOWN_LIVENESS for a in others):
             entry["worker_state_unknown"] = True
             entry["unverifiable"] = True
-        # Distinguish a completed released claim's clean preserved source from
-        # active/unknown work. This is diagnostic only: the finding keeps its
-        # blocking kind until an explicit, fingerprint-bound historical
-        # disposition clears it, and an unverifiable worktree is never labelled.
+        # Keep ledger-verified release provenance distinct from quiet inventory.
         released = released_source_provenance(conn, entry)
         if released is not None:
             entry["released_source"] = released
             entry["status"] = RELEASED_UNMERGED
-        if not live_here and not entry["touched"] and not others \
-                and not entry.get("committed_unknown") \
-                and not entry.get("dirty_digest_unknown") \
-                and not entry.get("unverifiable"):
-            # A quiet idle worktree with no changes, no committed divergence,
-            # no worker of any state AND no unreadable evidence is not
-            # discovery. "Nothing to report" and "nothing could be reported"
-            # are different claims, and only the first stays quiet.
-            continue
+        if _is_quiet_source(entry):
+            if not entry["committed"]:
+                continue
+            if released is None:
+                entry["status"] = "quiet_preserved_source"
         findings.append(entry)
 
     stamp_findings(findings)
@@ -1871,6 +1897,12 @@ def _candidate_checkout_refusal(spec: ClaimSpec, evidence: dict,
                       errors=["declared checkout is not a worktree of this "
                               "repository: %s" % real],
                       unverifiable=True)
+    current = _probe_items(git.probe_worktrees(real), "worktrees")
+    if current is None or tree != next(
+            (t for t in current if t["path"] == real), None):
+        return refuse(NEEDS_RECONCILIATION,
+                      errors=["declared checkout identity changed during probe"],
+                      unverifiable=True)
     actual_branch = tree.get("branch") or ""
     if tree.get("detached") or not actual_branch:
         if spec.branch:
@@ -1900,29 +1932,26 @@ def _candidate_checkout_refusal(spec: ClaimSpec, evidence: dict,
 
 
 def _is_self_bootstrap(finding: dict, spec: ClaimSpec,
-                       worktree_real: str) -> bool:
+                       worktree_real: str, scope: list[str]) -> bool:
     """Is this unregistered work just the claimant arriving to register itself?
 
     Requires ALL of: the finding is the exact worktree this claim declares; the
     claim itself declares a branch; that declared branch matches the
     worktree's actual branch exactly; the checkout is on a known, attached
-    branch; a clean tree; and known ZERO committed scope. Occupancy is
-    deliberately not part of this test: a supervised session puts a manager and
-    a worker in the same worktree before registration, and a second occupant is
-    not evidence of a second *writer*.
+    branch; verified clean source inside the declared scope; and no bound
+    agent. Runtime session identity alone does not prove claim ownership.
     """
     if not worktree_real or finding.get("worktree") != worktree_real:
         return False
-    if finding.get("changes") or finding.get("committed"):
-        return False
-    if finding.get("committed_unknown") or finding.get("dirty_digest_unknown"):
+    if not _is_quiet_source(finding):
         return False
     if not spec.branch:
         return False
     actual = finding.get("branch") or finding.get("worktree_branch") or ""
     if not actual or finding.get("detached"):
         return False
-    return spec.branch == actual
+    return spec.branch == actual and all(
+        _paths_within(path, scope) for path in finding["committed"])
 
 
 def _scope_signature(conn: sqlite3.Connection, spec: ClaimSpec) -> tuple | None:
@@ -2091,7 +2120,14 @@ def _write_gate_inner(conn, spec: ClaimSpec, evidence, persist_run) -> dict | No
                 "against_owner": f["owner"], "against_claim": f["claim_id"],
                 "escaped": f["escaped"]} for f in drift])
 
-    stale = [f for f in findings if f["kind"] == STALE_DIRTY and overlaps(f)]
+    incumbent = get_open_claim(conn, spec.run_id, spec.work_key, spec.issue,
+                               spec.owner)
+    stale = [f for f in findings if f["kind"] == STALE_DIRTY and overlaps(f)
+             and not (incumbent is not None
+                      and f["claim_id"] == incumbent["claim_id"]
+                      and _is_quiet_source(f)
+                      and find_disposition(conn, run_for_disposition, f)
+                      is None)]
     stale, stale_resolved = _apply_dispositions(conn, run_for_disposition, stale)
     if stale:
         return refuse(
@@ -2111,7 +2147,11 @@ def _write_gate_inner(conn, spec: ClaimSpec, evidence, persist_run) -> dict | No
     discovered, discovered_resolved = _apply_dispositions(
         conn, run_for_disposition, discovered)
     blocking = [d for d in discovered
-                if not _is_self_bootstrap(d, spec, worktree_real)]
+                if find_disposition(conn, run_for_disposition, d) is not None
+                or not (
+                    (d["worktree"] != worktree_real and _is_quiet_source(d))
+                    or _is_self_bootstrap(d, spec, worktree_real,
+                                          _unpack(work["paths"])))]
     if blocking:
         return refuse(
             CONFLICT,

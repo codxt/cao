@@ -10,7 +10,9 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -185,6 +187,193 @@ class UnregisteredWorkTests(RegistryTestCase):
     def test_clean_quiet_worktree_is_not_discovery(self) -> None:
         report = registry.reconcile(self.conn, self.evidence())
         self.assertEqual(report["findings"], [])
+
+
+class QuietSourceTests(RegistryTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.history = self.checkout("history")
+        (self.history / "src/app.py").write_text("print('history')\n")
+        run_git(self.history, "commit", "-am", "preserved source")
+        self.candidate = self.checkout("candidate", "history")
+        self.propose("candidate", ["src"])
+        self.spec = ClaimSpec("run", "candidate", "writer", "WRITE",
+                              branch="candidate", worktree=str(self.candidate))
+
+    def checkout(self, branch, start="main"):
+        path = self.root / branch
+        run_git(self.repo, "worktree", "add", "-b", branch, str(path), start)
+        return path
+
+    def assert_refused(self, observation=EMPTY):
+        for operation in (registry.preflight, registry.claim):
+            result = operation(self.conn, self.spec, observation)
+            self.assertFalse(result["ok"], result)
+        self.assertEqual(registry.list_active_claims(self.conn), [])
+
+    def test_multiple_quiet_branches_are_inventory_without_mutation(self):
+        other = self.checkout("older")
+        (other / "src/app.py").write_text("print('older')\n")
+        run_git(other, "commit", "-am", "older source")
+        trees = (self.history, other, self.candidate)
+        before = {str(p): (head_of(p), run_git(p, "status", "--porcelain"),
+                           (p / "src/app.py").read_text()) for p in trees}
+        report = registry.reconcile(self.conn, registry.gather_evidence(
+            str(self.repo), EMPTY, str(self.candidate)))
+        for tree in trees:
+            finding = next(f for f in report["findings"]
+                           if f["worktree"] == str(tree))
+            self.assertEqual(finding["kind"], registry.DISCOVERED_UNREGISTERED)
+            self.assertEqual(finding["committed"], ["src/app.py"])
+            self.assertEqual(finding["status"], "quiet_preserved_source")
+        for _ in range(2):
+            self.assertTrue(registry.preflight(self.conn, self.spec, EMPTY)["ok"])
+        first = registry.claim(self.conn, self.spec, EMPTY)
+        self.assertEqual(first["status"], registry.CLAIMED)
+        resumed = registry.claim(self.conn, self.spec, EMPTY)
+        self.assertEqual(resumed["status"], registry.RESUMED)
+        self.assertEqual(first["claim_id"], resumed["claim_id"])
+        self.assertEqual(len(registry.list_active_claims(self.conn)), 1)
+        self.assertEqual(before, {str(p): (
+            head_of(p), run_git(p, "status", "--porcelain"),
+            (p / "src/app.py").read_text()) for p in trees})
+        self.assertEqual(registry.list_dispositions(self.conn, "run"), [])
+
+    def test_candidate_occupancy_is_not_self_ownership(self):
+        for tree in (self.history, self.candidate):
+            for state in ("working", "unknown", "exited"):
+                with self.subTest(tree=tree.name, state=state):
+                    self.assert_refused(RuntimeObservation(True, (
+                        AgentObservation("foreign", str(tree), state,
+                                         session_id="foreign-session"),)))
+
+    def test_clean_candidate_without_divergence_still_refuses_active_agent(self):
+        self.spec = ClaimSpec("run", "candidate", "writer", "WRITE",
+                              branch="main", worktree=str(self.repo))
+        self.assert_refused(RuntimeObservation(True, (
+            AgentObservation("foreign", str(self.repo), "working"),)))
+
+    def test_dirty_staged_and_untracked_checkouts_refuse(self):
+        for tree in (self.history, self.candidate):
+            for kind in ("dirty", "staged", "untracked"):
+                with self.subTest(tree=tree.name, kind=kind):
+                    path = tree / ("new.txt" if kind == "untracked"
+                                   else "src/app.py")
+                    original = path.read_text() if path.exists() else None
+                    path.write_text("uncommitted\n")
+                    if kind == "staged":
+                        run_git(tree, "add", str(path))
+                    self.assert_refused()
+                    if kind == "staged":
+                        run_git(tree, "restore", "--staged", str(path))
+                    if original is None:
+                        path.unlink()
+                    else:
+                        path.write_text(original)
+
+    def test_unreadable_required_probes_refuse(self):
+        for name in ("probe_status", "probe_dirty_digest", "probe_baseline_ref",
+                     "probe_committed_diff", "probe_worktrees"):
+            with self.subTest(probe=name), mock.patch.object(
+                    registry.git, name, return_value={"ok": False}):
+                self.assert_refused()
+
+    def test_inconsistent_dirty_digest_refuses(self):
+        probe = git.probe_dirty_digest(str(self.candidate))
+        probe.update(clean=False, digest="a" * 16)
+        with mock.patch.object(registry.git, "probe_dirty_digest",
+                               return_value=probe):
+            self.assert_refused()
+
+    def test_probes_bound_to_another_checkout_refuse(self):
+        for name in ("probe_status", "probe_dirty_digest", "probe_committed_diff"):
+            original = getattr(registry.git, name)
+
+            def wrong_checkout(*args):
+                probe = original(*args)
+                probe["worktree"] = str(self.repo)
+                return probe
+
+            with self.subTest(probe=name), mock.patch.object(
+                    registry.git, name, side_effect=wrong_checkout):
+                self.assert_refused()
+
+    def test_missing_baseline_refuses(self):
+        probe = {"ok": True, "source": "git", "reason": "", "error": "",
+                 "items": []}
+        with mock.patch.object(registry.git, "probe_baseline_ref",
+                               return_value=probe):
+            self.assert_refused()
+
+    def test_wrong_branch_and_detached_candidate_refuse(self):
+        run_git(self.candidate, "checkout", "-b", "wrong")
+        self.assert_refused()
+        run_git(self.candidate, "checkout", "--detach")
+        self.assert_refused()
+
+    def test_clean_head_mismatch_refuses(self):
+        evidence = registry.gather_evidence(str(self.repo), EMPTY,
+                                            str(self.candidate))
+        next(t for t in evidence["worktrees"]["items"]
+             if t["path"] == str(self.candidate))["head"] = head_of(self.repo)
+        result = registry.write_gate(self.conn, self.spec, evidence)
+        self.assertIsNotNone(result)
+        self.assertFalse(result["ok"])
+
+    def test_locked_and_prunable_evidence_refuses(self):
+        for tree in (self.history, self.candidate):
+            for flag in ("locked", "prunable"):
+                probe = git.probe_worktrees(str(self.repo))
+                next(t for t in probe["items"]
+                     if t["path"] == str(tree))[flag] = True
+                with self.subTest(tree=tree.name, flag=flag), mock.patch.object(
+                        registry.git, "probe_worktrees", return_value=probe):
+                    self.assert_refused()
+
+    def test_candidate_committed_scope_escape_refuses(self):
+        (self.candidate / "outside.txt").write_text("outside change\n")
+        run_git(self.candidate, "commit", "-am", "outside candidate scope")
+        self.assert_refused()
+
+    def test_foreign_claim_is_preserved(self):
+        registry.propose(self.conn, "foreign", "held", str(self.repo),
+                         paths=["src"])
+        held = registry.claim(self.conn, ClaimSpec(
+            "foreign", "held", "controller", "WRITE", branch="main",
+            worktree=str(self.repo)), EMPTY)
+        self.assertEqual(held["status"], registry.CLAIMED)
+        before = registry.list_active_claims(self.conn)
+        result = registry.claim(self.conn, self.spec, EMPTY)
+        self.assertEqual(result["status"], registry.CONFLICT)
+        self.assertEqual(before, registry.list_active_claims(self.conn))
+
+    def test_concurrent_claims_have_one_writer(self):
+        rival = self.checkout("rival", "history")
+        self.propose("rival", ["src"])
+        rival_spec = ClaimSpec("run", "rival", "other", "WRITE",
+                               branch="rival", worktree=str(rival))
+
+        def acquire(spec):
+            conn = registry.connect(self.db)
+            try:
+                return registry.claim(conn, spec, EMPTY)
+            finally:
+                conn.close()
+
+        gate = registry.write_gate
+        barrier = threading.Barrier(2)
+
+        def gated(*args, **kwargs):
+            result = gate(*args, **kwargs)
+            barrier.wait(timeout=10)
+            return result
+
+        with mock.patch.object(registry, "write_gate", side_effect=gated), \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(acquire, (self.spec, rival_spec)))
+        self.assertEqual(sorted(r["status"] for r in results),
+                         sorted((registry.CLAIMED, registry.CONFLICT)))
+        self.assertEqual(len(registry.list_active_claims(self.conn)), 1)
 
 
 class DriftTests(RegistryTestCase):
@@ -1588,17 +1777,14 @@ class ReleasedSourceTests(_ReleasedSourceMixin, RegistryTestCase):
         self.assertEqual(finding["released_source"]["scope"], ["src"])
         self.assertIn("src/app.py", finding["committed"])
 
-    def test_reconcile_alone_does_not_waive_the_block(self) -> None:
+    def test_quiet_released_source_needs_no_disposition(self) -> None:
         linked, head = self.feature_leftover()
         self.propose("b", ["src/app.py"])
-        # Classification is diagnostic only: with no explicit disposition the
-        # released leftover still blocks an independent writer.
+        # Admission of clean source does not imply acceptance or disposition.
         refusal = registry.write_gate(self.conn, self.feature_spec(),
                                       self.feature_evidence())
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal["status"], registry.CONFLICT)
-        self.assertEqual(refusal["conflicts"][0]["kind"],
-                         "discovered_unregistered")
+        self.assertIsNone(refusal)
+        self.assertEqual(registry.list_dispositions(self.conn, "run"), [])
 
     def test_evidence_bound_disposition_clears_the_block(self) -> None:
         linked, head = self.feature_leftover()
@@ -1635,9 +1821,8 @@ class ReleasedSourceTests(_ReleasedSourceMixin, RegistryTestCase):
         self.propose("b", ["src/app.py"])
         refusal = registry.write_gate(self.conn, self.feature_spec(),
                                       self.feature_evidence())
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal["conflicts"][0]["kind"],
-                         "discovered_unregistered")
+        # The old disposition is invalid, but fresh quiet source can admit.
+        self.assertIsNone(refusal)
 
     def test_dirty_released_leftover_is_not_cleared(self) -> None:
         linked, head = self.feature_leftover()
@@ -1850,9 +2035,8 @@ class HistoricalReuseTests(_ReleasedSourceMixin, RegistryTestCase):
         self.propose_for("run2", "b", ["src/app.py"])
         refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
                                       self.feature_evidence())
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal["conflicts"][0]["kind"],
-                         "discovered_unregistered")
+        # No disposition was reused; fresh quiet-source admission is separate.
+        self.assertIsNone(refusal)
 
     def test_dirty_leftover_is_not_reused(self) -> None:
         linked, head, finding, result = self.accept_historical("run")
@@ -1870,9 +2054,9 @@ class HistoricalReuseTests(_ReleasedSourceMixin, RegistryTestCase):
         self.propose_for("run2", "b", ["src/app.py"])
         refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
                                       self.feature_evidence())
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal["conflicts"][0]["kind"],
-                         "discovered_unregistered")
+        # Quiet-source admission neither accepts commits nor creates a decision.
+        self.assertIsNone(refusal)
+        self.assertEqual(registry.list_dispositions(self.conn, "run2"), [])
 
     def test_generic_caller_attributed_historical_stays_run_local(self) -> None:
         linked, head = self.feature_leftover()
@@ -1891,7 +2075,8 @@ class HistoricalReuseTests(_ReleasedSourceMixin, RegistryTestCase):
         self.propose_for("run2", "b", ["src/app.py"])
         refusal = registry.write_gate(self.conn, self.successor_spec("run2"),
                                       self.feature_evidence())
-        self.assertIsNotNone(refusal)
+        # The generic decision stays run-local; quiet-source admission is new.
+        self.assertIsNone(refusal)
 
     def test_a_live_occupant_blocks_reuse(self) -> None:
         linked, head, finding, result = self.accept_historical("run")
