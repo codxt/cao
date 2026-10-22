@@ -1,16 +1,21 @@
 """Tests for the runtime CLI driver.
 
-Every test injects a fake runner; nothing here touches a live runtime. The
-suite pins argv construction (lists, never shell strings), refusal of unsafe
-bare arguments before any call, response binding, and sanitized failures.
+No test touches a live runtime. Most tests inject a fake runner; the transport
+tests substitute ``subprocess.run`` with a recording mock or run a temporary
+local executable, so they pin deadlines without contacting a provider. The
+suite also pins argv construction (lists, never shell strings), refusal of
+unsafe bare arguments before any call, response binding, and sanitized
+failures.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from cao import product_driver
 from cao.product_driver import RuntimeDriver
@@ -310,6 +315,89 @@ class AgentTests(unittest.TestCase):
         driver = RuntimeDriver(runner=runner)
         result = driver.agent_wait("cao1", until=("idle", "done"))
         self.assertEqual(product_driver.wait_state(result), "done")
+
+
+class TransportDeadlineTests(unittest.TestCase):
+    """The managed-CLI transport must never undercut a native deadline."""
+
+    def _capture(self, stdout: str, call):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured["timeout"] = kwargs["timeout"]
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+        with mock.patch.object(
+            product_driver.subprocess, "run", side_effect=fake_run
+        ):
+            result = call(RuntimeDriver(executable="/fake/runtime", timeout=30.0))
+        return result, captured
+
+    def test_native_deadlines_get_five_seconds_of_transport_grace(self) -> None:
+        _, prompt = self._capture(
+            envelope(
+                "agent_prompted",
+                agent={
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "agent_status": "working",
+                },
+            ),
+            lambda driver: driver.agent_prompt(
+                "cao1", "Review this", timeout_ms=300_000, wait=True
+            ),
+        )
+        self.assertEqual(prompt["timeout"], 305.0)
+
+        _, started = self._capture(
+            envelope("agent_started", agent={"pane_id": "w1:p1"}),
+            lambda driver: driver.agent_start(
+                "cao1", "opencode", "w1:p1", timeout_ms=120_000
+            ),
+        )
+        self.assertEqual(started["timeout"], 125.0)
+
+        _, waited = self._capture(
+            envelope("agent_wait", state="done"),
+            lambda driver: driver.agent_wait(
+                "cao1", until=("done",), timeout_ms=300_000
+            ),
+        )
+        self.assertEqual(waited["timeout"], 305.0)
+
+    def test_non_wait_prompt_keeps_the_standard_transport_deadline(self) -> None:
+        result, captured = self._capture(
+            envelope(
+                "agent_prompted",
+                agent={"pane_id": "w1:p1", "workspace_id": "w1"},
+            ),
+            lambda driver: driver.agent_prompt(
+                "cao1", "Review this", timeout_ms=300_000
+            ),
+        )
+        self.assertEqual(result["agent_pane_id"], "w1:p1")
+        self.assertEqual(captured["timeout"], 30.0)
+        self.assertEqual(
+            captured["argv"][1:], ["agent", "prompt", "cao1", "Review this"]
+        )
+
+    def test_non_wait_prompt_ignores_a_malformed_timeout(self) -> None:
+        # Original semantics: a non-wait call has no native timeout, so the
+        # argument is ignored rather than interpreted or rejected.
+        _, captured = self._capture(
+            envelope(
+                "agent_prompted",
+                agent={"pane_id": "w1:p1", "workspace_id": "w1"},
+            ),
+            lambda driver: driver.agent_prompt(
+                "cao1", "Review this", timeout_ms="not-a-timeout"
+            ),
+        )
+        self.assertEqual(captured["timeout"], 30.0)
+        self.assertEqual(
+            captured["argv"][1:], ["agent", "prompt", "cao1", "Review this"]
+        )
 
 
 class FailureTests(unittest.TestCase):

@@ -535,7 +535,12 @@ class RuntimeDriver:
             if timeout_ms is not None:
                 timeout_ms = _bounded_timeout_ms(timeout_ms, timeout_ms)
                 command += ["--timeout", str(timeout_ms)]
-        result = _read_envelope(self._run(command, timeout_ms), ("agent_prompted",))
+        # Without ``--wait`` there is no native deadline and no native
+        # ``--timeout``; the transport keeps its standard bound and any
+        # caller-supplied timeout_ms remains ignored exactly as before.
+        result = _read_envelope(
+            self._run(command, timeout_ms if wait else None), ("agent_prompted",)
+        )
         agent = _require_mapping(result, "agent")
         acknowledged = {
             "agent_pane_id": _require_str(agent, "pane_id", "agent pane id"),
