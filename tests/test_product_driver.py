@@ -8,7 +8,9 @@ bare arguments before any call, response binding, and sanitized failures.
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from cao import product_driver
 from cao.product_driver import RuntimeDriver
@@ -214,6 +216,29 @@ class AgentTests(unittest.TestCase):
         out = driver.agent_prompt("cao1", "Review this", timeout_ms=5000, wait=True)
         self.assertEqual(runner.calls, [list(argv)])
         self.assertTrue(out["activity_observed"])
+        self.assertEqual(out["observed_state"], "working")
+
+    def test_agent_prompt_wait_outlives_the_transport_timeout(self) -> None:
+        # ``agent prompt --wait --timeout 1000`` asked the runtime to wait one
+        # second, so the transport's 0.1s default must not kill it first. The
+        # native deadline is the larger bound; the transport only adds grace
+        # for the runtime's own bounded error.
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "runtime"
+            script.write_text(
+                "#!/bin/sh\n"
+                "sleep 0.4\n"
+                "printf '%s\\n' "
+                "'{\"id\":\"cli:test\",\"result\":{\"type\":\"agent_prompted\","
+                "\"agent\":{\"pane_id\":\"w1:p1\",\"workspace_id\":\"w1\","
+                "\"agent_status\":\"working\"}}}'\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+            driver = RuntimeDriver(executable=str(script), timeout=0.1)
+            out = driver.agent_prompt(
+                "cao1", "Review this", timeout_ms=1000, wait=True
+            )
         self.assertEqual(out["observed_state"], "working")
 
     def test_agent_prompt_wait_without_a_state_is_a_protocol_error(self) -> None:

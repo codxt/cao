@@ -49,6 +49,10 @@ DEFAULT_TIMEOUT = 30.0
 MIN_TIMEOUT_MS = 1
 MAX_TIMEOUT_MS = 300_000
 
+#: Extra transport time beyond a native ``--timeout`` so a bounded runtime can
+#: answer with its own typed failure instead of being killed by the transport.
+_NATIVE_TIMEOUT_GRACE = 5.0
+
 #: Terminal-snapshot sources the runtime documents for a read.
 READ_SOURCES = ("visible", "recent", "recent-unwrapped", "detection")
 #: Lifecycle states the runtime documents for a wait.
@@ -202,26 +206,33 @@ def _error_from_stderr(stderr: str, returncode: int) -> DriverError:
     return DriverTransportError(f"runtime command failed with exit code {returncode}")
 
 
-def _subprocess_runner(executable: str | None, timeout: float) -> Runner:
-    """Build the default transport over the managed runtime's installed path."""
+class _SubprocessRunner:
+    """Run the managed CLI with a transport deadline of its own.
 
-    if not isinstance(executable, str) or not executable:
-        raise DriverUnavailable("no managed runtime executable is configured")
+    The deadline is per call: a command that carries a native ``--timeout``
+    needs at least that long to answer, otherwise the transport would kill a
+    live command before the runtime can report what it observed.
+    """
 
-    def run(argv: Sequence[str]) -> str:
+    def __init__(self, executable: str, timeout: float) -> None:
+        self._executable = executable
+        self._timeout = timeout
+
+    def __call__(self, argv: Sequence[str], timeout: float | None = None) -> str:
+        deadline = self._timeout if timeout is None else max(self._timeout, timeout)
         failure: str | None = None
         process: subprocess.CompletedProcess[str] | None = None
         try:
             process = subprocess.run(
-                [executable, *argv],
+                [self._executable, *argv],
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=deadline,
             )
         except FileNotFoundError:
             failure = "runtime executable was not found"
         except subprocess.TimeoutExpired:
-            failure = f"runtime command timed out after {timeout}s"
+            failure = f"runtime command timed out after {deadline}s"
         except OSError:
             failure = "runtime command could not be executed"
         if failure is not None:
@@ -232,7 +243,13 @@ def _subprocess_runner(executable: str | None, timeout: float) -> Runner:
             raise _error_from_stderr(process.stderr or "", process.returncode)
         return process.stdout
 
-    return run
+
+def _subprocess_runner(executable: str | None, timeout: float) -> Runner:
+    """Build the default transport over the managed runtime's installed path."""
+
+    if not isinstance(executable, str) or not executable:
+        raise DriverUnavailable("no managed runtime executable is configured")
+    return _SubprocessRunner(executable, timeout)
 
 
 def _read_envelope(stdout: str, expected_types: Sequence[str]) -> Mapping[str, Any]:
@@ -307,6 +324,19 @@ class RuntimeDriver:
         self._runner: Runner = (
             runner if runner is not None else _subprocess_runner(executable, timeout)
         )
+
+    def _run(self, argv: Sequence[str], timeout_ms: int | None = None) -> str:
+        """Run one command, letting a native deadline govern the transport.
+
+        Injected runners stay one-argument callables. Only the managed-CLI
+        transport knows how to accept the larger deadline a native ``--timeout``
+        requires.
+        """
+
+        runner = self._runner
+        if timeout_ms is not None and isinstance(runner, _SubprocessRunner):
+            return runner(argv, timeout=timeout_ms / 1000.0 + _NATIVE_TIMEOUT_GRACE)
+        return runner(argv)
 
     # -- workspaces --------------------------------------------------------
 
@@ -465,7 +495,8 @@ class RuntimeDriver:
             _require_id(pane_id, "pane id"),
         ]
         if timeout_ms is not None:
-            command += ["--timeout", str(_bounded_timeout_ms(timeout_ms, timeout_ms))]
+            timeout_ms = _bounded_timeout_ms(timeout_ms, timeout_ms)
+            command += ["--timeout", str(timeout_ms)]
         extra: list[str] = []
         for arg in argv:
             if not isinstance(arg, str):
@@ -475,7 +506,7 @@ class RuntimeDriver:
             # Native agent arguments follow ``--``; flags there are safe.
             command.append("--")
             command.extend(extra)
-        result = _read_envelope(self._runner(command), ("agent_started",))
+        result = _read_envelope(self._run(command, timeout_ms), ("agent_started",))
         agent = _require_mapping(result, "agent")
         return {
             "agent_pane_id": _require_str(agent, "pane_id", "agent pane id"),
@@ -502,8 +533,9 @@ class RuntimeDriver:
             for state in PROMPT_ACTIVITY_STATES:
                 command += ["--until", state]
             if timeout_ms is not None:
-                command += ["--timeout", str(_bounded_timeout_ms(timeout_ms, timeout_ms))]
-        result = _read_envelope(self._runner(command), ("agent_prompted",))
+                timeout_ms = _bounded_timeout_ms(timeout_ms, timeout_ms)
+                command += ["--timeout", str(timeout_ms)]
+        result = _read_envelope(self._run(command, timeout_ms), ("agent_prompted",))
         agent = _require_mapping(result, "agent")
         acknowledged = {
             "agent_pane_id": _require_str(agent, "pane_id", "agent pane id"),
@@ -558,8 +590,9 @@ class RuntimeDriver:
                 raise DriverUsageError(f"unsupported wait state {state!r}")
             command += ["--until", state]
         if timeout_ms is not None:
-            command += ["--timeout", str(_bounded_timeout_ms(timeout_ms, timeout_ms))]
+            timeout_ms = _bounded_timeout_ms(timeout_ms, timeout_ms)
+            command += ["--timeout", str(timeout_ms)]
         result = _read_envelope(
-            self._runner(command), ("agent_wait", "agent_waited", "agent_info")
+            self._run(command, timeout_ms), ("agent_wait", "agent_waited", "agent_info")
         )
         return dict(result)
