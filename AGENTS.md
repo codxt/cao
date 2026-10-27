@@ -96,7 +96,7 @@ operational values.
 
 ## Root-cause and behavioral test discipline
 
-For changes to product code, apply the BRAIN `ub-mode` methodology if available: first reproduce the defect with a focused failing test or concrete discriminating check; fix the cause rather than suppressing errors or disguising `UNKNOWN`/`UNAVAILABLE`; keep edits minimal. Challenge tests that still pass if the implementation returns nothing. Before adding material complexity for speculative concurrency or remote security edge cases, establish the failure mechanism, observed likelihood, consequence, cost and simpler alternative; request approval for scope expansion. These principles never override mandatory fail-closed policy, identity, writer ownership or runtime isolation. Optional analyzers (`crapper`, `dryer`, `mutator`) may be skipped; no auto-install or mandatory numeric gates.
+For changes to product code, apply the `ub-mode` methodology if available: first reproduce the defect with a focused failing test or concrete discriminating check; fix the cause rather than suppressing errors or disguising `UNKNOWN`/`UNAVAILABLE`; keep edits minimal. Challenge tests that still pass if the implementation returns nothing. Before adding material complexity for speculative concurrency or remote security edge cases, establish the failure mechanism, observed likelihood, consequence, cost and simpler alternative; request approval for scope expansion. These principles never override mandatory fail-closed policy, identity, writer ownership or runtime isolation. Optional analyzers (`crapper`, `dryer`, `mutator`) may be skipped; no auto-install or mandatory numeric gates.
 
 ## Validation (required before handback)
 
